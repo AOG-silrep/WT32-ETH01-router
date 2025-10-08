@@ -1,0 +1,4 @@
+/.clangd
+/.devcontainer/Dockerfile
+/.devcontainer/devcontainer.json
+/build
