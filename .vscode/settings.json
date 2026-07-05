@@ -1,0 +1,25 @@
+{
+  "C_Cpp.intelliSenseEngine": "default",
+  "idf.espIdfPath": "/home/programmer/esp/v5.3/esp-idf",
+  "idf.pythonInstallPath": "/usr/bin/python",
+  "idf.openOcdConfigs": [
+    "board/esp32-ethernet-kit-3.3v.cfg"
+  ],
+  "idf.port": "/dev/ttyUSB1",
+  "idf.toolsPath": "/home/programmer/.espressif",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32"
+  },
+  "clangd.path": "/home/programmer/.espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/bin/clangd",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=/home/programmer/.espressif/tools/xtensa-esp-elf/esp-13.2.0_20240530/xtensa-esp-elf/bin/xtensa-esp32-elf-gcc",
+    "--compile-commands-dir=${workspaceFolder}/build"
+  ],
+  "idf.flashType": "UART",
+  "files.associations": {
+    "socket.h": "c",
+    "esp_http_server.h": "c"
+  },
+  "idf.currentSetup": "/home/programmer/.espressif/v6.0.2/esp-idf"
+}
