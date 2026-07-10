@@ -1,5 +1,6 @@
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "web_server.h"
 #include "wifi_cfg.h"
 #include "client_track.h"
@@ -158,6 +159,63 @@ static esp_err_t clients_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// Parses "aa:bb:cc:dd:ee:ff" into 6 raw bytes. Uses an unsigned int scratch
+// array rather than scanning directly into mac's uint8_t slots - %hhx support
+// varies across newlib scanf configurations, %x into a wider int does not.
+static bool parse_mac(const char *str, uint8_t mac[6])
+{
+    unsigned int b[6];
+    if (sscanf(str, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) {
+        return false;
+    }
+    for (int i = 0; i < 6; i++) {
+        mac[i] = (uint8_t)b[i];
+    }
+    return true;
+}
+
+static esp_err_t client_history_get_handler(httpd_req_t *req)
+{
+    char query[128];
+    char mac_str[24] = {0};
+    char since_str[16] = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        httpd_query_key_value(query, "mac", mac_str, sizeof(mac_str));
+        httpd_query_key_value(query, "since", since_str, sizeof(since_str));
+    }
+
+    uint8_t mac[6];
+    if (!parse_mac(mac_str, mac)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing or invalid \"mac\"");
+        return ESP_FAIL;
+    }
+    uint32_t since_seq = since_str[0] ? (uint32_t)strtoul(since_str, NULL, 10) : 0;
+
+    client_history_t hist;
+    if (!client_track_get_history(mac, since_seq, &hist)) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Unknown client");
+        return ESP_FAIL;
+    }
+
+    static char resp[900];
+    int off = snprintf(resp, sizeof(resp),
+                        "{\"mac\":\"%s\",\"period_ms\":%d,\"seq\":%u,\"reset\":%s,\"rx\":[",
+                        mac_str, CLIENT_TRACK_HISTORY_PERIOD_MS, (unsigned)hist.seq,
+                        hist.reset ? "true" : "false");
+    for (int i = 0; i < hist.count && off < sizeof(resp); i++) {
+        off += snprintf(resp + off, sizeof(resp) - off, "%s%u", i == 0 ? "" : ",", (unsigned)hist.rx_bps[i]);
+    }
+    off += snprintf(resp + off, sizeof(resp) - off, "],\"tx\":[");
+    for (int i = 0; i < hist.count && off < sizeof(resp); i++) {
+        off += snprintf(resp + off, sizeof(resp) - off, "%s%u", i == 0 ? "" : ",", (unsigned)hist.tx_bps[i]);
+    }
+    off += snprintf(resp + off, sizeof(resp) - off, "]}");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, off);
+    return ESP_OK;
+}
+
 static esp_err_t system_get_handler(httpd_req_t *req)
 {
     uint8_t cpu_pct[SYS_MONITOR_NUM_CORES];
@@ -202,12 +260,14 @@ httpd_handle_t web_server_start(void)
     const httpd_uri_t status_uri = {.uri = "/api/status", .method = HTTP_GET, .handler = status_get_handler};
     const httpd_uri_t wifi_uri = {.uri = "/api/wifi", .method = HTTP_POST, .handler = wifi_post_handler};
     const httpd_uri_t clients_uri = {.uri = "/api/clients", .method = HTTP_GET, .handler = clients_get_handler};
+    const httpd_uri_t history_uri = {.uri = "/api/client/history", .method = HTTP_GET, .handler = client_history_get_handler};
     const httpd_uri_t system_uri = {.uri = "/api/system", .method = HTTP_GET, .handler = system_get_handler};
 
     httpd_register_uri_handler(server, &index_uri);
     httpd_register_uri_handler(server, &status_uri);
     httpd_register_uri_handler(server, &wifi_uri);
     httpd_register_uri_handler(server, &clients_uri);
+    httpd_register_uri_handler(server, &history_uri);
     httpd_register_uri_handler(server, &system_uri);
 
     ESP_LOGI(TAG, "Web server started");

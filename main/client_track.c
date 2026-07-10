@@ -18,6 +18,7 @@ static const char *TAG = "client_track";
 
 #define CLIENT_AGE_OUT_US (5LL * 60 * 1000000)   // drop a client after 5 min of silence
 #define TICK_PERIOD_MS    1000
+#define FAST_TICKS_PER_SLOW_TICK (TICK_PERIOD_MS / CLIENT_TRACK_HISTORY_PERIOD_MS)
 
 typedef struct {
     bool active;
@@ -26,10 +27,19 @@ typedef struct {
     bool is_wifi;
     int8_t rssi;
     uint32_t rx_bytes, tx_bytes;           // cumulative
-    uint32_t rx_bytes_prev, tx_bytes_prev; // previous tick's cumulative, for rate calc
+    uint32_t rx_bytes_prev, tx_bytes_prev; // previous 1Hz tick's cumulative, for rate calc
     uint32_t rx_bps, tx_bps;
     int64_t last_seen_us;
     char name[CLIENT_TRACK_NAME_MAX_LEN];
+
+    // Fine-grained history, sampled every CLIENT_TRACK_HISTORY_PERIOD_MS - kept
+    // fully independent of rx_bytes_prev/tx_bytes_prev above so the two
+    // cadences never share bookkeeping, both just diffing the same raw
+    // cumulative rx_bytes/tx_bytes.
+    uint32_t rx_bytes_prev_fast, tx_bytes_prev_fast;
+    uint32_t hist_rx[CLIENT_TRACK_HISTORY_LEN]; // bytes/sec, one per 200ms bucket
+    uint32_t hist_tx[CLIENT_TRACK_HISTORY_LEN];
+    uint32_t hist_seq; // count of fast samples ever produced for this client
 } client_entry_t;
 
 static client_entry_t s_clients[CLIENT_TRACK_MAX_CLIENTS];
@@ -322,11 +332,41 @@ static void client_track_tick(void)
     xSemaphoreGive(s_mutex);
 }
 
+// Runs every CLIENT_TRACK_HISTORY_PERIOD_MS (much more often than the 1Hz
+// client_track_tick()) to record a fine-grained rx/tx sample per client, so a
+// page-level traffic graph can show bursts shorter than one second. Cheap
+// enough (a handful of clients, plain subtraction) to run unconditionally for
+// every tracked slot rather than only for a client someone is watching.
+static void client_track_fast_sample(void)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < CLIENT_TRACK_MAX_CLIENTS; i++) {
+        client_entry_t *e = &s_clients[i];
+        if (!e->active) {
+            continue;
+        }
+        uint32_t rx_delta = e->rx_bytes - e->rx_bytes_prev_fast;
+        uint32_t tx_delta = e->tx_bytes - e->tx_bytes_prev_fast;
+        e->rx_bytes_prev_fast = e->rx_bytes;
+        e->tx_bytes_prev_fast = e->tx_bytes;
+        int idx = e->hist_seq % CLIENT_TRACK_HISTORY_LEN;
+        e->hist_rx[idx] = rx_delta * (1000 / CLIENT_TRACK_HISTORY_PERIOD_MS);
+        e->hist_tx[idx] = tx_delta * (1000 / CLIENT_TRACK_HISTORY_PERIOD_MS);
+        e->hist_seq++;
+    }
+    xSemaphoreGive(s_mutex);
+}
+
 static void client_track_task(void *arg)
 {
+    int fast_count = 0;
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(TICK_PERIOD_MS));
-        client_track_tick();
+        vTaskDelay(pdMS_TO_TICKS(CLIENT_TRACK_HISTORY_PERIOD_MS));
+        client_track_fast_sample();
+        if (++fast_count >= FAST_TICKS_PER_SLOW_TICK) {
+            fast_count = 0;
+            client_track_tick();
+        }
     }
 }
 
@@ -384,4 +424,43 @@ void client_track_get_snapshot(client_info_t *out, int max, int *count)
     xSemaphoreGive(s_mutex);
 
     *count = n;
+}
+
+bool client_track_get_history(const uint8_t mac[6], uint32_t since_seq, client_history_t *out)
+{
+    bool found = false;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < CLIENT_TRACK_MAX_CLIENTS; i++) {
+        client_entry_t *e = &s_clients[i];
+        if (!e->active || memcmp(e->mac, mac, 6) != 0) {
+            continue;
+        }
+        found = true;
+
+        // Unsigned subtraction: also correctly treats a since_seq from before
+        // a reboot (hist_seq restarts at 0, so this underflows to a huge
+        // value) the same as ordinary ring-buffer wraparound - both just mean
+        // "more happened than we still have buffered".
+        uint32_t avail = e->hist_seq - since_seq;
+        bool reset = false;
+        if (avail > CLIENT_TRACK_HISTORY_LEN) {
+            avail = e->hist_seq < CLIENT_TRACK_HISTORY_LEN ? e->hist_seq : CLIENT_TRACK_HISTORY_LEN;
+            reset = true;
+        }
+
+        out->seq = e->hist_seq;
+        out->reset = reset;
+        out->count = (int)avail;
+        uint32_t start = e->hist_seq - avail;
+        for (uint32_t k = 0; k < avail; k++) {
+            int idx = (start + k) % CLIENT_TRACK_HISTORY_LEN;
+            out->rx_bps[k] = e->hist_rx[idx];
+            out->tx_bps[k] = e->hist_tx[idx];
+        }
+        break;
+    }
+    xSemaphoreGive(s_mutex);
+
+    return found;
 }

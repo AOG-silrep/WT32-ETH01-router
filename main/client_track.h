@@ -12,6 +12,12 @@ extern "C" {
 #define CLIENT_TRACK_MAX_CLIENTS 16
 #define CLIENT_TRACK_NAME_MAX_LEN 32
 
+// Fine-grained traffic history, sampled independently of the 1Hz rx_bps/tx_bps
+// figures below, so a client's page-level graph can show bursts shorter than
+// one second without waiting on (or disturbing) the slower IP/hostname tick.
+#define CLIENT_TRACK_HISTORY_PERIOD_MS 200
+#define CLIENT_TRACK_HISTORY_LEN 32   // 32 * 200ms = 6.4s buffered per client
+
 typedef struct {
     uint8_t mac[6];
     esp_ip4_addr_t ip;   // 0.0.0.0 if not yet resolved
@@ -22,6 +28,14 @@ typedef struct {
     uint32_t last_seen_s; // seconds since this client's last observed traffic
     char name[CLIENT_TRACK_NAME_MAX_LEN]; // DHCP hostname (option 12); empty if unknown
 } client_info_t;
+
+typedef struct {
+    uint32_t seq;      // sequence number of the newest sample included
+    bool reset;        // true if the requested `since_seq` predates what's buffered
+    int count;         // number of samples actually returned, oldest..newest
+    uint32_t rx_bps[CLIENT_TRACK_HISTORY_LEN];
+    uint32_t tx_bps[CLIENT_TRACK_HISTORY_LEN];
+} client_history_t;
 
 // Hooks the eth/wifi bridge ports for per-client byte counting and starts
 // the periodic accounting/aging/IP-resolution task. Must be called after
@@ -35,6 +49,12 @@ esp_err_t client_track_init(esp_netif_t *eth_netif, esp_netif_t *wifi_netif,
 // Copies up to max active client entries into out (in no particular order).
 // Thread-safe; intended to be called from the HTTP server task.
 void client_track_get_snapshot(client_info_t *out, int max, int *count);
+
+// Fills out with the fine-grained history samples for mac newer than
+// since_seq (pass 0 to get everything currently buffered). Returns false if
+// mac isn't a currently-tracked (active) client. Thread-safe; intended to be
+// called from the HTTP server task.
+bool client_track_get_history(const uint8_t mac[6], uint32_t since_seq, client_history_t *out);
 
 #ifdef __cplusplus
 }

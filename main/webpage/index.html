@@ -22,6 +22,19 @@
   #banner { display: none; background: #b00020; color: #fff; padding: 0.6em 1em; border-radius: 4px; margin-bottom: 1em; }
   #banner.show { display: block; }
   #banner.restarting { background: #c26a00; }
+  tr.selected { background: #eef4fc; }
+  button.watch-btn { margin: 0; padding: 0.2em 0.6em; font-size: 0.85em; }
+  #chart-panel {
+    --chart-rx: #2a78d6; --chart-tx: #eb6834;
+    --chart-grid: #e1e0d9; --chart-axis: #c3c2b7; --chart-muted: #898781;
+    display: none; margin-top: 0.8em; border: 1px solid #ddd; border-radius: 4px; padding: 0.8em;
+  }
+  #chart-panel.show { display: block; }
+  #chart-panel .chart-head { display: flex; justify-content: space-between; align-items: baseline; font-size: 0.9em; }
+  #chart-legend .legend-item { margin-right: 1em; color: var(--chart-muted); }
+  #chart-legend .legend-item i { display: inline-block; width: 0.7em; height: 0.7em; border-radius: 2px; margin-right: 0.3em; }
+  #traffic-canvas { width: 100%; height: 160px; display: block; margin-top: 0.4em; cursor: crosshair; }
+  #chart-tooltip { font-size: 0.85em; color: var(--chart-muted); height: 1.2em; margin-top: 0.2em; }
 </style>
 </head>
 <body>
@@ -56,12 +69,24 @@
 <h2>Connected clients</h2>
 <table>
   <thead>
-    <tr><th>Name</th><th>MAC</th><th>IP</th><th>Link</th><th>Signal</th><th>Down</th><th>Up</th></tr>
+    <tr><th>Name</th><th>MAC</th><th>IP</th><th>Link</th><th>Signal</th><th>Down</th><th>Up</th><th></th></tr>
   </thead>
   <tbody id="clients-body">
-    <tr><td colspan="7">Loading&hellip;</td></tr>
+    <tr><td colspan="8">Loading&hellip;</td></tr>
   </tbody>
 </table>
+
+<div id="chart-panel">
+  <div class="chart-head">
+    <div id="chart-legend">
+      <span class="legend-item"><i style="background:var(--chart-rx)"></i>Down (rx)</span>
+      <span class="legend-item"><i style="background:var(--chart-tx)"></i>Up (tx)</span>
+    </div>
+    <div><span id="chart-title"></span> &ndash; <button type="button" id="chart-stop">Stop</button></div>
+  </div>
+  <canvas id="traffic-canvas" width="600" height="160"></canvas>
+  <div id="chart-tooltip"></div>
+</div>
 
 <script>
 function formatRate(bytesPerSec) {
@@ -112,12 +137,12 @@ async function refreshClients() {
   const body = document.getElementById('clients-body');
   body.innerHTML = '';
   if (clients.length === 0) {
-    body.innerHTML = '<tr><td colspan="7">No clients seen yet</td></tr>';
+    body.innerHTML = '<tr><td colspan="8">No clients seen yet</td></tr>';
     return;
   }
   for (const c of clients) {
     const tr = document.createElement('tr');
-    if (c.last_seen_s > 30) tr.className = 'stale';
+    tr.className = (c.last_seen_s > 30 ? 'stale ' : '') + (c.mac === selectedMac ? 'selected' : '');
     tr.innerHTML =
       '<td>' + (c.name ? c.name : '&ndash;') + '</td>' +
       '<td class="mac">' + c.mac + '</td>' +
@@ -125,10 +150,185 @@ async function refreshClients() {
       '<td>' + c.link + '</td>' +
       '<td>' + (c.rssi === null ? '&ndash;' : c.rssi + ' dBm') + '</td>' +
       '<td class="rate">' + formatRate(c.rx_bps) + '</td>' +
-      '<td class="rate">' + formatRate(c.tx_bps) + '</td>';
+      '<td class="rate">' + formatRate(c.tx_bps) + '</td>' +
+      '<td><button type="button" class="watch-btn" data-mac="' + c.mac + '">' +
+        (c.mac === selectedMac ? 'Watching' : 'Graph') + '</button></td>';
     body.appendChild(tr);
   }
 }
+
+// --- Single-client traffic graph -------------------------------------------
+//
+// The device already samples every tracked client's byte counters every
+// 200ms and keeps a short ring buffer per client (see client_track.c) - this
+// just polls that buffer at the same 2s cadence as everything else on the
+// page and appends the new (sub-2-second-resolution) samples client-side, so
+// short bursts between polls still show up instead of being averaged away.
+let selectedMac = null;
+let lastSeq = 0;
+let histRx = [];
+let histTx = [];
+const HISTORY_VIEW_SAMPLES = 150; // ~30s at the device's 200ms sample period
+
+function selectClient(mac) {
+  selectedMac = mac;
+  lastSeq = 0;
+  histRx = [];
+  histTx = [];
+  document.getElementById('chart-title').textContent = mac;
+  document.getElementById('chart-tooltip').textContent = '';
+  document.getElementById('chart-panel').classList.add('show');
+  drawChart();
+}
+
+function stopWatching() {
+  selectedMac = null;
+  document.getElementById('chart-panel').classList.remove('show');
+}
+
+document.getElementById('clients-body').addEventListener('click', (e) => {
+  const btn = e.target.closest('.watch-btn');
+  if (btn) selectClient(btn.dataset.mac);
+});
+document.getElementById('chart-stop').addEventListener('click', stopWatching);
+
+async function refreshHistory() {
+  if (!selectedMac || document.hidden) return;
+  try {
+    const res = await fetchWithTimeout(
+      '/api/client/history?mac=' + selectedMac + '&since=' + lastSeq, {}, 1500);
+    if (!res.ok) {
+      document.getElementById('chart-tooltip').textContent =
+        res.status === 404 ? 'Client no longer active' : 'Graph error (' + res.status + ')';
+      return;
+    }
+    const data = await res.json();
+    if (data.reset) {
+      histRx = [];
+      histTx = [];
+    }
+    histRx.push(...data.rx);
+    histTx.push(...data.tx);
+    if (histRx.length > HISTORY_VIEW_SAMPLES) {
+      histRx = histRx.slice(histRx.length - HISTORY_VIEW_SAMPLES);
+      histTx = histTx.slice(histTx.length - HISTORY_VIEW_SAMPLES);
+    }
+    lastSeq = data.seq;
+    drawChart();
+  } catch (e) {
+    // Same soft-fail as the rest of poll() - the connection-lost banner
+    // already covers reporting this to the user.
+  }
+}
+
+function drawChart(hoverX) {
+  const canvas = document.getElementById('traffic-canvas');
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth || 600, cssH = canvas.clientHeight || 160;
+  if (canvas.width !== cssW * dpr || canvas.height !== cssH * dpr) {
+    canvas.width = cssW * dpr;
+    canvas.height = cssH * dpr;
+  }
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+
+  const padL = 44, padR = 8, padT = 8, padB = 16;
+  const plotW = cssW - padL - padR, plotH = cssH - padT - padB;
+  const n = Math.max(histRx.length, histTx.length);
+
+  const style = getComputedStyle(document.getElementById('chart-panel'));
+  const gridColor = style.getPropertyValue('--chart-grid').trim();
+  const axisColor = style.getPropertyValue('--chart-axis').trim();
+  const mutedColor = style.getPropertyValue('--chart-muted').trim();
+  const rxColor = style.getPropertyValue('--chart-rx').trim();
+  const txColor = style.getPropertyValue('--chart-tx').trim();
+
+  let maxVal = 1;
+  for (const v of histRx) if (v > maxVal) maxVal = v;
+  for (const v of histTx) if (v > maxVal) maxVal = v;
+  maxVal *= 1.15;
+
+  // Gridlines + y-axis rate labels (0 / mid / max).
+  ctx.strokeStyle = gridColor;
+  ctx.fillStyle = mutedColor;
+  ctx.font = '11px sans-serif';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  [0, 0.5, 1].forEach((frac) => {
+    const y = padT + plotH * (1 - frac);
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(padL + plotW, y);
+    ctx.stroke();
+    ctx.fillText(formatRate(Math.round(maxVal * frac)), padL - 6, y);
+  });
+  ctx.strokeStyle = axisColor;
+  ctx.beginPath();
+  ctx.moveTo(padL, padT + plotH);
+  ctx.lineTo(padL + plotW, padT + plotH);
+  ctx.stroke();
+
+  if (n < 2) {
+    ctx.textAlign = 'center';
+    ctx.fillText('Waiting for data…', padL + plotW / 2, padT + plotH / 2);
+    return;
+  }
+
+  const xAt = (i) => padL + (plotW * i) / (HISTORY_VIEW_SAMPLES - 1);
+  const yAt = (v) => padT + plotH * (1 - v / maxVal);
+
+  function drawSeries(series, color) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    const offset = HISTORY_VIEW_SAMPLES - series.length;
+    series.forEach((v, i) => {
+      const x = xAt(offset + i), y = yAt(v);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  }
+  drawSeries(histRx, rxColor);
+  drawSeries(histTx, txColor);
+
+  // x-axis time-span labels (device sample period, not wall-clock timestamps).
+  const spanS = (HISTORY_VIEW_SAMPLES * 200) / 1000;
+  ctx.fillStyle = mutedColor;
+  ctx.textBaseline = 'top';
+  ctx.textAlign = 'left';
+  ctx.fillText('-' + spanS + 's', padL, padT + plotH + 2);
+  ctx.textAlign = 'right';
+  ctx.fillText('now', padL + plotW, padT + plotH + 2);
+
+  // Hover crosshair + point readout.
+  if (hoverX !== undefined) {
+    const offsetRx = HISTORY_VIEW_SAMPLES - histRx.length;
+    const idx = Math.round(((hoverX - padL) / plotW) * (HISTORY_VIEW_SAMPLES - 1)) - offsetRx;
+    if (idx >= 0 && idx < histRx.length) {
+      const x = xAt(offsetRx + idx);
+      ctx.strokeStyle = axisColor;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x, padT);
+      ctx.lineTo(x, padT + plotH);
+      ctx.stroke();
+      const agoS = (((histRx.length - 1 - idx) * 200) / 1000).toFixed(1);
+      document.getElementById('chart-tooltip').textContent =
+        '-' + agoS + 's:  down ' + formatRate(histRx[idx]) + '   up ' + formatRate(histTx[idx]);
+    }
+  }
+}
+
+const trafficCanvas = document.getElementById('traffic-canvas');
+trafficCanvas.addEventListener('mousemove', (e) => {
+  const rect = trafficCanvas.getBoundingClientRect();
+  drawChart(e.clientX - rect.left);
+});
+trafficCanvas.addEventListener('mouseleave', () => {
+  document.getElementById('chart-tooltip').textContent = '';
+  drawChart();
+});
 
 async function refreshSystem() {
   const res = await fetchWithTimeout('/api/system', {}, 1500);
@@ -147,6 +347,7 @@ async function poll() {
   try {
     await refreshClients();
     await refreshSystem();
+    await refreshHistory();
     failCount = 0;
     const banner = document.getElementById('banner');
     banner.classList.remove('show', 'restarting');
