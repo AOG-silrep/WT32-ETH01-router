@@ -9,6 +9,7 @@
 #include "esp_log.h"
 #include "esp_eth.h"
 #include "esp_eth_phy_lan87xx.h"
+#include "esp_ota_ops.h"
 #include "nvs_flash.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
@@ -233,6 +234,19 @@ void app_main(void)
 
     // Start web server
     web_server_start();
+
+    // Mark this boot as good now that every startup-critical subsystem above
+    // has come up without hitting an ESP_ERROR_CHECK abort. Cancels the
+    // bootloader's pending-verify rollback state so a good OTA image isn't
+    // auto-reverted. On a non-OTA boot (fresh serial flash, blank otadata)
+    // this legitimately returns an error, which is expected, not a fault.
+    esp_err_t ota_mark_ret = esp_ota_mark_app_valid_cancel_rollback();
+    if (ota_mark_ret == ESP_OK) {
+        ESP_LOGI(TAG, "OTA rollback: app marked valid, pending-verify cleared");
+    } else {
+        ESP_LOGD(TAG, "OTA rollback: mark-valid not applicable here (%s)",
+                 esp_err_to_name(ota_mark_ret));
+    }
 
     ESP_LOGI(TAG, "\n====================================");
     ESP_LOGI(TAG, "Bridge Ready!");
