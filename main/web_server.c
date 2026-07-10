@@ -116,7 +116,12 @@ static esp_err_t wifi_post_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing \"ssid\"");
         return ESP_FAIL;
     }
-    json_get_string(buf, "password", password, sizeof(password)); // absent -> open network
+    json_get_string(buf, "password", password, sizeof(password)); // absent/blank -> keep current password
+    if (password[0] == '\0') {
+        char cur_ssid[WIFI_CFG_SSID_MAX_LEN];
+        uint8_t cur_channel;
+        wifi_cfg_load(cur_ssid, password, &cur_channel);
+    }
 
     long channel_val = WIFI_CFG_DEFAULT_CHANNEL;
     json_get_int(buf, "channel", &channel_val); // absent -> default channel

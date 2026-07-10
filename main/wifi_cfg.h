@@ -29,11 +29,11 @@ esp_err_t wifi_cfg_save(const char *ssid, const char *password, uint8_t channel)
 // state is unaffected.
 esp_err_t wifi_cfg_apply(const char *ssid, const char *password, uint8_t channel);
 
-// Validates SSID (1-31 bytes), password (empty for open network, or 8-63
-// bytes for WPA2-PSK), and channel (must be 1, 6, or 11 - the non-overlapping
-// 2.4GHz channels). Returns true and leaves *err_msg untouched on success;
-// returns false and sets *err_msg to a static, human-readable reason on
-// failure.
+// Validates SSID (1-31 bytes), password (8-63 bytes for WPA2-PSK; the AP
+// always requires a password, open networks are not supported), and channel
+// (must be 1, 6, or 11 - the non-overlapping 2.4GHz channels). Returns true
+// and leaves *err_msg untouched on success; returns false and sets *err_msg
+// to a static, human-readable reason on failure.
 bool wifi_cfg_validate(const char *ssid, const char *password, uint8_t channel, const char **err_msg);
 
 #ifdef __cplusplus

@@ -83,7 +83,7 @@ esp_err_t wifi_cfg_apply(const char *ssid, const char *password, uint8_t channel
             .ssid_len = strlen(ssid),
             .channel = channel,
             .max_connection = WIFI_CFG_MAX_STA_CONN,
-            .authmode = strlen(password) == 0 ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK,
+            .authmode = WIFI_AUTH_WPA2_PSK,
         },
     };
 
@@ -109,8 +109,8 @@ bool wifi_cfg_validate(const char *ssid, const char *password, uint8_t channel, 
         *err_msg = "SSID must be 1-31 characters";
         return false;
     }
-    if (pass_len != 0 && (pass_len < 8 || pass_len > WIFI_CFG_PASSWORD_MAX_LEN - 1)) {
-        *err_msg = "Password must be empty (open network) or 8-63 characters";
+    if (pass_len < 8 || pass_len > WIFI_CFG_PASSWORD_MAX_LEN - 1) {
+        *err_msg = "Password must be 8-63 characters";
         return false;
     }
     if (channel != 1 && channel != 6 && channel != 11) {
