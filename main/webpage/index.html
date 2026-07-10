@@ -169,8 +169,8 @@ async function refreshClients() {
 //
 // The device already samples every tracked client's byte counters every
 // 200ms and keeps a short ring buffer per client (see client_track.c) - this
-// just polls that buffer at the same 2s cadence as everything else on the
-// page and appends the new (sub-2-second-resolution) samples client-side, so
+// just polls that buffer at the same 1s cadence as everything else on the
+// page and appends the new (sub-1-second-resolution) samples client-side, so
 // short bursts between polls still show up instead of being averaged away.
 let selectedMac = null;
 let lastSeq = 0;
@@ -403,7 +403,7 @@ document.getElementById('wifi-form').addEventListener('submit', async (e) => {
 
 loadStatus();
 poll();
-setInterval(poll, 2000);
+setInterval(poll, 1000);
 </script>
 
 </body>
