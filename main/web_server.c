@@ -9,6 +9,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_ota_ops.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -157,6 +158,82 @@ static esp_err_t wifi_post_handler(httpd_req_t *req)
     esp_restart();
 }
 
+static esp_err_t ota_post_handler(httpd_req_t *req)
+{
+    if (req->content_len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body missing");
+        return ESP_FAIL;
+    }
+
+    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+    if (update_partition == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No OTA partition available");
+        return ESP_FAIL;
+    }
+
+    esp_ota_handle_t ota_handle;
+    esp_err_t err = esp_ota_begin(update_partition, req->content_len, &ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Image too large or OTA busy");
+        return ESP_FAIL;
+    }
+
+    // Static, not stack-allocated: the httpd worker task's stack is shared
+    // across all handlers, and a 4KB local buffer here would blow it.
+    static uint8_t ota_buf[4096];
+    int remaining = req->content_len;
+    while (remaining > 0) {
+        int to_read = remaining < sizeof(ota_buf) ? remaining : sizeof(ota_buf);
+        int received = httpd_req_recv(req, (char *)ota_buf, to_read);
+        if (received <= 0) {
+            esp_ota_abort(ota_handle);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Failed to read body");
+            return ESP_FAIL;
+        }
+        err = esp_ota_write(ota_handle, ota_buf, received);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(err));
+            esp_ota_abort(ota_handle);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Flash write failed");
+            return ESP_FAIL;
+        }
+        remaining -= received;
+    }
+
+    // esp_ota_end() validates the image header/checksum - on failure the
+    // partition just written is left un-booted, so a corrupt upload can't
+    // brick the device; it just doesn't take effect.
+    err = esp_ota_end(ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(err));
+        char resp[128];
+        int len = snprintf(resp, sizeof(resp), "{\"ok\":false,\"error\":\"Image validation failed: %s\"}",
+                            esp_err_to_name(err));
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, resp, len);
+        return ESP_OK;
+    }
+
+    err = esp_ota_set_boot_partition(update_partition);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"Failed to set boot partition\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+
+    // Same pattern as wifi_post_handler: let the response reach the client
+    // before tearing everything down for the reboot into the new image.
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+}
+
 static esp_err_t clients_get_handler(httpd_req_t *req)
 {
     client_info_t clients[CLIENT_TRACK_MAX_CLIENTS];
@@ -283,6 +360,9 @@ httpd_handle_t web_server_start(void)
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.uri_match_fn = httpd_uri_match_wildcard;
+    // Default 4KB is too tight once the OTA handler's call chain into
+    // esp_ota_write()/SPI flash is included on this same worker task's stack.
+    config.stack_size = 8192;
 
     esp_err_t err = httpd_start(&server, &config);
     if (err != ESP_OK) {
@@ -296,6 +376,7 @@ httpd_handle_t web_server_start(void)
     const httpd_uri_t clients_uri = {.uri = "/api/clients", .method = HTTP_GET, .handler = clients_get_handler};
     const httpd_uri_t history_uri = {.uri = "/api/client/history", .method = HTTP_GET, .handler = client_history_get_handler};
     const httpd_uri_t system_uri = {.uri = "/api/system", .method = HTTP_GET, .handler = system_get_handler};
+    const httpd_uri_t ota_uri = {.uri = "/api/ota", .method = HTTP_POST, .handler = ota_post_handler};
 
     httpd_register_uri_handler(server, &index_uri);
     httpd_register_uri_handler(server, &status_uri);
@@ -303,6 +384,7 @@ httpd_handle_t web_server_start(void)
     httpd_register_uri_handler(server, &clients_uri);
     httpd_register_uri_handler(server, &history_uri);
     httpd_register_uri_handler(server, &system_uri);
+    httpd_register_uri_handler(server, &ota_uri);
 
     ESP_LOGI(TAG, "Web server started");
     return server;
