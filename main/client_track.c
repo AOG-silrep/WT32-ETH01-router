@@ -9,6 +9,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "lwip/netif.h"
 #include "lwip/pbuf.h"
 #include "lwip/prot/ip4.h"
@@ -19,6 +20,19 @@ static const char *TAG = "client_track";
 #define CLIENT_AGE_OUT_US (5LL * 60 * 1000000)   // drop a client after 5 min of silence
 #define TICK_PERIOD_MS    1000
 #define FAST_TICKS_PER_SLOW_TICK (TICK_PERIOD_MS / CLIENT_TRACK_HISTORY_PERIOD_MS)
+#define TRAFFIC_EVENT_QUEUE_DEPTH 64
+
+// Everything account_traffic() needs, captured by value - the hot-path
+// wrappers below run in the eth/wifi driver's own RX/TX task, and the pbuf
+// (and anything pointing into it) is not valid once that task moves on, so
+// nothing here may be a pointer into pbuf data.
+typedef struct {
+    uint8_t mac[6];
+    bool is_wifi;
+    uint16_t bytes;
+    bool is_uplink;
+    esp_ip4_addr_t observed_ip; // .addr == 0 means "none observed"
+} traffic_event_t;
 
 typedef struct {
     bool active;
@@ -44,6 +58,8 @@ typedef struct {
 
 static client_entry_t s_clients[CLIENT_TRACK_MAX_CLIENTS];
 static SemaphoreHandle_t s_mutex;
+static QueueHandle_t s_traffic_q;
+static volatile uint32_t s_traffic_drops;
 
 static esp_netif_t *s_eth_netif;
 static esp_netif_t *s_wifi_netif;
@@ -162,7 +178,22 @@ static err_t traffic_input_wrapper(struct pbuf *p, struct netif *inp, bool is_wi
                 src_ip.addr = iph->src.addr;
                 src_ip_p = &src_ip;
             }
-            account_traffic(hdr->src.addr, is_wifi, p->tot_len, true, src_ip_p);
+            traffic_event_t ev = {
+                .is_wifi = is_wifi,
+                .bytes = p->tot_len,
+                .is_uplink = true,
+                .observed_ip = { .addr = 0 },
+            };
+            memcpy(ev.mac, hdr->src.addr, 6);
+            if (src_ip_p != NULL) {
+                ev.observed_ip = *src_ip_p;
+            }
+            // Timeout 0 is load-bearing, not a tuning knob: traffic
+            // forwarding must never block on accounting, so a full queue
+            // means drop-and-count here, never wait.
+            if (xQueueSend(s_traffic_q, &ev, 0) != pdTRUE) {
+                s_traffic_drops++;
+            }
         }
     }
     return orig(p, inp);
@@ -186,7 +217,17 @@ static err_t traffic_output_wrapper(struct netif *netif, struct pbuf *p, bool is
     if (p != NULL && p->len >= 12) {
         struct eth_hdr *hdr = (struct eth_hdr *)p->payload;
         if (mac_is_client(hdr->dest.addr)) {
-            account_traffic(hdr->dest.addr, is_wifi, p->tot_len, false, NULL);
+            traffic_event_t ev = {
+                .is_wifi = is_wifi,
+                .bytes = p->tot_len,
+                .is_uplink = false,
+                .observed_ip = { .addr = 0 },
+            };
+            memcpy(ev.mac, hdr->dest.addr, 6);
+            // See traffic_input_wrapper() - timeout 0 here for the same reason.
+            if (xQueueSend(s_traffic_q, &ev, 0) != pdTRUE) {
+                s_traffic_drops++;
+            }
         }
     }
     return orig(netif, p);
@@ -370,6 +411,22 @@ static void client_track_task(void *arg)
     }
 }
 
+// Drains traffic_event_t entries queued by the eth/wifi RX/TX hot path and
+// applies them via the original (unchanged) account_traffic(). Keeping this
+// as its own task, pinned to the opposite core from the networking hot path,
+// means the mutex/scan work in account_traffic() never runs on the same core
+// that's servicing packet forwarding.
+static void traffic_account_task(void *arg)
+{
+    traffic_event_t ev;
+    while (1) {
+        if (xQueueReceive(s_traffic_q, &ev, portMAX_DELAY) == pdTRUE) {
+            account_traffic(ev.mac, ev.is_wifi, ev.bytes, ev.is_uplink,
+                             ev.observed_ip.addr != 0 ? &ev.observed_ip : NULL);
+        }
+    }
+}
+
 esp_err_t client_track_init(esp_netif_t *eth_netif, esp_netif_t *wifi_netif,
                              esp_netif_t *br_netif, const uint8_t *bridge_mac)
 {
@@ -380,6 +437,11 @@ esp_err_t client_track_init(esp_netif_t *eth_netif, esp_netif_t *wifi_netif,
 
     s_mutex = xSemaphoreCreateMutex();
     if (s_mutex == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_traffic_q = xQueueCreate(TRAFFIC_EVENT_QUEUE_DEPTH, sizeof(traffic_event_t));
+    if (s_traffic_q == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -396,7 +458,23 @@ esp_err_t client_track_init(esp_netif_t *eth_netif, esp_netif_t *wifi_netif,
 
     BaseType_t ok = xTaskCreatePinnedToCore(client_track_task, "client_track", 4096,
                                              NULL, tskIDLE_PRIORITY + 2, NULL, 1);
-    return ok == pdPASS ? ESP_OK : ESP_FAIL;
+    if (ok != pdPASS) {
+        return ESP_FAIL;
+    }
+
+    // Priority idle+3: higher than client_track_task (idle+2) so it
+    // preferentially drains the traffic queue over that slower housekeeping
+    // work, but deliberately far below the actual traffic-critical tasks
+    // (Ethernet RX ~15, lwIP tcpip 18, WiFi's own driver task higher still)
+    // so accounting can never preempt or delay real packet forwarding.
+    BaseType_t acct_ok = xTaskCreatePinnedToCore(traffic_account_task, "traffic_acct", 3072,
+                                                  NULL, tskIDLE_PRIORITY + 3, NULL, 1);
+    return acct_ok == pdPASS ? ESP_OK : ESP_FAIL;
+}
+
+uint32_t client_track_get_traffic_drops(void)
+{
+    return s_traffic_drops;
 }
 
 void client_track_get_snapshot(client_info_t *out, int max, int *count)

@@ -28,3 +28,17 @@ idf.py -p <PORT> flash monitor
 - `main/client_track.c` / `.h` — connected-client and traffic tracking
 - `main/sys_monitor.c` / `.h` — system stats (heap, uptime) for the web UI
 - `main/webpage/index.html` — the web UI itself
+
+## Troubleshooting high/jittery ping latency
+
+Check `192.168.5.1/api/system` first: `cpu_pct` should be near-idle and `traffic_drops`
+should be ~0 under normal load. If both look fine, the bridge's software
+isn't the bottleneck — check WiFi channel congestion/interference next.
+
+Per-client traffic accounting (`client_track.c`) is intentionally decoupled
+from the packet-forwarding path: `traffic_input_wrapper`/`traffic_output_wrapper`
+hand events to a bounded queue with a non-blocking send (drop-and-count on
+full, never wait), and a dedicated low-priority task drains it. This means
+forwarding can never block on accounting, so it shouldn't need to be a
+suspect in future latency investigations — see the comments at those call
+sites and around the `traffic_account_task` creation in `client_track_init()`.

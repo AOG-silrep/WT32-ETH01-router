@@ -56,6 +56,12 @@ void client_track_get_snapshot(client_info_t *out, int max, int *count);
 // called from the HTTP server task.
 bool client_track_get_history(const uint8_t mac[6], uint32_t since_seq, client_history_t *out);
 
+// Count of traffic events dropped because the hot-path -> accounting-task
+// queue was full (i.e. the accounting task couldn't keep up). Should stay at
+// or near 0 under normal load; a climbing count means
+// TRAFFIC_EVENT_QUEUE_DEPTH in client_track.c needs to be raised.
+uint32_t client_track_get_traffic_drops(void);
+
 #ifdef __cplusplus
 }
 #endif
