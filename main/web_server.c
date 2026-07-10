@@ -52,6 +52,29 @@ static bool json_get_string(const char *json, const char *key, char *out, size_t
     return true;
 }
 
+// Pulls a JSON numeric field's value out of a flat {"key":123,...} object.
+static bool json_get_int(const char *json, const char *key, long *out)
+{
+    char pattern[32];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (p == NULL) {
+        return false;
+    }
+    p = strchr(p + strlen(pattern), ':');
+    if (p == NULL) {
+        return false;
+    }
+    p++;
+    char *end;
+    long val = strtol(p, &end, 10);
+    if (end == p) {
+        return false;
+    }
+    *out = val;
+    return true;
+}
+
 static esp_err_t index_get_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
@@ -65,8 +88,9 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     wifi_config_t cfg;
     esp_wifi_get_config(WIFI_IF_AP, &cfg);
 
-    char resp[64];
-    int len = snprintf(resp, sizeof(resp), "{\"ssid\":\"%s\"}", (const char *)cfg.ap.ssid);
+    char resp[80];
+    int len = snprintf(resp, sizeof(resp), "{\"ssid\":\"%s\",\"channel\":%u}",
+                        (const char *)cfg.ap.ssid, (unsigned)cfg.ap.channel);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, len);
     return ESP_OK;
@@ -94,8 +118,12 @@ static esp_err_t wifi_post_handler(httpd_req_t *req)
     }
     json_get_string(buf, "password", password, sizeof(password)); // absent -> open network
 
+    long channel_val = WIFI_CFG_DEFAULT_CHANNEL;
+    json_get_int(buf, "channel", &channel_val); // absent -> default channel
+    uint8_t channel = (channel_val < 0 || channel_val > 255) ? 0 : (uint8_t)channel_val;
+
     const char *err_msg = NULL;
-    if (!wifi_cfg_validate(ssid, password, &err_msg)) {
+    if (!wifi_cfg_validate(ssid, password, channel, &err_msg)) {
         char resp[128];
         int len = snprintf(resp, sizeof(resp), "{\"ok\":false,\"error\":\"%s\"}", err_msg);
         httpd_resp_set_status(req, "400 Bad Request");
@@ -104,7 +132,7 @@ static esp_err_t wifi_post_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    if (wifi_cfg_save(ssid, password) != ESP_OK) {
+    if (wifi_cfg_save(ssid, password, channel) != ESP_OK) {
         httpd_resp_set_status(req, "500 Internal Server Error");
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, "{\"ok\":false,\"error\":\"Failed to save\"}", HTTPD_RESP_USE_STRLEN);

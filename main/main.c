@@ -46,8 +46,9 @@ static void wifi_init_softap(esp_netif_t **out_wifi_netif)
 {
     char ssid[WIFI_CFG_SSID_MAX_LEN];
     char password[WIFI_CFG_PASSWORD_MAX_LEN];
+    uint8_t channel;
 
-    wifi_cfg_load(ssid, password);
+    wifi_cfg_load(ssid, password, &channel);
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -65,10 +66,11 @@ static void wifi_init_softap(esp_netif_t **out_wifi_netif)
     ESP_ERROR_CHECK(esp_wifi_set_default_wifi_ap_handlers());
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(wifi_cfg_apply(ssid, password));
+    ESP_ERROR_CHECK(wifi_cfg_apply(ssid, password, channel));
 
     ESP_LOGI(TAG, "WiFi AP configured");
     ESP_LOGI(TAG, "  SSID: %s", ssid);
+    ESP_LOGI(TAG, "  Channel: %u", channel);
 
     *out_wifi_netif = wifi_netif;
 }
