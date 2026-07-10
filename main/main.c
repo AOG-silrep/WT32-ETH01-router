@@ -15,7 +15,6 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_netif_br_glue.h"
-#include "esp_http_server.h"
 #include "driver/gpio.h"
 #include "lwip/err.h"
 #include "lwip/sys.h"
@@ -23,14 +22,11 @@
 #include "dhcpserver/dhcpserver.h"
 #include "netif/ethernet.h"
 #include <sys/socket.h>
+#include "wifi_cfg.h"
+#include "client_track.h"
+#include "web_server.h"
 
 static const char *TAG = "AOG-BRIDGE";
-
-// WiFi AP Configuration
-#define WIFI_SSID      "AOG hub"
-#define WIFI_PASS      "password"
-#define WIFI_CHANNEL   1
-#define MAX_STA_CONN   6
 
 // Network Configuration
 #define BRIDGE_IP      "192.168.5.1"
@@ -45,47 +41,12 @@ static const char *TAG = "AOG-BRIDGE";
 #define ETH_MDC_GPIO        23
 #define ETH_MDIO_GPIO       18
 
-// NVS Keys
-#define NVS_NAMESPACE "wifi_config"
-#define NVS_SSID_KEY  "ssid"
-#define NVS_PASS_KEY  "password"
-
-// Load WiFi settings from NVS
-static void load_wifi_config(char *ssid, char *password)
-{
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
-    
-    if(err == ESP_OK){
-        size_t ssid_len = 32;
-        size_t pass_len = 64;
-        
-        err = nvs_get_str(nvs_handle, NVS_SSID_KEY, ssid, &ssid_len);
-        if(err != ESP_OK){
-            strcpy(ssid, WIFI_SSID);
-        }
-        
-        err = nvs_get_str(nvs_handle, NVS_PASS_KEY, password, &pass_len);
-        if(err != ESP_OK){
-            strcpy(password, WIFI_PASS);
-        }
-        
-        nvs_close(nvs_handle);
-        ESP_LOGI(TAG, "Loaded WiFi config - SSID: %s", ssid);
-    }
-    else{
-        strcpy(ssid, WIFI_SSID);
-        strcpy(password, WIFI_PASS);
-        ESP_LOGI(TAG, "Using default WiFi config");
-    }
-}
-
 static void wifi_init_softap(esp_netif_t **out_wifi_netif)
 {
-    char ssid[32];
-    char password[64];
+    char ssid[WIFI_CFG_SSID_MAX_LEN];
+    char password[WIFI_CFG_PASSWORD_MAX_LEN];
 
-    load_wifi_config(ssid, password);
+    wifi_cfg_load(ssid, password);
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -102,24 +63,11 @@ static void wifi_init_softap(esp_netif_t **out_wifi_netif)
     assert(wifi_netif);
     ESP_ERROR_CHECK(esp_wifi_set_default_wifi_ap_handlers());
 
-    wifi_config_t wifi_config = {
-        .ap = {
-            .ssid_len = strlen(ssid),
-            .channel = WIFI_CHANNEL,
-            .max_connection = MAX_STA_CONN,
-            .authmode = WIFI_AUTH_WPA2_PSK,
-        },
-    };
-
-    strcpy((char*)wifi_config.ap.ssid, ssid);
-    strcpy((char*)wifi_config.ap.password, password);
-
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    ESP_ERROR_CHECK(wifi_cfg_apply(ssid, password));
 
     ESP_LOGI(TAG, "WiFi AP configured");
     ESP_LOGI(TAG, "  SSID: %s", ssid);
-    ESP_LOGI(TAG, "  Password: %s", password);
 
     *out_wifi_netif = wifi_netif;
 }
@@ -176,7 +124,8 @@ static void eth_init(esp_netif_t **out_eth_netif, esp_eth_handle_t *out_eth_hand
     *out_eth_handle = eth_handle;
 }
 
-static void setup_bridge(esp_netif_t *eth_netif, esp_netif_t *wifi_netif, const uint8_t *common_mac)
+static void setup_bridge(esp_netif_t *eth_netif, esp_netif_t *wifi_netif, const uint8_t *common_mac,
+                          esp_netif_t **out_br_netif)
 {
     ESP_LOGI(TAG, "Configuring bridge + DHCP Server...");
 
@@ -223,6 +172,8 @@ static void setup_bridge(esp_netif_t *eth_netif, esp_netif_t *wifi_netif, const 
 
     ESP_LOGI(TAG, "Bridge + DHCP Server started");
     ESP_LOGI(TAG, "  IP Pool: %s - %s", DHCP_START, DHCP_END);
+
+    *out_br_netif = br_netif;
 }
 
 void app_main(void)
@@ -259,7 +210,13 @@ void app_main(void)
     wifi_init_softap(&wifi_netif);
 
     // Bridge Ethernet and WiFi AP together, with one DHCP server on the bridge
-    setup_bridge(eth_netif, wifi_netif, common_mac);
+    esp_netif_t *br_netif = NULL;
+    setup_bridge(eth_netif, wifi_netif, common_mac, &br_netif);
+
+    // Hooks the eth/wifi bridge ports for per-client traffic accounting.
+    // Must run before esp_eth_start()/esp_wifi_start() below - see
+    // client_track.h for why the ordering matters.
+    ESP_ERROR_CHECK(client_track_init(eth_netif, wifi_netif, br_netif, common_mac));
 
     // Since MAC forwarding is done in the lwIP bridge, the Ethernet MAC needs
     // to pass through frames not addressed to it.
@@ -270,7 +227,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 
     // Start web server
-    //server = start_webserver();
+    web_server_start();
 
     ESP_LOGI(TAG, "\n====================================");
     ESP_LOGI(TAG, "Bridge Ready!");

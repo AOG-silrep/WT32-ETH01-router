@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgOpen router</title>
+<style>
+  body { font-family: sans-serif; max-width: 640px; margin: 2em auto; padding: 0 1em; color: #222; }
+  h1 { font-size: 1.3em; }
+  h2 { font-size: 1.1em; margin-top: 2em; }
+  label { display: block; margin-top: 0.8em; font-size: 0.9em; }
+  input { width: 100%; box-sizing: border-box; padding: 0.4em; margin-top: 0.2em; font-size: 1em; }
+  button { margin-top: 1em; padding: 0.5em 1.2em; font-size: 1em; }
+  #wifi-msg { margin-top: 0.6em; font-size: 0.9em; }
+  #wifi-msg.error { color: #b00020; }
+  #wifi-msg.ok { color: #0a7a2f; }
+  table { width: 100%; border-collapse: collapse; margin-top: 0.8em; font-size: 0.9em; }
+  th, td { text-align: left; padding: 0.4em 0.5em; border-bottom: 1px solid #ddd; }
+  td.mac, td.ip { font-family: monospace; }
+  tr.stale { color: #999; }
+  tr.stale .rate::after { content: " (idle)"; font-size: 0.85em; }
+  #banner { display: none; background: #b00020; color: #fff; padding: 0.6em 1em; border-radius: 4px; margin-bottom: 1em; }
+  #banner.show { display: block; }
+</style>
+</head>
+<body>
+
+<div id="banner">Lost connection to bridge &mdash; retrying&hellip;</div>
+
+<h1>AgOpen router</h1>
+
+<h2>WiFi</h2>
+<form id="wifi-form">
+  <label for="ssid">Network name (SSID)</label>
+  <input type="text" id="ssid" maxlength="31" required>
+
+  <label for="password">Password (leave blank for an open network)</label>
+  <input type="password" id="password" maxlength="63" autocomplete="new-password">
+
+  <button type="submit">Save &amp; apply</button>
+  <div id="wifi-msg"></div>
+</form>
+
+<h2>Connected clients</h2>
+<table>
+  <thead>
+    <tr><th>Name</th><th>MAC</th><th>IP</th><th>Link</th><th>Signal</th><th>Down</th><th>Up</th></tr>
+  </thead>
+  <tbody id="clients-body">
+    <tr><td colspan="7">Loading&hellip;</td></tr>
+  </tbody>
+</table>
+
+<script>
+function formatRate(bytesPerSec) {
+  if (bytesPerSec >= 1024 * 1024) return (bytesPerSec / (1024 * 1024)).toFixed(1) + ' MB/s';
+  if (bytesPerSec >= 1024) return (bytesPerSec / 1024).toFixed(1) + ' KB/s';
+  return bytesPerSec + ' B/s';
+}
+
+async function loadStatus() {
+  const res = await fetch('/api/status');
+  const data = await res.json();
+  document.getElementById('ssid').value = data.ssid;
+}
+
+async function refreshClients() {
+  const res = await fetch('/api/clients');
+  const clients = await res.json();
+  const body = document.getElementById('clients-body');
+  body.innerHTML = '';
+  if (clients.length === 0) {
+    body.innerHTML = '<tr><td colspan="7">No clients seen yet</td></tr>';
+    return;
+  }
+  for (const c of clients) {
+    const tr = document.createElement('tr');
+    if (c.last_seen_s > 30) tr.className = 'stale';
+    tr.innerHTML =
+      '<td>' + (c.name ? c.name : '&ndash;') + '</td>' +
+      '<td class="mac">' + c.mac + '</td>' +
+      '<td class="ip">' + c.ip + '</td>' +
+      '<td>' + c.link + '</td>' +
+      '<td>' + (c.rssi === null ? '&ndash;' : c.rssi + ' dBm') + '</td>' +
+      '<td class="rate">' + formatRate(c.rx_bps) + '</td>' +
+      '<td class="rate">' + formatRate(c.tx_bps) + '</td>';
+    body.appendChild(tr);
+  }
+}
+
+let failCount = 0;
+async function poll() {
+  try {
+    await refreshClients();
+    failCount = 0;
+    document.getElementById('banner').classList.remove('show');
+  } catch (e) {
+    failCount++;
+    if (failCount >= 2) {
+      document.getElementById('banner').classList.add('show');
+    }
+  }
+}
+
+document.getElementById('wifi-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = document.getElementById('wifi-msg');
+  msg.textContent = '';
+  msg.className = '';
+  const ssid = document.getElementById('ssid').value;
+  const password = document.getElementById('password').value;
+  try {
+    const res = await fetch('/api/wifi', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ssid, password })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      document.getElementById('password').value = '';
+      const banner = document.getElementById('banner');
+      banner.textContent = 'Saved — WiFi is restarting, reconnecting…';
+      banner.classList.add('show');
+      setTimeout(() => location.reload(), 3000);
+    } else {
+      msg.textContent = data.error || 'Failed to save';
+      msg.className = 'error';
+    }
+  } catch (e) {
+    msg.textContent = 'Could not reach the bridge';
+    msg.className = 'error';
+  }
+});
+
+loadStatus();
+poll();
+setInterval(poll, 2000);
+</script>
+
+</body>
+</html>
