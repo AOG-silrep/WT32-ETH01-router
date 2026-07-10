@@ -3,9 +3,11 @@
 #include "web_server.h"
 #include "wifi_cfg.h"
 #include "client_track.h"
+#include "sys_monitor.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -156,6 +158,34 @@ static esp_err_t clients_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t system_get_handler(httpd_req_t *req)
+{
+    uint8_t cpu_pct[SYS_MONITOR_NUM_CORES];
+    sys_monitor_get_cpu_load(cpu_pct);
+
+    client_info_t clients[CLIENT_TRACK_MAX_CLIENTS];
+    int count = 0;
+    client_track_get_snapshot(clients, CLIENT_TRACK_MAX_CLIENTS, &count);
+    uint32_t rx_total = 0, tx_total = 0;
+    for (int i = 0; i < count; i++) {
+        rx_total += clients[i].rx_bps;
+        tx_total += clients[i].tx_bps;
+    }
+
+    char resp[256];
+    int len = snprintf(resp, sizeof(resp),
+                        "{\"uptime_s\":%llu,\"free_heap\":%u,\"min_free_heap\":%u,"
+                        "\"cpu_pct\":[%u,%u],\"net_rx_bps\":%u,\"net_tx_bps\":%u,"
+                        "\"client_count\":%d}",
+                        (unsigned long long)(esp_timer_get_time() / 1000000ULL),
+                        (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(),
+                        (unsigned)cpu_pct[0], (unsigned)cpu_pct[1],
+                        (unsigned)rx_total, (unsigned)tx_total, count);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, len);
+    return ESP_OK;
+}
+
 httpd_handle_t web_server_start(void)
 {
     httpd_handle_t server = NULL;
@@ -172,11 +202,13 @@ httpd_handle_t web_server_start(void)
     const httpd_uri_t status_uri = {.uri = "/api/status", .method = HTTP_GET, .handler = status_get_handler};
     const httpd_uri_t wifi_uri = {.uri = "/api/wifi", .method = HTTP_POST, .handler = wifi_post_handler};
     const httpd_uri_t clients_uri = {.uri = "/api/clients", .method = HTTP_GET, .handler = clients_get_handler};
+    const httpd_uri_t system_uri = {.uri = "/api/system", .method = HTTP_GET, .handler = system_get_handler};
 
     httpd_register_uri_handler(server, &index_uri);
     httpd_register_uri_handler(server, &status_uri);
     httpd_register_uri_handler(server, &wifi_uri);
     httpd_register_uri_handler(server, &clients_uri);
+    httpd_register_uri_handler(server, &system_uri);
 
     ESP_LOGI(TAG, "Web server started");
     return server;

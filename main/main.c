@@ -24,6 +24,7 @@
 #include <sys/socket.h>
 #include "wifi_cfg.h"
 #include "client_track.h"
+#include "sys_monitor.h"
 #include "web_server.h"
 
 static const char *TAG = "AOG-BRIDGE";
@@ -217,6 +218,10 @@ void app_main(void)
     // Must run before esp_eth_start()/esp_wifi_start() below - see
     // client_track.h for why the ordering matters.
     ESP_ERROR_CHECK(client_track_init(eth_netif, wifi_netif, br_netif, common_mac));
+
+    // System monitor (CPU load) for the web UI - no ordering dependency,
+    // just needs the scheduler running.
+    ESP_ERROR_CHECK(sys_monitor_init());
 
     // Since MAC forwarding is done in the lwIP bridge, the Ethernet MAC needs
     // to pass through frames not addressed to it.

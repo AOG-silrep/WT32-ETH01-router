@@ -42,6 +42,17 @@
   <div id="wifi-msg"></div>
 </form>
 
+<h2>System</h2>
+<table>
+  <tbody>
+    <tr><th>Uptime</th><td id="sys-uptime">&hellip;</td></tr>
+    <tr><th>Free heap</th><td id="sys-heap">&hellip;</td></tr>
+    <tr><th>CPU (core 0 / 1)</th><td id="sys-cpu">&hellip;</td></tr>
+    <tr><th>Network (down / up)</th><td id="sys-net">&hellip;</td></tr>
+    <tr><th>Clients</th><td id="sys-clients">&hellip;</td></tr>
+  </tbody>
+</table>
+
 <h2>Connected clients</h2>
 <table>
   <thead>
@@ -57,6 +68,21 @@ function formatRate(bytesPerSec) {
   if (bytesPerSec >= 1024 * 1024) return (bytesPerSec / (1024 * 1024)).toFixed(1) + ' MB/s';
   if (bytesPerSec >= 1024) return (bytesPerSec / 1024).toFixed(1) + ' KB/s';
   return bytesPerSec + ' B/s';
+}
+
+function formatBytes(bytes) {
+  if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return bytes + ' B';
+}
+
+function formatUptime(seconds) {
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (d > 0) return d + 'd ' + h + 'h';
+  if (h > 0) return h + 'h ' + m + 'm';
+  return m + 'm ' + (seconds % 60) + 's';
 }
 
 // Plain fetch() only rejects on a hard network error (refused, DNS, abort) -
@@ -104,10 +130,23 @@ async function refreshClients() {
   }
 }
 
+async function refreshSystem() {
+  const res = await fetchWithTimeout('/api/system', {}, 1500);
+  const s = await res.json();
+  document.getElementById('sys-uptime').textContent = formatUptime(s.uptime_s);
+  document.getElementById('sys-heap').textContent =
+    formatBytes(s.free_heap) + ' (min ' + formatBytes(s.min_free_heap) + ')';
+  document.getElementById('sys-cpu').textContent = s.cpu_pct[0] + '% / ' + s.cpu_pct[1] + '%';
+  document.getElementById('sys-net').textContent =
+    formatRate(s.net_rx_bps) + ' / ' + formatRate(s.net_tx_bps);
+  document.getElementById('sys-clients').textContent = s.client_count;
+}
+
 let failCount = 0;
 async function poll() {
   try {
     await refreshClients();
+    await refreshSystem();
     failCount = 0;
     const banner = document.getElementById('banner');
     banner.classList.remove('show', 'restarting');
