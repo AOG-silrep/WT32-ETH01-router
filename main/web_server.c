@@ -340,16 +340,18 @@ static esp_err_t system_get_handler(httpd_req_t *req)
         tx_total += clients[i].tx_bps;
     }
 
-    char resp[256];
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+
+    char resp[320];
     int len = snprintf(resp, sizeof(resp),
                         "{\"uptime_s\":%llu,\"free_heap\":%u,\"min_free_heap\":%u,"
                         "\"cpu_pct\":[%u,%u],\"net_rx_bps\":%u,\"net_tx_bps\":%u,"
-                        "\"client_count\":%d,\"traffic_drops\":%u}",
+                        "\"client_count\":%d,\"traffic_drops\":%u,\"version\":\"%s\"}",
                         (unsigned long long)(esp_timer_get_time() / 1000000ULL),
                         (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(),
                         (unsigned)cpu_pct[0], (unsigned)cpu_pct[1],
                         (unsigned)rx_total, (unsigned)tx_total, count,
-                        (unsigned)client_track_get_traffic_drops());
+                        (unsigned)client_track_get_traffic_drops(), app_desc->version);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, len);
     return ESP_OK;

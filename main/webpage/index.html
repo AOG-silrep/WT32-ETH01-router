@@ -46,7 +46,7 @@
 
 <div id="banner">Lost connection to bridge &mdash; retrying&hellip;</div>
 
-<h1>AgOpen router</h1>
+<h1>AgOpen router <span id="fw-version" style="font-size: 0.5em; color: #898781; font-weight: normal;"></span></h1>
 
 <h2>WiFi</h2>
 <form id="wifi-form">
@@ -363,6 +363,7 @@ async function refreshSystem() {
   document.getElementById('sys-net').textContent =
     formatRate(s.net_rx_bps) + ' / ' + formatRate(s.net_tx_bps);
   document.getElementById('sys-clients').textContent = s.client_count;
+  document.getElementById('fw-version').textContent = s.version ? 'Rev ' + s.version : '';
 }
 
 let failCount = 0;
