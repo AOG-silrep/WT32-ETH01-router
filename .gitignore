@@ -2,3 +2,4 @@
 /.devcontainer/Dockerfile
 /.devcontainer/devcontainer.json
 /build
+/managed_components
