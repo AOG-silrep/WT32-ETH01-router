@@ -1,5 +1,6 @@
 # wt32-bridge
 
+
 An ESP-IDF firmware project that turns a [WT32-ETH01](https://en.wireless-tag.com/product-item-2.html) (ESP32 + LAN8720 Ethernet PHY) module into an Ethernet↔WiFi bridge for [AgOpenGPS](https://github.com/AgOpenGPS-Official/AgOpenGPS). It bridges the wired Ethernet interface and a WiFi access point at the network layer, and serves a small web UI for configuration and live monitoring.
 
 ## Features
@@ -14,11 +15,31 @@ An ESP-IDF firmware project that turns a [WT32-ETH01](https://en.wireless-tag.co
 
 Requires [ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/get-started/index.html) (v5.3+).
 
+Firmware images are signed (ECDSA), so a local private key is required to build. Generate
+one once per machine you build from:
+
+```sh
+python -m espsecure generate-signing-key --version 1 --scheme ecdsa256 secure_boot_signing_key.pem
+```
+
+`secure_boot_signing_key.pem` is gitignored — never commit it. It's what makes the device
+trust "this project"'s firmware specifically: the bootloader verifies every image's signature
+before booting it (on serial flash and on OTA update via `/api/ota`), and rejects anything not
+signed with this key. Back the key up somewhere private (password manager, encrypted drive) if
+you build from more than one machine; losing it just means generating a new one and
+re-flashing once over serial — it's a software check, not a hardware fuse, so there's no risk
+of bricking.
+
 ```sh
 idf.py set-target esp32
 idf.py build
 idf.py -p <PORT> flash monitor
 ```
+
+Because this changes the bootloader itself, a device previously flashed without signing
+enabled needs one full serial reflash (as above, which writes bootloader + partition table +
+app) to start enforcing it. After that, only images signed with `secure_boot_signing_key.pem`
+will boot.
 
 ## Source layout
 
