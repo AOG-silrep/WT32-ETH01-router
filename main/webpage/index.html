@@ -21,6 +21,7 @@
   tr.stale .rate::after { content: " (idle)"; font-size: 0.85em; }
   #banner { display: none; background: #b00020; color: #fff; padding: 0.6em 1em; border-radius: 4px; margin-bottom: 1em; }
   #banner.show { display: block; }
+  #banner.restarting { background: #c26a00; }
 </style>
 </head>
 <body>
@@ -58,6 +59,21 @@ function formatRate(bytesPerSec) {
   return bytesPerSec + ' B/s';
 }
 
+// Plain fetch() only rejects on a hard network error (refused, DNS, abort) -
+// if the bridge stops responding without tearing down the TCP connection
+// (crash, reboot), the browser can sit on the OS's default connect timeout
+// for a minute or more before it ever rejects. Bound it explicitly so the
+// polling loop below fails on a predictable schedule instead.
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function loadStatus() {
   const res = await fetch('/api/status');
   const data = await res.json();
@@ -65,7 +81,7 @@ async function loadStatus() {
 }
 
 async function refreshClients() {
-  const res = await fetch('/api/clients');
+  const res = await fetchWithTimeout('/api/clients', {}, 1500);
   const clients = await res.json();
   const body = document.getElementById('clients-body');
   body.innerHTML = '';
@@ -93,11 +109,15 @@ async function poll() {
   try {
     await refreshClients();
     failCount = 0;
-    document.getElementById('banner').classList.remove('show');
+    const banner = document.getElementById('banner');
+    banner.classList.remove('show', 'restarting');
   } catch (e) {
     failCount++;
     if (failCount >= 2) {
-      document.getElementById('banner').classList.add('show');
+      const banner = document.getElementById('banner');
+      banner.textContent = 'Lost connection to bridge — retrying…';
+      banner.classList.remove('restarting');
+      banner.classList.add('show');
     }
   }
 }
@@ -120,7 +140,7 @@ document.getElementById('wifi-form').addEventListener('submit', async (e) => {
       document.getElementById('password').value = '';
       const banner = document.getElementById('banner');
       banner.textContent = 'Saved — WiFi is restarting, reconnecting…';
-      banner.classList.add('show');
+      banner.classList.add('show', 'restarting');
       setTimeout(() => location.reload(), 3000);
     } else {
       msg.textContent = data.error || 'Failed to save';
