@@ -1,35 +1,30 @@
-| Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-H2 | ESP32-P4 | ESP32-S2 | ESP32-S3 |
-| ----------------- | ----- | -------- | -------- | -------- | -------- | -------- | -------- | -------- | -------- |
+# wt32-bridge
 
-# _Sample project_
+An ESP-IDF firmware project that turns a [WT32-ETH01](https://en.wireless-tag.com/product-item-2.html) (ESP32 + LAN8720 Ethernet PHY) module into an Ethernet↔WiFi bridge for [AgOpenGPS](https://github.com/AgOpenGPS-Official/AgOpenGPS). It bridges the wired Ethernet interface and a WiFi access point at the network layer, and serves a small web UI for configuration and live monitoring.
 
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
+## Features
 
-This is the simplest buildable example. The example is used by command `idf.py create-project`
-that copies the project to user specified path and set it's name. For more information follow the [docs page](https://docs.espressif.com/projects/esp-idf/en/latest/api-guides/build-system.html#start-a-new-project)
+- Ethernet (LAN8720 PHY) ↔ WiFi AP network bridge (`esp_netif_br_glue`)
+- Web UI (`main/webpage/index.html`) for WiFi configuration and live status
+- Connected-client tracking and per-device traffic graphing
+- System monitor (heap, uptime, etc.) surfaced on the web UI, refreshed every second
+- Configurable WiFi channel (1, 6, or 11)
 
+## Building and flashing
 
+Requires [ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/get-started/index.html) (v5.3+).
 
-## How to use example
-We encourage the users to use the example as a template for the new projects.
-A recommended way is to follow the instructions on a [docs page](https://docs.espressif.com/projects/esp-idf/en/latest/api-guides/build-system.html#start-a-new-project).
-
-## Example folder contents
-
-The project **sample_project** contains one source file in C language [main.c](main/main.c). The file is located in folder [main](main).
-
-ESP-IDF projects are built using CMake. The project build configuration is contained in `CMakeLists.txt`
-files that provide set of directives and instructions describing the project's source files and targets
-(executable, library, or both). 
-
-Below is short explanation of remaining files in the project folder.
-
+```sh
+idf.py set-target esp32
+idf.py build
+idf.py -p <PORT> flash monitor
 ```
-├── CMakeLists.txt
-├── main
-│   ├── CMakeLists.txt
-│   └── main.c
-└── README.md                  This is the file you are currently reading
-```
-Additionally, the sample project contains Makefile and component.mk files, used for the legacy Make based build system. 
-They are not used or needed when building with CMake and idf.py.
+
+## Source layout
+
+- `main/main.c` — startup, Ethernet/WiFi bridge setup
+- `main/wifi_cfg.c` / `.h` — WiFi AP configuration (SSID, channel, credentials)
+- `main/web_server.c` / `.h` — HTTP server backing the web UI
+- `main/client_track.c` / `.h` — connected-client and traffic tracking
+- `main/sys_monitor.c` / `.h` — system stats (heap, uptime) for the web UI
+- `main/webpage/index.html` — the web UI itself

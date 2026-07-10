@@ -5,8 +5,6 @@
 #include "freertos/event_groups.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
-//#include "esp_bridge.h"
-//#include "esp_bridge_internal.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_eth.h"
