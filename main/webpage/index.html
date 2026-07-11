@@ -24,10 +24,12 @@
   #banner.restarting { background: #c26a00; }
   tr.selected { background: #eef4fc; }
   button.watch-btn { margin: 0; padding: 0.2em 0.6em; font-size: 0.85em; }
+  .panel { border: 2px solid #888; border-radius: 4px; padding: 0.8em; margin-top: 1.5em; }
+  .panel h2 { margin-top: 0; }
   #chart-panel {
     --chart-rx: #2a78d6; --chart-tx: #eb6834;
     --chart-grid: #e1e0d9; --chart-axis: #c3c2b7; --chart-muted: #898781;
-    display: none; margin-top: 0.8em; border: 1px solid #ddd; border-radius: 4px; padding: 0.8em;
+    display: none; margin-top: 0.8em; border: 2px solid #888; border-radius: 4px; padding: 0.8em;
   }
   #chart-panel.show { display: block; }
   #chart-panel .chart-head { display: flex; justify-content: space-between; align-items: baseline; font-size: 0.9em; }
@@ -48,6 +50,7 @@
 
 <h1>AgOpen router <span id="fw-version" style="font-size: 0.5em; color: #898781; font-weight: normal;"></span></h1>
 
+<div class="panel">
 <h2>WiFi</h2>
 <form id="wifi-form">
   <label for="ssid">Network name (SSID)</label>
@@ -66,7 +69,9 @@
   <button type="submit">Save &amp; apply</button>
   <div id="wifi-msg"></div>
 </form>
+</div>
 
+<div class="panel">
 <h2>Firmware update</h2>
 <form id="ota-form">
   <label for="ota-file">Firmware image (.bin)</label>
@@ -76,7 +81,9 @@
   <progress id="ota-progress" value="0" max="100"></progress>
   <div id="ota-msg"></div>
 </form>
+</div>
 
+<div class="panel">
 <h2>System</h2>
 <table>
   <tbody>
@@ -87,7 +94,9 @@
     <tr><th>Clients</th><td id="sys-clients">&hellip;</td></tr>
   </tbody>
 </table>
+</div>
 
+<div class="panel">
 <h2>Connected clients</h2>
 <table>
   <thead>
@@ -97,6 +106,7 @@
     <tr><td colspan="8">Loading&hellip;</td></tr>
   </tbody>
 </table>
+</div>
 
 <div id="chart-panel">
   <div class="chart-head">
