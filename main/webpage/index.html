@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AgOpen router</title>
 <style>
-  body { font-family: sans-serif; max-width: 640px; margin: 2em auto; padding: 0 1em; color: #222; }
+  body { font-family: sans-serif; max-width: 1100px; margin: 2em auto; padding: 0 1em; color: #222; }
   h1 { font-size: 1.3em; }
   h2 { font-size: 1.1em; margin-top: 2em; }
   label { display: block; margin-top: 0.8em; font-size: 0.9em; }
@@ -24,8 +24,10 @@
   #banner.restarting { background: #c26a00; }
   tr.selected { background: #eef4fc; }
   button.watch-btn { margin: 0; padding: 0.2em 0.6em; font-size: 0.85em; }
-  .panel { border: 2px solid #888; border-radius: 4px; padding: 0.8em; margin-top: 1.5em; }
+  .panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 1.5em; margin-top: 1.5em; }
+  .panel { border: 2px solid #888; border-radius: 4px; padding: 0.8em; }
   .panel h2 { margin-top: 0; }
+  .panel-wide { grid-column: 1 / -1; }
   #chart-panel {
     --chart-rx: #2a78d6; --chart-tx: #eb6834;
     --chart-grid: #e1e0d9; --chart-axis: #c3c2b7; --chart-muted: #898781;
@@ -49,6 +51,8 @@
 <div id="banner">Lost connection to bridge &mdash; retrying&hellip;</div>
 
 <h1>AgOpen router <span id="fw-version" style="font-size: 0.5em; color: #898781; font-weight: normal;"></span></h1>
+
+<div class="panels">
 
 <div class="panel">
 <h2>WiFi</h2>
@@ -96,7 +100,7 @@
 </table>
 </div>
 
-<div class="panel">
+<div class="panel panel-wide">
 <h2>Connected clients</h2>
 <table>
   <thead>
@@ -106,6 +110,8 @@
     <tr><td colspan="8">Loading&hellip;</td></tr>
   </tbody>
 </table>
+</div>
+
 </div>
 
 <div id="chart-panel">
