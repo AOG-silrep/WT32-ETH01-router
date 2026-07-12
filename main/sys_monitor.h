@@ -18,6 +18,11 @@ esp_err_t sys_monitor_init(void);
 // Thread-safe; intended to be called from the HTTP server task.
 void sys_monitor_get_cpu_load(uint8_t out_pct[SYS_MONITOR_NUM_CORES]);
 
+// Returns the most recently measured actual CPU clock speed in MHz, derived
+// from the CPU cycle counter timed against esp_timer_get_time(). 0 until the
+// first measurement window completes. Thread-safe.
+uint32_t sys_monitor_get_cpu_freq_mhz(void);
+
 #ifdef __cplusplus
 }
 #endif
