@@ -124,7 +124,7 @@
       <span class="legend-item"><i style="background:var(--chart-rx)"></i>Down (rx)</span>
       <span class="legend-item"><i style="background:var(--chart-tx)"></i>Up (tx)</span>
     </div>
-    <div><span id="chart-title"></span> &ndash; <button type="button" id="chart-stop">Stop</button></div>
+    <div><span id="chart-title"></span> &ndash; <button type="button" id="chart-pause">Pause</button> <button type="button" id="chart-stop">Stop</button></div>
   </div>
   <canvas id="traffic-canvas" width="600" height="160"></canvas>
   <div id="chart-tooltip"></div>
@@ -211,6 +211,7 @@ let selectedMac = null;
 let lastSeq = 0;
 let histRx = [];
 let histTx = [];
+let paused = false;
 const HISTORY_VIEW_SAMPLES = 150; // ~30s at the device's 200ms sample period
 
 function selectClient(mac) {
@@ -218,6 +219,8 @@ function selectClient(mac) {
   lastSeq = 0;
   histRx = [];
   histTx = [];
+  paused = false;
+  document.getElementById('chart-pause').textContent = 'Pause';
   document.getElementById('chart-title').textContent = mac;
   document.getElementById('chart-tooltip').textContent = '';
   document.getElementById('chart-panel').classList.add('show');
@@ -234,9 +237,16 @@ document.getElementById('clients-body').addEventListener('click', (e) => {
   if (btn) selectClient(btn.dataset.mac);
 });
 document.getElementById('chart-stop').addEventListener('click', stopWatching);
+document.getElementById('chart-pause').addEventListener('click', (e) => {
+  paused = !paused;
+  e.target.textContent = paused ? 'Resume' : 'Pause';
+});
 
+// While paused, the graph stops polling for new samples so the frozen
+// trace stays put under the cursor - otherwise the 1s poll loop would
+// redraw over the hover crosshair/tooltip before it could be read.
 async function refreshHistory() {
-  if (!selectedMac || document.hidden) return;
+  if (!selectedMac || document.hidden || paused) return;
   try {
     const res = await fetchWithTimeout(
       '/api/client/history?mac=' + selectedMac + '&since=' + lastSeq, {}, 1500);
