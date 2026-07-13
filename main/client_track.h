@@ -15,8 +15,8 @@ extern "C" {
 // Fine-grained traffic history, sampled independently of the 1Hz rx_bps/tx_bps
 // figures below, so a client's page-level graph can show bursts shorter than
 // one second without waiting on (or disturbing) the slower IP/hostname tick.
-#define CLIENT_TRACK_HISTORY_PERIOD_MS 200
-#define CLIENT_TRACK_HISTORY_LEN 32   // 32 * 200ms = 6.4s buffered per client
+#define CLIENT_TRACK_HISTORY_PERIOD_MS 100
+#define CLIENT_TRACK_HISTORY_LEN 32   // 32 * 100ms = 3.2s buffered per client
 
 typedef struct {
     uint8_t mac[6];

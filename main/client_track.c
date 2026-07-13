@@ -51,7 +51,7 @@ typedef struct {
     // cadences never share bookkeeping, both just diffing the same raw
     // cumulative rx_bytes/tx_bytes.
     uint32_t rx_bytes_prev_fast, tx_bytes_prev_fast;
-    uint32_t hist_rx[CLIENT_TRACK_HISTORY_LEN]; // bytes/sec, one per 200ms bucket
+    uint32_t hist_rx[CLIENT_TRACK_HISTORY_LEN]; // bytes/sec, one per CLIENT_TRACK_HISTORY_PERIOD_MS bucket
     uint32_t hist_tx[CLIENT_TRACK_HISTORY_LEN];
     uint32_t hist_seq; // count of fast samples ever produced for this client
 } client_entry_t;

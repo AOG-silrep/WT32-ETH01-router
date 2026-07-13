@@ -203,7 +203,7 @@ async function refreshClients() {
 // --- Single-client traffic graph -------------------------------------------
 //
 // The device already samples every tracked client's byte counters every
-// 200ms and keeps a short ring buffer per client (see client_track.c) - this
+// 100ms and keeps a short ring buffer per client (see client_track.c) - this
 // just polls that buffer at the same 1s cadence as everything else on the
 // page and appends the new (sub-1-second-resolution) samples client-side, so
 // short bursts between polls still show up instead of being averaged away.
@@ -212,7 +212,7 @@ let lastSeq = 0;
 let histRx = [];
 let histTx = [];
 let paused = false;
-const HISTORY_VIEW_SAMPLES = 150; // ~30s at the device's 200ms sample period
+const HISTORY_VIEW_SAMPLES = 300; // ~30s at the device's 100ms sample period
 
 function selectClient(mac) {
   selectedMac = mac;
