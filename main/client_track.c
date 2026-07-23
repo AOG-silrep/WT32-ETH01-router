@@ -163,37 +163,57 @@ static void account_traffic(const uint8_t *mac, bool is_wifi, uint16_t bytes, bo
 static err_t traffic_input_wrapper(struct pbuf *p, struct netif *inp, bool is_wifi,
                                     netif_input_fn orig)
 {
-    if (p != NULL && p->len >= 12) {
-        struct eth_hdr *hdr = (struct eth_hdr *)p->payload;
-        if (mac_is_client(hdr->src.addr)) {
-            // Sniff the source IP straight off the client's own packet when
-            // possible - some clients re-address themselves after DHCP
-            // without ever renewing the lease, so the DHCP lease table
-            // client_track_tick() polls can go stale while this can't.
-            esp_ip4_addr_t src_ip;
-            const esp_ip4_addr_t *src_ip_p = NULL;
-            if (hdr->type == PP_HTONS(ETHTYPE_IP) &&
-                p->len >= sizeof(struct eth_hdr) + IP_HLEN) {
-                struct ip_hdr *iph = (struct ip_hdr *)((uint8_t *)p->payload + sizeof(struct eth_hdr));
-                src_ip.addr = iph->src.addr;
-                src_ip_p = &src_ip;
-            }
-            traffic_event_t ev = {
-                .is_wifi = is_wifi,
-                .bytes = p->tot_len,
-                .is_uplink = true,
-                .observed_ip = { .addr = 0 },
-            };
-            memcpy(ev.mac, hdr->src.addr, 6);
-            if (src_ip_p != NULL) {
-                ev.observed_ip = *src_ip_p;
-            }
-            // Timeout 0 is load-bearing, not a tuning knob: traffic
-            // forwarding must never block on accounting, so a full queue
-            // means drop-and-count here, never wait.
-            if (xQueueSend(s_traffic_q, &ev, 0) != pdTRUE) {
-                s_traffic_drops++;
-            }
+    // p->len is only the first pbuf segment's length; a chained pbuf can have
+    // the eth/IP headers split across segments even though p->tot_len covers
+    // them. Fast-path the common single-segment case, and fall back to
+    // pbuf_copy_partial() (checked against tot_len) for the rare chained one
+    // instead of silently dropping the accounting event for that frame.
+    uint8_t hdrbuf[sizeof(struct eth_hdr) + IP_HLEN];
+    struct eth_hdr *hdr;
+    bool have_ip_hdr;
+    if (p != NULL && p->len >= sizeof(hdrbuf)) {
+        hdr = (struct eth_hdr *)p->payload;
+        have_ip_hdr = true;
+    } else if (p != NULL && p->tot_len >= sizeof(hdrbuf)) {
+        pbuf_copy_partial(p, hdrbuf, sizeof(hdrbuf), 0);
+        hdr = (struct eth_hdr *)hdrbuf;
+        have_ip_hdr = true;
+    } else if (p != NULL && p->len >= 12) {
+        // Header-only frame shorter than eth+IP (e.g. ARP): MAC is still
+        // readable from the first segment, just skip IP sniffing below.
+        hdr = (struct eth_hdr *)p->payload;
+        have_ip_hdr = false;
+    } else {
+        return orig(p, inp);
+    }
+
+    if (mac_is_client(hdr->src.addr)) {
+        // Sniff the source IP straight off the client's own packet when
+        // possible - some clients re-address themselves after DHCP
+        // without ever renewing the lease, so the DHCP lease table
+        // client_track_tick() polls can go stale while this can't.
+        esp_ip4_addr_t src_ip;
+        const esp_ip4_addr_t *src_ip_p = NULL;
+        if (have_ip_hdr && hdr->type == PP_HTONS(ETHTYPE_IP)) {
+            struct ip_hdr *iph = (struct ip_hdr *)((uint8_t *)hdr + sizeof(struct eth_hdr));
+            src_ip.addr = iph->src.addr;
+            src_ip_p = &src_ip;
+        }
+        traffic_event_t ev = {
+            .is_wifi = is_wifi,
+            .bytes = p->tot_len,
+            .is_uplink = true,
+            .observed_ip = { .addr = 0 },
+        };
+        memcpy(ev.mac, hdr->src.addr, 6);
+        if (src_ip_p != NULL) {
+            ev.observed_ip = *src_ip_p;
+        }
+        // Timeout 0 is load-bearing, not a tuning knob: traffic
+        // forwarding must never block on accounting, so a full queue
+        // means drop-and-count here, never wait.
+        if (xQueueSend(s_traffic_q, &ev, 0) != pdTRUE) {
+            s_traffic_drops++;
         }
     }
     return orig(p, inp);
@@ -214,20 +234,29 @@ static err_t wifi_input_wrapper(struct pbuf *p, struct netif *inp)
 static err_t traffic_output_wrapper(struct netif *netif, struct pbuf *p, bool is_wifi,
                                      netif_linkoutput_fn orig)
 {
-    if (p != NULL && p->len >= 12) {
-        struct eth_hdr *hdr = (struct eth_hdr *)p->payload;
-        if (mac_is_client(hdr->dest.addr)) {
-            traffic_event_t ev = {
-                .is_wifi = is_wifi,
-                .bytes = p->tot_len,
-                .is_uplink = false,
-                .observed_ip = { .addr = 0 },
-            };
-            memcpy(ev.mac, hdr->dest.addr, 6);
-            // See traffic_input_wrapper() - timeout 0 here for the same reason.
-            if (xQueueSend(s_traffic_q, &ev, 0) != pdTRUE) {
-                s_traffic_drops++;
-            }
+    // See traffic_input_wrapper() for why this can't just check p->len.
+    uint8_t hdrbuf[12];
+    struct eth_hdr *hdr;
+    if (p != NULL && p->len >= sizeof(hdrbuf)) {
+        hdr = (struct eth_hdr *)p->payload;
+    } else if (p != NULL && p->tot_len >= sizeof(hdrbuf)) {
+        pbuf_copy_partial(p, hdrbuf, sizeof(hdrbuf), 0);
+        hdr = (struct eth_hdr *)hdrbuf;
+    } else {
+        return orig(netif, p);
+    }
+
+    if (mac_is_client(hdr->dest.addr)) {
+        traffic_event_t ev = {
+            .is_wifi = is_wifi,
+            .bytes = p->tot_len,
+            .is_uplink = false,
+            .observed_ip = { .addr = 0 },
+        };
+        memcpy(ev.mac, hdr->dest.addr, 6);
+        // See traffic_input_wrapper() - timeout 0 here for the same reason.
+        if (xQueueSend(s_traffic_q, &ev, 0) != pdTRUE) {
+            s_traffic_drops++;
         }
     }
     return orig(netif, p);
