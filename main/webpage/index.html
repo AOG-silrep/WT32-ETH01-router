@@ -212,6 +212,7 @@ let lastSeq = 0;
 let histRx = [];
 let histTx = [];
 let paused = false;
+let samplePeriodMs = 100;
 const HISTORY_VIEW_SAMPLES = 300; // ~30s at the device's 100ms sample period
 
 function selectClient(mac) {
@@ -267,6 +268,7 @@ async function refreshHistory() {
       histTx = histTx.slice(histTx.length - HISTORY_VIEW_SAMPLES);
     }
     lastSeq = data.seq;
+    samplePeriodMs = data.period_ms;
     drawChart();
   } catch (e) {
     // Same soft-fail as the rest of poll() - the connection-lost banner
@@ -346,7 +348,7 @@ function drawChart(hoverX) {
   drawSeries(histTx, txColor);
 
   // x-axis time-span labels (device sample period, not wall-clock timestamps).
-  const spanS = (HISTORY_VIEW_SAMPLES * 200) / 1000;
+  const spanS = (HISTORY_VIEW_SAMPLES * samplePeriodMs) / 1000;
   ctx.fillStyle = mutedColor;
   ctx.textBaseline = 'top';
   ctx.textAlign = 'left';
@@ -366,7 +368,7 @@ function drawChart(hoverX) {
       ctx.moveTo(x, padT);
       ctx.lineTo(x, padT + plotH);
       ctx.stroke();
-      const agoS = (((histRx.length - 1 - idx) * 200) / 1000).toFixed(1);
+      const agoS = (((histRx.length - 1 - idx) * samplePeriodMs) / 1000).toFixed(1);
       document.getElementById('chart-tooltip').textContent =
         '-' + agoS + 's:  down ' + formatRate(histRx[idx]) + '   up ' + formatRate(histTx[idx]);
     }
