@@ -87,6 +87,8 @@
   <progress id="ota-progress" value="0" max="100"></progress>
   <div id="ota-msg"></div>
 </form>
+<p style="margin-top: 1.2em; margin-bottom: 0;"><strong>Change admin login</strong></p>
+<button type="button" id="admin-login-btn">Update username &amp; password</button>
 </div>
 
 <div class="panel">
@@ -131,6 +133,11 @@
 </div>
 
 <script>
+// The whole site sits behind HTTP Basic Auth (see check_admin_auth() in
+// web_server.c) - the browser's native login prompt collects credentials
+// on the first request and attaches them to every request after that, so
+// there's no client-side login code here at all.
+
 function formatRate(bytesPerSec) {
   if (bytesPerSec >= 1024 * 1024) return (bytesPerSec / (1024 * 1024)).toFixed(1) + '\u00A0MB/s';
   if (bytesPerSec >= 1024) return (bytesPerSec / 1024).toFixed(1) + '\u00A0KB/s';
@@ -453,6 +460,10 @@ document.getElementById('wifi-form').addEventListener('submit', async (e) => {
     msg.textContent = 'Could not reach the bridge';
     msg.className = 'error';
   }
+});
+
+document.getElementById('admin-login-btn').addEventListener('click', () => {
+  location.href = '/admin';
 });
 
 document.getElementById('ota-file').addEventListener('change', (e) => {

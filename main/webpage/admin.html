@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgOpen router &ndash; Admin login</title>
+<style>
+  body { font-family: sans-serif; max-width: 420px; margin: 2em auto; padding: 0 1em; color: #222; }
+  h1 { font-size: 1.3em; }
+  a.back { font-size: 0.9em; text-decoration: none; color: #2a78d6; }
+  .panel { border: 2px solid #888; border-radius: 4px; padding: 0.8em; margin-top: 1em; }
+  label { display: block; margin-top: 0.8em; font-size: 0.9em; }
+  input { width: 100%; box-sizing: border-box; padding: 0.4em; margin-top: 0.2em; font-size: 1em; }
+  button { margin-top: 1em; padding: 0.5em 1.2em; font-size: 1em; }
+  #admin-msg { margin-top: 0.6em; font-size: 0.9em; }
+  #admin-msg.error { color: #b00020; }
+  #admin-msg.ok { color: #0a7a2f; }
+</style>
+</head>
+<body>
+
+<a class="back" href="/">&larr; Back to router</a>
+<h1>Admin login</h1>
+
+<div class="panel">
+<form id="admin-form">
+  <label for="new-admin-user">New admin username (leave blank to keep the current one)</label>
+  <input type="text" id="new-admin-user" maxlength="31" autocomplete="off">
+
+  <label for="new-admin-password">New admin password (leave blank to keep the current one)</label>
+  <input type="password" id="new-admin-password" maxlength="63" autocomplete="new-password">
+
+  <button type="submit">Save</button>
+  <div id="admin-msg"></div>
+</form>
+</div>
+
+<script>
+document.getElementById('admin-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = document.getElementById('admin-msg');
+  msg.textContent = '';
+  msg.className = '';
+  const newUserInput = document.getElementById('new-admin-user');
+  const newPasswordInput = document.getElementById('new-admin-password');
+  const newUser = newUserInput.value;
+  const newPassword = newPasswordInput.value;
+  if (!newUser && !newPassword) {
+    msg.textContent = 'Enter a new username and/or password';
+    msg.className = 'error';
+    return;
+  }
+  try {
+    const res = await fetch('/api/admin', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        new_admin_user: newUser || undefined,
+        new_admin_password: newPassword || undefined
+      })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      newUserInput.value = '';
+      newPasswordInput.value = '';
+      msg.textContent = 'Saved. You may be asked to log in again with the new credentials.';
+      msg.className = 'ok';
+    } else {
+      msg.textContent = data.error || 'Failed to save';
+      msg.className = 'error';
+    }
+  } catch (err) {
+    msg.textContent = 'Could not reach the bridge';
+    msg.className = 'error';
+  }
+});
+</script>
+
+</body>
+</html>
