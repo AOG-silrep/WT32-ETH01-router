@@ -45,6 +45,7 @@ typedef struct {
     uint32_t rx_bps, tx_bps;
     uint32_t rx_pkts, tx_pkts;             // cumulative, one per accounted frame regardless of protocol
     uint32_t rx_pkts_prev, tx_pkts_prev;   // previous 1Hz tick's cumulative, for rate calc
+    uint32_t rx_pps, tx_pps;
     int64_t last_seen_us;
     char name[CLIENT_TRACK_NAME_MAX_LEN];
 
@@ -53,8 +54,11 @@ typedef struct {
     // cadences never share bookkeeping, both just diffing the same raw
     // cumulative rx_bytes/tx_bytes.
     uint32_t rx_bytes_prev_fast, tx_bytes_prev_fast;
+    uint32_t rx_pkts_prev_fast, tx_pkts_prev_fast;
     uint32_t hist_rx[CLIENT_TRACK_HISTORY_LEN]; // bytes/sec, one per CLIENT_TRACK_HISTORY_PERIOD_MS bucket
     uint32_t hist_tx[CLIENT_TRACK_HISTORY_LEN];
+    uint32_t hist_rx_pps[CLIENT_TRACK_HISTORY_LEN]; // packets/sec, same buckets as hist_rx/hist_tx
+    uint32_t hist_tx_pps[CLIENT_TRACK_HISTORY_LEN];
     uint32_t hist_seq; // count of fast samples ever produced for this client
 } client_entry_t;
 
@@ -361,10 +365,12 @@ static void client_track_tick(void)
         e->tx_bps = e->tx_bytes - e->tx_bytes_prev;
         e->rx_bytes_prev = e->rx_bytes;
         e->tx_bytes_prev = e->tx_bytes;
-        rx_pps_sum += e->rx_pkts - e->rx_pkts_prev;
-        tx_pps_sum += e->tx_pkts - e->tx_pkts_prev;
+        e->rx_pps = e->rx_pkts - e->rx_pkts_prev;
+        e->tx_pps = e->tx_pkts - e->tx_pkts_prev;
         e->rx_pkts_prev = e->rx_pkts;
         e->tx_pkts_prev = e->tx_pkts;
+        rx_pps_sum += e->rx_pps;
+        tx_pps_sum += e->tx_pps;
         memcpy(macs[n], e->mac, 6);
         n++;
     }
@@ -431,9 +437,15 @@ static void client_track_fast_sample(void)
         uint32_t tx_delta = e->tx_bytes - e->tx_bytes_prev_fast;
         e->rx_bytes_prev_fast = e->rx_bytes;
         e->tx_bytes_prev_fast = e->tx_bytes;
+        uint32_t rx_pkt_delta = e->rx_pkts - e->rx_pkts_prev_fast;
+        uint32_t tx_pkt_delta = e->tx_pkts - e->tx_pkts_prev_fast;
+        e->rx_pkts_prev_fast = e->rx_pkts;
+        e->tx_pkts_prev_fast = e->tx_pkts;
         int idx = e->hist_seq % CLIENT_TRACK_HISTORY_LEN;
         e->hist_rx[idx] = rx_delta * (1000 / CLIENT_TRACK_HISTORY_PERIOD_MS);
         e->hist_tx[idx] = tx_delta * (1000 / CLIENT_TRACK_HISTORY_PERIOD_MS);
+        e->hist_rx_pps[idx] = rx_pkt_delta * (1000 / CLIENT_TRACK_HISTORY_PERIOD_MS);
+        e->hist_tx_pps[idx] = tx_pkt_delta * (1000 / CLIENT_TRACK_HISTORY_PERIOD_MS);
         e->hist_seq++;
     }
     xSemaphoreGive(s_mutex);
@@ -544,6 +556,8 @@ void client_track_get_snapshot(client_info_t *out, int max, int *count)
         o->rssi = e->rssi;
         o->rx_bps = e->rx_bps;
         o->tx_bps = e->tx_bps;
+        o->rx_pps = e->rx_pps;
+        o->tx_pps = e->tx_pps;
         int64_t age_us = now - e->last_seen_us;
         o->last_seen_s = age_us > 0 ? (uint32_t)(age_us / 1000000) : 0;
         strlcpy(o->name, e->name, sizeof(o->name));
@@ -584,6 +598,8 @@ bool client_track_get_history(const uint8_t mac[6], uint32_t since_seq, client_h
             int idx = (start + k) % CLIENT_TRACK_HISTORY_LEN;
             out->rx_bps[k] = e->hist_rx[idx];
             out->tx_bps[k] = e->hist_tx[idx];
+            out->rx_pps[k] = e->hist_rx_pps[idx];
+            out->tx_pps[k] = e->hist_tx_pps[idx];
         }
         break;
     }

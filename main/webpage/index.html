@@ -100,7 +100,7 @@
     <tr><th>CPU (core 0 / 1)</th><td id="sys-cpu">&hellip;</td></tr>
     <tr><th title="Measured from the CPU cycle counter timed against esp_timer_get_time(), independent of the configured clock setting.">CPU speed</th><td id="sys-cpu-freq" title="Measured from the CPU cycle counter timed against esp_timer_get_time(), independent of the configured clock setting.">&hellip;</td></tr>
     <tr><th>Network (up / down)</th><td id="sys-net">&hellip;</td></tr>
-    <tr><th title="Frames/sec, all protocols (TCP, UDP, ARP, etc.) combined.">Messages (up / down)</th><td id="sys-pps" title="Frames/sec, all protocols (TCP, UDP, ARP, etc.) combined.">&hellip;</td></tr>
+    <tr><th title="Frames/sec, all protocols (TCP, UDP, ARP, etc.) combined.">Packets (up / down)</th><td id="sys-pps" title="Frames/sec, all protocols (TCP, UDP, ARP, etc.) combined.">&hellip;</td></tr>
     <tr><th>Clients</th><td id="sys-clients">&hellip;</td></tr>
     <tr><th title="Missed bandwidth samples since boot — a rising count means traffic accounting is falling behind under load. Does not mean the bridge is actually dropping network packets.">Unreported traffic</th><td id="sys-drops" title="Missed bandwidth samples since boot — a rising count means traffic accounting is falling behind under load. Does not mean the bridge is actually dropping network packets.">&hellip;</td></tr>
   </tbody>
@@ -111,10 +111,13 @@
 <h2>Connected clients</h2>
 <table>
   <thead>
-    <tr><th>Name</th><th>MAC</th><th>IP</th><th>Link</th><th>Signal</th><th>Down</th><th>Up</th><th></th></tr>
+    <tr><th>Name</th><th>MAC</th><th>IP</th><th>Link</th><th>Signal</th>
+        <th>Bytes&nbsp;&darr;</th><th>Bytes&nbsp;&uarr;</th>
+        <th title="Frames/sec, all protocols combined.">Packets&nbsp;&darr;</th>
+        <th title="Frames/sec, all protocols combined.">Packets&nbsp;&uarr;</th><th></th></tr>
   </thead>
   <tbody id="clients-body">
-    <tr><td colspan="8">Loading&hellip;</td></tr>
+    <tr><td colspan="10">Loading&hellip;</td></tr>
   </tbody>
 </table>
 </div>
@@ -127,7 +130,7 @@
       <span class="legend-item"><i style="background:var(--chart-rx)"></i>Down (rx)</span>
       <span class="legend-item"><i style="background:var(--chart-tx)"></i>Up (tx)</span>
     </div>
-    <div><span id="chart-title"></span> &ndash; <button type="button" id="chart-pause">Pause</button> <button type="button" id="chart-stop">Stop</button></div>
+    <div><span id="chart-title"></span> &ndash; <button type="button" id="chart-mode">Show packets/s</button> <button type="button" id="chart-pause">Pause</button> <button type="button" id="chart-stop">Stop</button></div>
   </div>
   <canvas id="traffic-canvas" width="600" height="160"></canvas>
   <div id="chart-tooltip"></div>
@@ -193,7 +196,7 @@ async function refreshClients() {
   const body = document.getElementById('clients-body');
   body.innerHTML = '';
   if (clients.length === 0) {
-    body.innerHTML = '<tr><td colspan="8">No clients seen yet</td></tr>';
+    body.innerHTML = '<tr><td colspan="10">No clients seen yet</td></tr>';
     return;
   }
   for (const c of clients) {
@@ -207,6 +210,8 @@ async function refreshClients() {
       '<td>' + (c.rssi === null ? '&ndash;' : c.rssi + ' dBm') + '</td>' +
       '<td class="rate">' + formatRate(c.rx_bps) + '</td>' +
       '<td class="rate">' + formatRate(c.tx_bps) + '</td>' +
+      '<td class="rate">' + formatPps(c.rx_pps) + '</td>' +
+      '<td class="rate">' + formatPps(c.tx_pps) + '</td>' +
       '<td><button type="button" class="watch-btn" data-mac="' + c.mac + '">' +
         (c.mac === selectedMac ? 'Watching' : 'Graph') + '</button></td>';
     body.appendChild(tr);
@@ -224,7 +229,10 @@ let selectedMac = null;
 let lastSeq = 0;
 let histRx = [];
 let histTx = [];
+let histRxPps = [];
+let histTxPps = [];
 let paused = false;
+let chartMode = 'bytes'; // 'bytes' | 'pps' - which pair of series drawChart() plots
 let samplePeriodMs = 100;
 const HISTORY_VIEW_SAMPLES = 300; // ~30s at the device's 100ms sample period
 
@@ -233,6 +241,8 @@ function selectClient(mac) {
   lastSeq = 0;
   histRx = [];
   histTx = [];
+  histRxPps = [];
+  histTxPps = [];
   paused = false;
   document.getElementById('chart-pause').textContent = 'Pause';
   document.getElementById('chart-title').textContent = mac;
@@ -255,6 +265,11 @@ document.getElementById('chart-pause').addEventListener('click', (e) => {
   paused = !paused;
   e.target.textContent = paused ? 'Resume' : 'Pause';
 });
+document.getElementById('chart-mode').addEventListener('click', (e) => {
+  chartMode = chartMode === 'bytes' ? 'pps' : 'bytes';
+  e.target.textContent = chartMode === 'bytes' ? 'Show packets/s' : 'Show bytes/s';
+  drawChart();
+});
 
 // While paused, the graph stops polling for new samples so the frozen
 // trace stays put under the cursor - otherwise the 1s poll loop would
@@ -273,12 +288,20 @@ async function refreshHistory() {
     if (data.reset) {
       histRx = [];
       histTx = [];
+      histRxPps = [];
+      histTxPps = [];
     }
     histRx.push(...data.rx);
     histTx.push(...data.tx);
+    histRxPps.push(...data.rx_pps);
+    histTxPps.push(...data.tx_pps);
     if (histRx.length > HISTORY_VIEW_SAMPLES) {
       histRx = histRx.slice(histRx.length - HISTORY_VIEW_SAMPLES);
       histTx = histTx.slice(histTx.length - HISTORY_VIEW_SAMPLES);
+    }
+    if (histRxPps.length > HISTORY_VIEW_SAMPLES) {
+      histRxPps = histRxPps.slice(histRxPps.length - HISTORY_VIEW_SAMPLES);
+      histTxPps = histTxPps.slice(histTxPps.length - HISTORY_VIEW_SAMPLES);
     }
     lastSeq = data.seq;
     samplePeriodMs = data.period_ms;
@@ -303,7 +326,10 @@ function drawChart(hoverX) {
 
   const padL = 44, padR = 8, padT = 8, padB = 16;
   const plotW = cssW - padL - padR, plotH = cssH - padT - padB;
-  const n = Math.max(histRx.length, histTx.length);
+  const seriesRx = chartMode === 'bytes' ? histRx : histRxPps;
+  const seriesTx = chartMode === 'bytes' ? histTx : histTxPps;
+  const fmt = chartMode === 'bytes' ? formatRate : formatPps;
+  const n = Math.max(seriesRx.length, seriesTx.length);
 
   const style = getComputedStyle(document.getElementById('chart-panel'));
   const gridColor = style.getPropertyValue('--chart-grid').trim();
@@ -313,8 +339,8 @@ function drawChart(hoverX) {
   const txColor = style.getPropertyValue('--chart-tx').trim();
 
   let maxVal = 1;
-  for (const v of histRx) if (v > maxVal) maxVal = v;
-  for (const v of histTx) if (v > maxVal) maxVal = v;
+  for (const v of seriesRx) if (v > maxVal) maxVal = v;
+  for (const v of seriesTx) if (v > maxVal) maxVal = v;
   maxVal *= 1.15;
 
   // Gridlines + y-axis rate labels (0 / mid / max).
@@ -329,7 +355,7 @@ function drawChart(hoverX) {
     ctx.moveTo(padL, y);
     ctx.lineTo(padL + plotW, y);
     ctx.stroke();
-    ctx.fillText(formatRate(Math.round(maxVal * frac)), padL - 6, y);
+    ctx.fillText(fmt(Math.round(maxVal * frac)), padL - 6, y);
   });
   ctx.strokeStyle = axisColor;
   ctx.beginPath();
@@ -357,8 +383,8 @@ function drawChart(hoverX) {
     });
     ctx.stroke();
   }
-  drawSeries(histRx, rxColor);
-  drawSeries(histTx, txColor);
+  drawSeries(seriesRx, rxColor);
+  drawSeries(seriesTx, txColor);
 
   // x-axis time-span labels (device sample period, not wall-clock timestamps).
   const spanS = (HISTORY_VIEW_SAMPLES * samplePeriodMs) / 1000;
@@ -371,9 +397,9 @@ function drawChart(hoverX) {
 
   // Hover crosshair + point readout.
   if (hoverX !== undefined) {
-    const offsetRx = HISTORY_VIEW_SAMPLES - histRx.length;
+    const offsetRx = HISTORY_VIEW_SAMPLES - seriesRx.length;
     const idx = Math.round(((hoverX - padL) / plotW) * (HISTORY_VIEW_SAMPLES - 1)) - offsetRx;
-    if (idx >= 0 && idx < histRx.length) {
+    if (idx >= 0 && idx < seriesRx.length) {
       const x = xAt(offsetRx + idx);
       ctx.strokeStyle = axisColor;
       ctx.lineWidth = 1;
@@ -381,9 +407,9 @@ function drawChart(hoverX) {
       ctx.moveTo(x, padT);
       ctx.lineTo(x, padT + plotH);
       ctx.stroke();
-      const agoS = (((histRx.length - 1 - idx) * samplePeriodMs) / 1000).toFixed(1);
+      const agoS = (((seriesRx.length - 1 - idx) * samplePeriodMs) / 1000).toFixed(1);
       document.getElementById('chart-tooltip').textContent =
-        '-' + agoS + 's:  down ' + formatRate(histRx[idx]) + '   up ' + formatRate(histTx[idx]);
+        '-' + agoS + 's:  down ' + fmt(seriesRx[idx]) + '   up ' + fmt(seriesTx[idx]);
     }
   }
 }

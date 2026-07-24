@@ -462,7 +462,7 @@ static esp_err_t clients_get_handler(httpd_req_t *req)
     int count = 0;
     client_track_get_snapshot(clients, CLIENT_TRACK_MAX_CLIENTS, &count);
 
-    static char resp[CLIENT_TRACK_MAX_CLIENTS * (160 + CLIENT_TRACK_NAME_MAX_LEN) + 16];
+    static char resp[CLIENT_TRACK_MAX_CLIENTS * (200 + CLIENT_TRACK_NAME_MAX_LEN) + 16];
     int off = snprintf(resp, sizeof(resp), "[");
     for (int i = 0; i < count && off < sizeof(resp); i++) {
         client_info_t *c = &clients[i];
@@ -477,11 +477,13 @@ static esp_err_t clients_get_handler(httpd_req_t *req)
         off += snprintf(resp + off, sizeof(resp) - off,
                          "%s{\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"ip\":\"%s\","
                          "\"link\":\"%s\",\"rssi\":%s,\"rx_bps\":%u,\"tx_bps\":%u,"
+                         "\"rx_pps\":%u,\"tx_pps\":%u,"
                          "\"last_seen_s\":%u,\"name\":\"%s\"}",
                          i == 0 ? "" : ",",
                          c->mac[0], c->mac[1], c->mac[2], c->mac[3], c->mac[4], c->mac[5],
                          ip_str, c->is_wifi ? "wifi" : "eth", rssi_str,
-                         (unsigned)c->rx_bps, (unsigned)c->tx_bps, (unsigned)c->last_seen_s,
+                         (unsigned)c->rx_bps, (unsigned)c->tx_bps,
+                         (unsigned)c->rx_pps, (unsigned)c->tx_pps, (unsigned)c->last_seen_s,
                          c->name);
     }
     off += snprintf(resp + off, sizeof(resp) - off, "]");
@@ -534,7 +536,7 @@ static esp_err_t client_history_get_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    static char resp[900];
+    static char resp[1600];
     int off = snprintf(resp, sizeof(resp),
                         "{\"mac\":\"%s\",\"period_ms\":%d,\"seq\":%u,\"reset\":%s,\"rx\":[",
                         mac_str, CLIENT_TRACK_HISTORY_PERIOD_MS, (unsigned)hist.seq,
@@ -545,6 +547,14 @@ static esp_err_t client_history_get_handler(httpd_req_t *req)
     off += snprintf(resp + off, sizeof(resp) - off, "],\"tx\":[");
     for (int i = 0; i < hist.count && off < sizeof(resp); i++) {
         off += snprintf(resp + off, sizeof(resp) - off, "%s%u", i == 0 ? "" : ",", (unsigned)hist.tx_bps[i]);
+    }
+    off += snprintf(resp + off, sizeof(resp) - off, "],\"rx_pps\":[");
+    for (int i = 0; i < hist.count && off < sizeof(resp); i++) {
+        off += snprintf(resp + off, sizeof(resp) - off, "%s%u", i == 0 ? "" : ",", (unsigned)hist.rx_pps[i]);
+    }
+    off += snprintf(resp + off, sizeof(resp) - off, "],\"tx_pps\":[");
+    for (int i = 0; i < hist.count && off < sizeof(resp); i++) {
+        off += snprintf(resp + off, sizeof(resp) - off, "%s%u", i == 0 ? "" : ",", (unsigned)hist.tx_pps[i]);
     }
     off += snprintf(resp + off, sizeof(resp) - off, "]}");
 

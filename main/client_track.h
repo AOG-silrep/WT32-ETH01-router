@@ -25,6 +25,8 @@ typedef struct {
     int8_t rssi;         // valid only when is_wifi
     uint32_t rx_bps;     // bridge -> client, bytes/sec (downlink)
     uint32_t tx_bps;     // client -> bridge, bytes/sec (uplink)
+    uint32_t rx_pps;     // bridge -> client, packets/sec (downlink), any protocol
+    uint32_t tx_pps;     // client -> bridge, packets/sec (uplink), any protocol
     uint32_t last_seen_s; // seconds since this client's last observed traffic
     char name[CLIENT_TRACK_NAME_MAX_LEN]; // DHCP hostname (option 12); empty if unknown
 } client_info_t;
@@ -35,6 +37,8 @@ typedef struct {
     int count;         // number of samples actually returned, oldest..newest
     uint32_t rx_bps[CLIENT_TRACK_HISTORY_LEN];
     uint32_t tx_bps[CLIENT_TRACK_HISTORY_LEN];
+    uint32_t rx_pps[CLIENT_TRACK_HISTORY_LEN];
+    uint32_t tx_pps[CLIENT_TRACK_HISTORY_LEN];
 } client_history_t;
 
 // Hooks the eth/wifi bridge ports for per-client byte counting and starts
