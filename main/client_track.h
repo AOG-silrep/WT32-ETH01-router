@@ -62,6 +62,11 @@ bool client_track_get_history(const uint8_t mac[6], uint32_t since_seq, client_h
 // TRAFFIC_EVENT_QUEUE_DEPTH in client_track.c needs to be raised.
 uint32_t client_track_get_traffic_drops(void);
 
+// Bridge-wide packet rate (all tracked clients summed, every protocol -
+// TCP/UDP/ARP/etc. alike), updated once per second alongside rx_bps/tx_bps.
+// Thread-safe; intended to be called from the HTTP server task.
+void client_track_get_traffic_pps(uint32_t *rx_pps, uint32_t *tx_pps);
+
 #ifdef __cplusplus
 }
 #endif

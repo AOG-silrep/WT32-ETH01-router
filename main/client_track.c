@@ -43,6 +43,8 @@ typedef struct {
     uint32_t rx_bytes, tx_bytes;           // cumulative
     uint32_t rx_bytes_prev, tx_bytes_prev; // previous 1Hz tick's cumulative, for rate calc
     uint32_t rx_bps, tx_bps;
+    uint32_t rx_pkts, tx_pkts;             // cumulative, one per accounted frame regardless of protocol
+    uint32_t rx_pkts_prev, tx_pkts_prev;   // previous 1Hz tick's cumulative, for rate calc
     int64_t last_seen_us;
     char name[CLIENT_TRACK_NAME_MAX_LEN];
 
@@ -60,6 +62,7 @@ static client_entry_t s_clients[CLIENT_TRACK_MAX_CLIENTS];
 static SemaphoreHandle_t s_mutex;
 static QueueHandle_t s_traffic_q;
 static volatile uint32_t s_traffic_drops;
+static uint32_t s_net_rx_pps, s_net_tx_pps; // bridge-wide, summed across clients each 1Hz tick
 
 static esp_netif_t *s_eth_netif;
 static esp_netif_t *s_wifi_netif;
@@ -146,8 +149,10 @@ static void account_traffic(const uint8_t *mac, bool is_wifi, uint16_t bytes, bo
         e->is_wifi = is_wifi;
         if (is_uplink) {
             e->tx_bytes += bytes;
+            e->tx_pkts++;
         } else {
             e->rx_bytes += bytes;
+            e->rx_pkts++;
         }
         e->last_seen_us = esp_timer_get_time();
         if (observed_ip != NULL) {
@@ -340,6 +345,7 @@ static void client_track_tick(void)
     int64_t now = esp_timer_get_time();
     uint8_t macs[CLIENT_TRACK_MAX_CLIENTS][6];
     int n = 0;
+    uint32_t rx_pps_sum = 0, tx_pps_sum = 0;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < CLIENT_TRACK_MAX_CLIENTS; i++) {
@@ -355,9 +361,15 @@ static void client_track_tick(void)
         e->tx_bps = e->tx_bytes - e->tx_bytes_prev;
         e->rx_bytes_prev = e->rx_bytes;
         e->tx_bytes_prev = e->tx_bytes;
+        rx_pps_sum += e->rx_pkts - e->rx_pkts_prev;
+        tx_pps_sum += e->tx_pkts - e->tx_pkts_prev;
+        e->rx_pkts_prev = e->rx_pkts;
+        e->tx_pkts_prev = e->tx_pkts;
         memcpy(macs[n], e->mac, 6);
         n++;
     }
+    s_net_rx_pps = rx_pps_sum;
+    s_net_tx_pps = tx_pps_sum;
     xSemaphoreGive(s_mutex);
 
     // Resolve IPs outside the lock: DHCP lease table first, ARP cache as a
@@ -504,6 +516,14 @@ esp_err_t client_track_init(esp_netif_t *eth_netif, esp_netif_t *wifi_netif,
 uint32_t client_track_get_traffic_drops(void)
 {
     return s_traffic_drops;
+}
+
+void client_track_get_traffic_pps(uint32_t *rx_pps, uint32_t *tx_pps)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    *rx_pps = s_net_rx_pps;
+    *tx_pps = s_net_tx_pps;
+    xSemaphoreGive(s_mutex);
 }
 
 void client_track_get_snapshot(client_info_t *out, int max, int *count)
