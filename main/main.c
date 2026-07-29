@@ -25,6 +25,7 @@
 #include "client_track.h"
 #include "sys_monitor.h"
 #include "web_server.h"
+#include "serial_console.h"
 
 static const char *TAG = "AOG-BRIDGE";
 
@@ -234,6 +235,11 @@ void app_main(void)
 
     // Start web server
     web_server_start();
+
+    // Interactive command console over the same UART used for log output -
+    // needs WiFi/NVS/client tracking already up since its commands depend
+    // on them.
+    ESP_ERROR_CHECK(serial_console_init());
 
     // Mark this boot as good now that every startup-critical subsystem above
     // has come up without hitting an ESP_ERROR_CHECK abort. Cancels the
