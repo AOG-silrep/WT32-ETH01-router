@@ -101,7 +101,6 @@
     <tr><th title="Measured from the CPU cycle counter timed against esp_timer_get_time(), independent of the configured clock setting.">CPU speed</th><td id="sys-cpu-freq" title="Measured from the CPU cycle counter timed against esp_timer_get_time(), independent of the configured clock setting.">&hellip;</td></tr>
     <tr><th>Network (up / down)</th><td id="sys-net">&hellip;</td></tr>
     <tr><th title="Frames/sec, all protocols (TCP, UDP, ARP, etc.) combined.">Packets (up / down)</th><td id="sys-pps" title="Frames/sec, all protocols (TCP, UDP, ARP, etc.) combined.">&hellip;</td></tr>
-    <tr><th>Clients</th><td id="sys-clients">&hellip;</td></tr>
     <tr><th title="Missed bandwidth samples since boot — a rising count means traffic accounting is falling behind under load. Does not mean the bridge is actually dropping network packets.">Unreported traffic</th><td id="sys-drops" title="Missed bandwidth samples since boot — a rising count means traffic accounting is falling behind under load. Does not mean the bridge is actually dropping network packets.">&hellip;</td></tr>
   </tbody>
 </table>
@@ -436,7 +435,6 @@ async function refreshSystem() {
     formatRate(s.net_tx_bps) + '<br>' + formatRate(s.net_rx_bps);
   document.getElementById('sys-pps').innerHTML =
     formatPps(s.net_tx_pps) + '<br>' + formatPps(s.net_rx_pps);
-  document.getElementById('sys-clients').textContent = s.client_count;
   const dropsEl = document.getElementById('sys-drops');
   dropsEl.textContent = s.traffic_drops;
   dropsEl.classList.toggle('warn', s.traffic_drops > 0);

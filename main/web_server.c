@@ -591,11 +591,11 @@ static esp_err_t system_get_handler(httpd_req_t *req)
                         "{\"uptime_s\":%llu,\"free_heap\":%u,\"min_free_heap\":%u,"
                         "\"cpu_pct\":[%u,%u],\"cpu_freq_mhz\":%u,\"net_rx_bps\":%u,\"net_tx_bps\":%u,"
                         "\"net_rx_pps\":%u,\"net_tx_pps\":%u,"
-                        "\"client_count\":%d,\"traffic_drops\":%u,\"version\":\"%s\"}",
+                        "\"traffic_drops\":%u,\"version\":\"%s\"}",
                         (unsigned long long)(esp_timer_get_time() / 1000000ULL),
                         (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(),
                         (unsigned)cpu_pct[0], (unsigned)cpu_pct[1], (unsigned)sys_monitor_get_cpu_freq_mhz(),
-                        (unsigned)rx_total, (unsigned)tx_total, (unsigned)rx_pps, (unsigned)tx_pps, count,
+                        (unsigned)rx_total, (unsigned)tx_total, (unsigned)rx_pps, (unsigned)tx_pps,
                         (unsigned)client_track_get_traffic_drops(), app_desc->version);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, len);
