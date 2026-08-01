@@ -182,16 +182,7 @@ static bool check_admin_auth(httpd_req_t *req)
     if (strcmp(user, expected_user) != 0) {
         return false;
     }
-
-    size_t pass_len = strlen(password);
-    if (pass_len != strlen(expected_password)) {
-        return false;
-    }
-    unsigned char diff = 0;
-    for (size_t i = 0; i < pass_len; i++) {
-        diff |= (unsigned char)(password[i] ^ expected_password[i]);
-    }
-    return diff == 0;
+    return strcmp(password, expected_password) == 0;
 }
 
 static void send_auth_error(httpd_req_t *req)
