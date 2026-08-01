@@ -3,3 +3,4 @@
 /.devcontainer/devcontainer.json
 /build
 /managed_components
+/secure_boot_signing_key.pem
