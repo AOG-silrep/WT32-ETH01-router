@@ -12,6 +12,18 @@ An ESP-IDF firmware project that turns a [WT32-ETH01](https://en.wireless-tag.co
 - System monitor (heap, uptime, etc.) surfaced on the web UI, refreshed every second
 - Configurable WiFi channel (1, 6, or 11)
 
+## Web UI login
+
+The web UI (`/`) and settings page (`/admin`) are behind HTTP Basic Auth. Until changed, the
+login is the compiled-in default:
+
+- Username: `admin`
+- Password: `admin`
+
+Change it from `/admin` (linked via the "Update username & password" button on the main page)
+or with the serial console's `admin` command (see below). Change the default before deploying
+on any network you don't fully trust — anyone who can reach the web UI can use it.
+
 ## Building and flashing
 
 Requires [ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/get-started/index.html) (v5.3+).
@@ -42,6 +54,31 @@ enabled needs one full serial reflash (as above, which writes bootloader + parti
 app) to start enforcing it. After that, only images signed with `secure_boot_signing_key.pem`
 will boot.
 
+## Serial console (recovery & diagnostics)
+
+The firmware exposes an interactive command console on the same UART used for flashing
+(UART0, 115200 baud) — connect with `idf.py -p <PORT> monitor`, or any serial terminal at
+115200 8N1, no extra wiring needed.
+
+This console is **unauthenticated**: anyone with physical/serial access to the board has full
+control, including the ability to wipe saved config. That's by design — physical access
+already wins, and this is the intended recovery path when the web UI is unreachable (lost
+admin password, bad WiFi config). Type `help` at the `aog-bridge>` prompt for the full command
+list; the main ones:
+
+| Command | Purpose |
+| --- | --- |
+| `wifi [-s <ssid>] [-p <password>] [-c <1\|6\|11>]` | Show or change the WiFi AP SSID/password/channel. Omitted fields keep their current value; changing any reboots the device. |
+| `admin [-u <user>] [-p <password>]` | Show or change the web UI admin username/password. |
+| `sysinfo` | Uptime, heap, CPU load, network traffic. |
+| `clients` | List active bridge clients (WiFi + Ethernet). |
+| `loglevel [none\|error\|warn\|info\|debug\|verbose]` | Show or set log verbosity. |
+| `reboot` | Restart the device. |
+| `factory-reset yes` | Erase saved WiFi and admin credentials, restoring compiled-in defaults (WiFi `AOG hub`/`password`; admin `admin`/`admin`), then reboot. Bare `factory-reset` (no `yes`) just prints this warning and changes nothing. |
+
+**Locked out of the web UI?** Connect over serial and run `factory-reset yes`. The device
+reboots with the default WiFi AP and `admin`/`admin` web login restored.
+
 ## Source layout
 
 - `main/main.c` — startup, Ethernet/WiFi bridge setup
@@ -49,7 +86,10 @@ will boot.
 - `main/web_server.c` / `.h` — HTTP server backing the web UI
 - `main/client_track.c` / `.h` — connected-client and traffic tracking
 - `main/sys_monitor.c` / `.h` — system stats (heap, uptime) for the web UI
+- `main/serial_console.c` / `.h` — interactive UART console for recovery/diagnostics
+- `main/auth_cfg.c` / `.h` — admin username/password storage (NVS) with compiled-in defaults
 - `main/webpage/index.html` — the web UI itself
+- `main/webpage/admin.html` — the `/admin` settings page
 
 ## Troubleshooting high/jittery ping latency
 

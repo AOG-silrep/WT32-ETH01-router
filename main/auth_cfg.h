@@ -11,7 +11,7 @@ extern "C" {
 #define AUTH_CFG_PASSWORD_MAX_LEN 64   // includes NUL
 
 // Loads the admin username/password from NVS, falling back to compiled-in
-// defaults ("admin"/"admin123") if nothing has been saved yet. username
+// defaults ("admin"/"admin") if nothing has been saved yet. username
 // buffer must be at least AUTH_CFG_USERNAME_MAX_LEN bytes, password buffer
 // at least AUTH_CFG_PASSWORD_MAX_LEN bytes.
 void auth_cfg_load(char *username, char *password);

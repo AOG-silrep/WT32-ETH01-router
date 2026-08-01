@@ -6,7 +6,7 @@
 static const char *TAG = "auth_cfg";
 
 #define AUTH_CFG_DEFAULT_USERNAME "admin"
-#define AUTH_CFG_DEFAULT_PASSWORD "admin123"
+#define AUTH_CFG_DEFAULT_PASSWORD "admin"
 
 #define NVS_NAMESPACE    "auth_cfg"
 #define NVS_USERNAME_KEY "user"
