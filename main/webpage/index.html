@@ -172,11 +172,22 @@ function formatUptime(seconds) {
 // (crash, reboot), the browser can sit on the OS's default connect timeout
 // for a minute or more before it ever rejects. Bound it explicitly so the
 // polling loop below fails on a predictable schedule instead.
+//
+// A 401 throws AUTH_ERROR instead of returning, so the polling loop can tell
+// "credentials are stale" apart from "bridge is unreachable". The two need
+// opposite responses: retry the second, stop dead on the first. The bridge
+// delays a second before answering any failed auth, and its httpd has a single
+// worker task, so a loop that kept polling with bad credentials would
+// monopolise the server and lock everyone out of the UI.
+const AUTH_ERROR = Symbol('unauthorized');
+
 async function fetchWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    if (res.status === 401) throw AUTH_ERROR;
+    return res;
   } finally {
     clearTimeout(timer);
   }
@@ -319,7 +330,9 @@ async function refreshHistory() {
     drawChart();
   } catch (e) {
     // Same soft-fail as the rest of poll() - the connection-lost banner
-    // already covers reporting this to the user.
+    // already covers reporting this to the user. A stale-credentials 401 is
+    // the exception: poll() has to see it to stop the loop.
+    if (e === AUTH_ERROR) throw e;
   }
 }
 
@@ -462,6 +475,7 @@ async function refreshSystem() {
 
 let failCount = 0;
 let otaUploading = false;
+let pollTimer = null;
 async function poll() {
   if (otaUploading) return;
   try {
@@ -472,6 +486,16 @@ async function poll() {
     const banner = document.getElementById('banner');
     banner.classList.remove('show', 'restarting');
   } catch (e) {
+    if (e === AUTH_ERROR) {
+      // Retrying can't help - the browser will keep replaying the same
+      // cached credentials. Stop, and let a reload re-prompt for them.
+      clearInterval(pollTimer);
+      const banner = document.getElementById('banner');
+      banner.textContent = 'Sign-in expired — reload the page to sign in again';
+      banner.classList.remove('restarting');
+      banner.classList.add('show');
+      return;
+    }
     failCount++;
     if (failCount >= 2) {
       const banner = document.getElementById('banner');
@@ -597,7 +621,7 @@ document.getElementById('ota-form').addEventListener('submit', (e) => {
 
 loadStatus();
 poll();
-setInterval(poll, 1000);
+pollTimer = setInterval(poll, 1000);
 </script>
 
 </body>

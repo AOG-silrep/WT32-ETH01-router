@@ -196,8 +196,18 @@ static bool check_admin_auth(httpd_req_t *req)
     return strcmp(password, expected_password) == 0;
 }
 
+// Throttles credential guessing: every failed attempt costs a full second,
+// capping a brute-force run at ~1 guess/sec instead of as fast as the server
+// can answer. The httpd runs a single worker task, so this parks the whole
+// server for that second - acceptable only because the UI's polling loop
+// stops on 401 rather than free-running at 1Hz (see index.html's poll()).
+#define AUTH_FAIL_DELAY_MS 1000
+
 static void send_auth_error(httpd_req_t *req)
 {
+    vTaskDelay(pdMS_TO_TICKS(AUTH_FAIL_DELAY_MS));
+    ESP_LOGW(TAG, "Rejected request for %s: bad or missing credentials", req->uri);
+
     httpd_resp_set_status(req, "401 Unauthorized");
     httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"AgOpen router\"");
     httpd_resp_set_type(req, "application/json");
