@@ -1,5 +1,9 @@
 # wt32-bridge
 
+## Network
+
+The end device is on the `192.168.5.x` network.
+
 ## ESP-IDF location
 
 The ESP-IDF path is machine-specific (not checked into this repo) — don't
