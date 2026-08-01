@@ -69,6 +69,15 @@ void auth_cfg_load(char *username, char *password)
     xSemaphoreGive(s_mutex);
 }
 
+bool auth_cfg_is_default(void)
+{
+    char username[AUTH_CFG_USERNAME_MAX_LEN];
+    char password[AUTH_CFG_PASSWORD_MAX_LEN];
+    auth_cfg_load(username, password);
+    return strcmp(username, AUTH_CFG_DEFAULT_USERNAME) == 0 &&
+           strcmp(password, AUTH_CFG_DEFAULT_PASSWORD) == 0;
+}
+
 esp_err_t auth_cfg_save(const char *username, const char *password)
 {
     nvs_handle_t nvs_handle;

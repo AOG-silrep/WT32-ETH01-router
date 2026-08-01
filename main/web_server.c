@@ -193,10 +193,21 @@ static void send_auth_error(httpd_req_t *req)
     httpd_resp_send(req, "{\"ok\":false,\"error\":\"Authentication required\"}", HTTPD_RESP_USE_STRLEN);
 }
 
+static void send_default_creds_redirect(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/admin?forced=1");
+    httpd_resp_send(req, NULL, 0);
+}
+
 static esp_err_t index_get_handler(httpd_req_t *req)
 {
     if (!check_admin_auth(req)) {
         send_auth_error(req);
+        return ESP_OK;
+    }
+    if (auth_cfg_is_default()) {
+        send_default_creds_redirect(req);
         return ESP_OK;
     }
 

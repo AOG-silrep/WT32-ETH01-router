@@ -21,6 +21,10 @@ esp_err_t auth_cfg_init(void);
 // AUTH_CFG_PASSWORD_MAX_LEN bytes.
 void auth_cfg_load(char *username, char *password);
 
+// Returns true if the current admin username AND password both still
+// equal the compiled-in defaults (AUTH_CFG_DEFAULT_USERNAME/PASSWORD).
+bool auth_cfg_is_default(void);
+
 // Persists a new admin username/password to NVS.
 esp_err_t auth_cfg_save(const char *username, const char *password);
 

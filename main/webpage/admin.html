@@ -15,12 +15,15 @@
   #admin-msg { margin-top: 0.6em; font-size: 0.9em; }
   #admin-msg.error { color: #b00020; }
   #admin-msg.ok { color: #0a7a2f; }
+  #forced-banner { display: none; background: #b00020; color: #fff; padding: 0.6em 1em; border-radius: 4px; margin: 1em 0; }
+  #forced-banner.show { display: block; }
 </style>
 </head>
 <body>
 
-<a class="back" href="/">&larr; Back to router</a>
+<a class="back" id="back-link" href="/">&larr; Back to router</a>
 <h1>Admin login</h1>
+<div id="forced-banner">You're using the default admin/admin login. Set a new username or password below before continuing.</div>
 
 <div class="panel">
 <form id="admin-form">
@@ -36,6 +39,11 @@
 </div>
 
 <script>
+if (new URLSearchParams(location.search).get('forced') === '1') {
+  document.getElementById('forced-banner').classList.add('show');
+  document.getElementById('back-link').style.display = 'none';
+}
+
 document.getElementById('admin-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const msg = document.getElementById('admin-msg');
@@ -65,6 +73,7 @@ document.getElementById('admin-form').addEventListener('submit', async (e) => {
       newPasswordInput.value = '';
       msg.textContent = 'Saved. You may be asked to log in again with the new credentials.';
       msg.className = 'ok';
+      setTimeout(() => { location.href = '/'; }, 1200);
     } else {
       msg.textContent = data.error || 'Failed to save';
       msg.className = 'error';
