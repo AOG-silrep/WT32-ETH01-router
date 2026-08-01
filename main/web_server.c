@@ -372,8 +372,27 @@ static esp_err_t admin_post_handler(httpd_req_t *req)
 
 static esp_err_t ota_post_handler(httpd_req_t *req)
 {
+    // Static, not stack-allocated: the httpd worker task's stack is shared
+    // across all handlers, and a 4KB local buffer here would blow it.
+    static uint8_t ota_buf[4096];
+
     if (!check_admin_auth(req)) {
         send_auth_error(req);
+        // Drain the body ourselves in large chunks. Left to the framework,
+        // the post-handler purge reads CONFIG_HTTPD_PURGE_BUF_LEN (32)
+        // bytes at a time against a multi-megabyte image; any inter-chunk
+        // gap past recv_wait_timeout (5s) makes it bail and force-close the
+        // socket mid-upload, which surfaces to the client as a connection
+        // reset instead of the 401 it already received.
+        int remaining = req->content_len;
+        while (remaining > 0) {
+            int to_read = remaining < sizeof(ota_buf) ? remaining : sizeof(ota_buf);
+            int received = httpd_req_recv(req, (char *)ota_buf, to_read);
+            if (received <= 0) {
+                break;
+            }
+            remaining -= received;
+        }
         return ESP_OK;
     }
 
@@ -396,9 +415,6 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    // Static, not stack-allocated: the httpd worker task's stack is shared
-    // across all handlers, and a 4KB local buffer here would blow it.
-    static uint8_t ota_buf[4096];
     int remaining = req->content_len;
     while (remaining > 0) {
         int to_read = remaining < sizeof(ota_buf) ? remaining : sizeof(ota_buf);
