@@ -40,18 +40,21 @@ static int cmd_wifi(int argc, char **argv)
     uint8_t cur_channel;
     wifi_cfg_load(cur_ssid, cur_password, &cur_channel);
 
-    if (wifi_args.ssid->count == 0) {
+    bool any_given = wifi_args.ssid->count > 0 || wifi_args.password->count > 0 || wifi_args.channel->count > 0;
+    if (!any_given) {
         printf("SSID: %s\nChannel: %u\n", cur_ssid, (unsigned)cur_channel);
         return 0;
     }
 
-    const char *ssid = wifi_args.ssid->sval[0];
+    // Any field not explicitly given keeps its current saved value, so
+    // -s, -p, and -c can each be changed independently.
+    const char *ssid = wifi_args.ssid->count > 0 ? wifi_args.ssid->sval[0] : cur_ssid;
     // Blank/absent password keeps the current one, same fallback the web UI
     // uses (see wifi_post_handler in web_server.c).
     const char *password = (wifi_args.password->count > 0 && wifi_args.password->sval[0][0] != '\0')
                                 ? wifi_args.password->sval[0]
                                 : cur_password;
-    uint8_t channel = wifi_args.channel->count > 0 ? (uint8_t)wifi_args.channel->ival[0] : WIFI_CFG_DEFAULT_CHANNEL;
+    uint8_t channel = wifi_args.channel->count > 0 ? (uint8_t)wifi_args.channel->ival[0] : cur_channel;
 
     const char *err_msg = NULL;
     if (!wifi_cfg_validate(ssid, password, channel, &err_msg)) {
@@ -298,12 +301,12 @@ static void register_commands(void)
 {
     wifi_args.ssid = arg_str0("s", "ssid", "<ssid>", "new SSID (1-31 chars)");
     wifi_args.password = arg_str0("p", "password", "<password>", "new password (8-63 chars); blank keeps current");
-    wifi_args.channel = arg_int0("c", "channel", "<1|6|11>", "WiFi channel; omitted defaults to 1");
+    wifi_args.channel = arg_int0("c", "channel", "<1|6|11>", "WiFi channel; omitted keeps current");
     wifi_args.end = arg_end(3);
     const esp_console_cmd_t wifi_cmd = {
         .command = "wifi",
         .help = "Show or set the WiFi AP SSID/password/channel. No args shows the current config. "
-                "Setting the SSID reboots the device to apply.",
+                "Changing any of -s/-p/-c reboots the device to apply.",
         .hint = NULL,
         .func = &cmd_wifi,
         .argtable = &wifi_args,
