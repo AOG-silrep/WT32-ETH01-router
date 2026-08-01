@@ -98,20 +98,30 @@ static bool base64_decode(const char *in, size_t in_len, char *out, size_t out_c
         return false;
     }
     size_t written = 0;
-    for (size_t i = 0; i < in_len; i += 4) {
+    size_t num_groups = in_len / 4;
+    for (size_t g = 0; g < num_groups; g++) {
+        size_t i = g * 4;
         int vals[4];
         int pad = 0;
+        bool seen_pad = false;
         for (int j = 0; j < 4; j++) {
             char c = in[i + j];
             if (c == '=') {
+                seen_pad = true;
                 vals[j] = 0;
                 pad++;
             } else {
+                if (seen_pad) {
+                    return false;
+                }
                 vals[j] = base64_decode_char(c);
                 if (vals[j] < 0) {
                     return false;
                 }
             }
+        }
+        if (pad > 2 || (pad > 0 && g != num_groups - 1)) {
+            return false;
         }
         unsigned char b0 = (unsigned char)((vals[0] << 2) | (vals[1] >> 4));
         unsigned char b1 = (unsigned char)((vals[1] << 4) | (vals[2] >> 2));
