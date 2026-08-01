@@ -126,8 +126,8 @@
 <div id="chart-panel">
   <div class="chart-head">
     <div id="chart-legend">
-      <span class="legend-item"><i style="background:var(--chart-rx)"></i>Down (rx)</span>
-      <span class="legend-item"><i style="background:var(--chart-tx)"></i>Up (tx)</span>
+      <span class="legend-item"><i style="background:var(--chart-rx)"></i><span id="legend-rx-label">Down (rx, bytes)</span></span>
+      <span class="legend-item"><i style="background:var(--chart-tx)"></i><span id="legend-tx-label">Up (tx, bytes)</span></span>
     </div>
     <div><span id="chart-title"></span> &ndash; <button type="button" id="chart-mode">Show packets/s</button> <button type="button" id="chart-pause">Pause</button> <button type="button" id="chart-stop">Stop</button></div>
   </div>
@@ -148,8 +148,8 @@ function formatRate(bytesPerSec) {
 }
 
 function formatPps(n) {
-  if (n >= 1000) return (n / 1000).toFixed(1) + ' Kpps';
-  return n + ' pps';
+  if (n >= 1000) return (n / 1000).toFixed(1) + '\u00A0Kpps';
+  return n + '\u00A0pps';
 }
 
 function formatBytes(bytes) {
@@ -264,9 +264,14 @@ document.getElementById('chart-pause').addEventListener('click', (e) => {
   paused = !paused;
   e.target.textContent = paused ? 'Resume' : 'Pause';
 });
+function updateChartLegend() {
+  document.getElementById('legend-rx-label').textContent = chartMode === 'pps' ? 'Down (rx, packets)' : 'Down (rx, bytes)';
+  document.getElementById('legend-tx-label').textContent = chartMode === 'pps' ? 'Up (tx, packets)' : 'Up (tx, bytes)';
+}
 document.getElementById('chart-mode').addEventListener('click', (e) => {
   chartMode = chartMode === 'bytes' ? 'pps' : 'bytes';
   e.target.textContent = chartMode === 'bytes' ? 'Show packets/s' : 'Show bytes/s';
+  updateChartLegend();
   drawChart();
 });
 
