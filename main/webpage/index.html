@@ -328,8 +328,7 @@ function drawChart(hoverX) {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, cssW, cssH);
 
-  const padL = 44, padR = 8, padT = 8, padB = 16;
-  const plotW = cssW - padL - padR, plotH = cssH - padT - padB;
+  const padR = 8, padT = 8, padB = 16;
   const seriesRx = chartMode === 'bytes' ? histRx : histRxPps;
   const seriesTx = chartMode === 'bytes' ? histTx : histTxPps;
   const fmt = chartMode === 'bytes' ? formatRate : formatPps;
@@ -347,19 +346,27 @@ function drawChart(hoverX) {
   for (const v of seriesTx) if (v > maxVal) maxVal = v;
   maxVal *= 1.15;
 
+  // Size the left padding to fit the widest y-axis label so it never
+  // gets clipped by the canvas's left edge (labels are right-aligned).
+  ctx.font = '11px sans-serif';
+  const yLabels = [0, 0.5, 1].map((frac) => fmt(Math.round(maxVal * frac)));
+  const maxLabelW = Math.max(...yLabels.map((s) => ctx.measureText(s).width));
+  const padL = Math.max(36, Math.ceil(maxLabelW) + 10);
+  const plotW = cssW - padL - padR, plotH = cssH - padT - padB;
+
   // Gridlines + y-axis rate labels (0 / mid / max).
   ctx.strokeStyle = gridColor;
   ctx.fillStyle = mutedColor;
-  ctx.font = '11px sans-serif';
   ctx.textAlign = 'right';
   ctx.textBaseline = 'middle';
-  [0, 0.5, 1].forEach((frac) => {
+  yLabels.forEach((label, i) => {
+    const frac = [0, 0.5, 1][i];
     const y = padT + plotH * (1 - frac);
     ctx.beginPath();
     ctx.moveTo(padL, y);
     ctx.lineTo(padL + plotW, y);
     ctx.stroke();
-    ctx.fillText(fmt(Math.round(maxVal * frac)), padL - 6, y);
+    ctx.fillText(label, padL - 6, y);
   });
   ctx.strokeStyle = axisColor;
   ctx.beginPath();
