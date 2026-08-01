@@ -1,3 +1,4 @@
+#include <stdarg.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -479,6 +480,35 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
     esp_restart();
 }
 
+// Appends a formatted string to buf at offset off, like the
+// `off += snprintf(resp + off, sizeof(resp) - off, ...)` pattern this
+// replaces, but clamps the returned offset to at most bufsz. Plain
+// snprintf() returns the length that *would* have been written had the
+// buffer been big enough - if a call truncates, chaining that raw return
+// value into the next call's `bufsz - off` underflows (size_t) and turns
+// `buf + off` into an out-of-bounds pointer. Routing every accumulation
+// through here means off <= bufsz holds after every single call, so
+// `bufsz - off` can never wrap, no matter how many fields get appended.
+static int __attribute__((format(printf, 4, 5)))
+resp_append(char *buf, size_t bufsz, int off, const char *fmt, ...)
+{
+    if (off < 0 || (size_t)off > bufsz) {
+        return (int)bufsz;
+    }
+
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + off, bufsz - off, fmt, ap);
+    va_end(ap);
+
+    if (n < 0) {
+        return off;
+    }
+
+    size_t new_off = (size_t)off + (size_t)n;
+    return (int)(new_off > bufsz ? bufsz : new_off);
+}
+
 static esp_err_t clients_get_handler(httpd_req_t *req)
 {
     if (!check_admin_auth(req)) {
@@ -491,7 +521,7 @@ static esp_err_t clients_get_handler(httpd_req_t *req)
     client_track_get_snapshot(clients, CLIENT_TRACK_MAX_CLIENTS, &count);
 
     static char resp[CLIENT_TRACK_MAX_CLIENTS * (200 + CLIENT_TRACK_NAME_MAX_LEN) + 16];
-    int off = snprintf(resp, sizeof(resp), "[");
+    int off = resp_append(resp, sizeof(resp), 0, "[");
     for (int i = 0; i < count && off < sizeof(resp); i++) {
         client_info_t *c = &clients[i];
         char ip_str[16];
@@ -502,19 +532,19 @@ static esp_err_t clients_get_handler(httpd_req_t *req)
         } else {
             strcpy(rssi_str, "null");
         }
-        off += snprintf(resp + off, sizeof(resp) - off,
-                         "%s{\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"ip\":\"%s\","
-                         "\"link\":\"%s\",\"rssi\":%s,\"rx_bps\":%u,\"tx_bps\":%u,"
-                         "\"rx_pps\":%u,\"tx_pps\":%u,"
-                         "\"last_seen_s\":%u,\"name\":\"%s\"}",
-                         i == 0 ? "" : ",",
-                         c->mac[0], c->mac[1], c->mac[2], c->mac[3], c->mac[4], c->mac[5],
-                         ip_str, c->is_wifi ? "wifi" : "eth", rssi_str,
-                         (unsigned)c->rx_bps, (unsigned)c->tx_bps,
-                         (unsigned)c->rx_pps, (unsigned)c->tx_pps, (unsigned)c->last_seen_s,
-                         c->name);
+        off = resp_append(resp, sizeof(resp), off,
+                           "%s{\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"ip\":\"%s\","
+                           "\"link\":\"%s\",\"rssi\":%s,\"rx_bps\":%u,\"tx_bps\":%u,"
+                           "\"rx_pps\":%u,\"tx_pps\":%u,"
+                           "\"last_seen_s\":%u,\"name\":\"%s\"}",
+                           i == 0 ? "" : ",",
+                           c->mac[0], c->mac[1], c->mac[2], c->mac[3], c->mac[4], c->mac[5],
+                           ip_str, c->is_wifi ? "wifi" : "eth", rssi_str,
+                           (unsigned)c->rx_bps, (unsigned)c->tx_bps,
+                           (unsigned)c->rx_pps, (unsigned)c->tx_pps, (unsigned)c->last_seen_s,
+                           c->name);
     }
-    off += snprintf(resp + off, sizeof(resp) - off, "]");
+    off = resp_append(resp, sizeof(resp), off, "]");
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, off);
@@ -565,26 +595,26 @@ static esp_err_t client_history_get_handler(httpd_req_t *req)
     }
 
     static char resp[1600];
-    int off = snprintf(resp, sizeof(resp),
-                        "{\"mac\":\"%s\",\"period_ms\":%d,\"seq\":%u,\"reset\":%s,\"rx\":[",
-                        mac_str, CLIENT_TRACK_HISTORY_PERIOD_MS, (unsigned)hist.seq,
-                        hist.reset ? "true" : "false");
+    int off = resp_append(resp, sizeof(resp), 0,
+                           "{\"mac\":\"%s\",\"period_ms\":%d,\"seq\":%u,\"reset\":%s,\"rx\":[",
+                           mac_str, CLIENT_TRACK_HISTORY_PERIOD_MS, (unsigned)hist.seq,
+                           hist.reset ? "true" : "false");
     for (int i = 0; i < hist.count && off < sizeof(resp); i++) {
-        off += snprintf(resp + off, sizeof(resp) - off, "%s%u", i == 0 ? "" : ",", (unsigned)hist.rx_bps[i]);
+        off = resp_append(resp, sizeof(resp), off, "%s%u", i == 0 ? "" : ",", (unsigned)hist.rx_bps[i]);
     }
-    off += snprintf(resp + off, sizeof(resp) - off, "],\"tx\":[");
+    off = resp_append(resp, sizeof(resp), off, "],\"tx\":[");
     for (int i = 0; i < hist.count && off < sizeof(resp); i++) {
-        off += snprintf(resp + off, sizeof(resp) - off, "%s%u", i == 0 ? "" : ",", (unsigned)hist.tx_bps[i]);
+        off = resp_append(resp, sizeof(resp), off, "%s%u", i == 0 ? "" : ",", (unsigned)hist.tx_bps[i]);
     }
-    off += snprintf(resp + off, sizeof(resp) - off, "],\"rx_pps\":[");
+    off = resp_append(resp, sizeof(resp), off, "],\"rx_pps\":[");
     for (int i = 0; i < hist.count && off < sizeof(resp); i++) {
-        off += snprintf(resp + off, sizeof(resp) - off, "%s%u", i == 0 ? "" : ",", (unsigned)hist.rx_pps[i]);
+        off = resp_append(resp, sizeof(resp), off, "%s%u", i == 0 ? "" : ",", (unsigned)hist.rx_pps[i]);
     }
-    off += snprintf(resp + off, sizeof(resp) - off, "],\"tx_pps\":[");
+    off = resp_append(resp, sizeof(resp), off, "],\"tx_pps\":[");
     for (int i = 0; i < hist.count && off < sizeof(resp); i++) {
-        off += snprintf(resp + off, sizeof(resp) - off, "%s%u", i == 0 ? "" : ",", (unsigned)hist.tx_pps[i]);
+        off = resp_append(resp, sizeof(resp), off, "%s%u", i == 0 ? "" : ",", (unsigned)hist.tx_pps[i]);
     }
-    off += snprintf(resp + off, sizeof(resp) - off, "]}");
+    off = resp_append(resp, sizeof(resp), off, "]}");
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, off);
