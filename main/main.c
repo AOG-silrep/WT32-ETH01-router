@@ -24,6 +24,7 @@
 #include "wifi_cfg.h"
 #include "client_track.h"
 #include "sys_monitor.h"
+#include "auth_cfg.h"
 #include "web_server.h"
 #include "serial_console.h"
 
@@ -224,6 +225,10 @@ void app_main(void)
     // System monitor (CPU load) for the web UI - no ordering dependency,
     // just needs the scheduler running.
     ESP_ERROR_CHECK(sys_monitor_init());
+
+    // Admin credential RAM cache - must be up before web_server_start()/
+    // serial_console_init() below, since both can call auth_cfg_load/save.
+    ESP_ERROR_CHECK(auth_cfg_init());
 
     // Since MAC forwarding is done in the lwIP bridge, the Ethernet MAC needs
     // to pass through frames not addressed to it.

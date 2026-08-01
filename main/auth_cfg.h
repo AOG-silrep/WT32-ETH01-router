@@ -10,10 +10,15 @@ extern "C" {
 #define AUTH_CFG_USERNAME_MAX_LEN 32   // includes NUL
 #define AUTH_CFG_PASSWORD_MAX_LEN 64   // includes NUL
 
-// Loads the admin username/password from NVS, falling back to compiled-in
-// defaults ("admin"/"admin") if nothing has been saved yet. username
-// buffer must be at least AUTH_CFG_USERNAME_MAX_LEN bytes, password buffer
-// at least AUTH_CFG_PASSWORD_MAX_LEN bytes.
+// Must be called once (after the FreeRTOS scheduler is running, before any
+// web server or console access) to set up the credential RAM cache.
+esp_err_t auth_cfg_init(void);
+
+// Loads the admin username/password from a RAM cache (populated from NVS
+// on first use, or from compiled-in defaults - "admin"/"admin" - if
+// nothing has been saved yet). username buffer must be at least
+// AUTH_CFG_USERNAME_MAX_LEN bytes, password buffer at least
+// AUTH_CFG_PASSWORD_MAX_LEN bytes.
 void auth_cfg_load(char *username, char *password);
 
 // Persists a new admin username/password to NVS.
