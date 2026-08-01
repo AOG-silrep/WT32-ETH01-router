@@ -129,7 +129,7 @@
       <span class="legend-item"><i style="background:var(--chart-rx)"></i><span id="legend-rx-label">Down (rx, bytes)</span></span>
       <span class="legend-item"><i style="background:var(--chart-tx)"></i><span id="legend-tx-label">Up (tx, bytes)</span></span>
     </div>
-    <div><span id="chart-title"></span> &ndash; <button type="button" id="chart-mode">Show packets/s</button> <button type="button" id="chart-pause">Pause</button> <button type="button" id="chart-stop">Stop</button></div>
+    <div><span id="chart-title"></span> <button type="button" id="chart-mode">Show packets/s</button> <button type="button" id="chart-pause">Pause</button> <button type="button" id="chart-stop">Stop</button></div>
   </div>
   <canvas id="traffic-canvas" width="600" height="160"></canvas>
   <div id="chart-tooltip"></div>
@@ -211,9 +211,12 @@ async function refreshClients() {
       '<td class="rate">' + formatRate(c.tx_bps) + '</td>' +
       '<td class="rate">' + formatPps(c.rx_pps) + '</td>' +
       '<td class="rate">' + formatPps(c.tx_pps) + '</td>' +
-      '<td><button type="button" class="watch-btn" data-mac="' + c.mac + '">' +
+      '<td><button type="button" class="watch-btn" data-mac="' + c.mac + '" data-name="' + (c.name || '') + '">' +
         (c.mac === selectedMac ? 'Watching' : 'Graph') + '</button></td>';
     body.appendChild(tr);
+    if (c.mac === selectedMac) {
+      document.getElementById('chart-title').textContent = chartTitleFor(c.name, c.mac);
+    }
   }
 }
 
@@ -235,7 +238,11 @@ let chartMode = 'bytes'; // 'bytes' | 'pps' - which pair of series drawChart() p
 let samplePeriodMs = 100;
 const HISTORY_VIEW_SAMPLES = 300; // ~30s at the device's 100ms sample period
 
-function selectClient(mac) {
+function chartTitleFor(name, mac) {
+  return name || mac;
+}
+
+function selectClient(mac, name) {
   selectedMac = mac;
   lastSeq = 0;
   histRx = [];
@@ -244,7 +251,7 @@ function selectClient(mac) {
   histTxPps = [];
   paused = false;
   document.getElementById('chart-pause').textContent = 'Pause';
-  document.getElementById('chart-title').textContent = mac;
+  document.getElementById('chart-title').textContent = chartTitleFor(name, mac);
   document.getElementById('chart-tooltip').textContent = '';
   document.getElementById('chart-panel').classList.add('show');
   drawChart();
@@ -257,7 +264,7 @@ function stopWatching() {
 
 document.getElementById('clients-body').addEventListener('click', (e) => {
   const btn = e.target.closest('.watch-btn');
-  if (btn) selectClient(btn.dataset.mac);
+  if (btn) selectClient(btn.dataset.mac, btn.dataset.name);
 });
 document.getElementById('chart-stop').addEventListener('click', stopWatching);
 document.getElementById('chart-pause').addEventListener('click', (e) => {
