@@ -158,6 +158,16 @@ function formatBytes(bytes) {
   return bytes + '\u00A0B';
 }
 
+// Escape text before it goes into innerHTML. Device-controlled fields
+// (DHCP hostname, and anything reflected from the client) can otherwise
+// break out of a tag or attribute — a hostname like  "><img onerror=...>
+// would run script in the authenticated admin page.
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
 function formatUptime(seconds) {
   const d = Math.floor(seconds / 86400);
   const h = Math.floor((seconds % 86400) / 3600);
@@ -219,16 +229,16 @@ async function refreshClients() {
     const tr = document.createElement('tr');
     tr.className = (c.last_seen_s > 30 ? 'stale ' : '') + (c.mac === selectedMac ? 'selected' : '');
     tr.innerHTML =
-      '<td>' + (c.name ? c.name : '&ndash;') + '</td>' +
-      '<td class="mac">' + c.mac + '</td>' +
-      '<td class="ip">' + c.ip + '</td>' +
-      '<td>' + c.link + '</td>' +
-      '<td>' + (c.rssi === null ? '&ndash;' : c.rssi + ' dBm') + '</td>' +
+      '<td>' + (c.name ? esc(c.name) : '&ndash;') + '</td>' +
+      '<td class="mac">' + esc(c.mac) + '</td>' +
+      '<td class="ip">' + esc(c.ip) + '</td>' +
+      '<td>' + esc(c.link) + '</td>' +
+      '<td>' + (c.rssi === null ? '&ndash;' : esc(c.rssi) + ' dBm') + '</td>' +
       '<td class="rate">' + formatRate(c.rx_bps) + '</td>' +
       '<td class="rate">' + formatRate(c.tx_bps) + '</td>' +
       '<td class="rate">' + formatPps(c.rx_pps) + '</td>' +
       '<td class="rate">' + formatPps(c.tx_pps) + '</td>' +
-      '<td><button type="button" class="watch-btn" data-mac="' + c.mac + '" data-name="' + (c.name || '') + '">' +
+      '<td><button type="button" class="watch-btn" data-mac="' + esc(c.mac) + '" data-name="' + esc(c.name || '') + '">' +
         (c.mac === selectedMac ? 'Watching' : 'Graph') + '</button></td>';
     body.appendChild(tr);
     if (c.mac === selectedMac) {
