@@ -12,6 +12,19 @@ An ESP-IDF firmware project that turns a [WT32-ETH01](https://en.wireless-tag.co
 - System monitor (heap, uptime, etc.) surfaced on the web UI, refreshed every second
 - Configurable WiFi channel (1, 6, or 11)
 
+## Web UI
+
+Browse to the device (`192.168.5.1` by default) for WiFi settings, firmware update, and live
+system stats:
+
+![The web UI: WiFi settings, firmware update, and system stats](docs/web-ui.png)
+
+Further down the same page, every connected client (WiFi and Ethernet) is listed with its
+live throughput. "Graph" plots that client's traffic over the last 30 seconds, switchable
+between bytes/s and packets/s:
+
+![Connected clients table with a per-client traffic graph](docs/client-traffic.png)
+
 ## Web UI login
 
 The web UI (`/`) and settings page (`/admin`) are behind HTTP Basic Auth. Until changed, the
