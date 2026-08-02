@@ -268,6 +268,80 @@ static void send_setup_required(httpd_req_t *req)
                      HTTPD_RESP_USE_STRLEN);
 }
 
+// Appends a formatted string to buf at offset off, like the
+// `off += snprintf(resp + off, sizeof(resp) - off, ...)` pattern this
+// replaces, but clamps the returned offset to at most bufsz. Plain
+// snprintf() returns the length that *would* have been written had the
+// buffer been big enough - if a call truncates, chaining that raw return
+// value into the next call's `bufsz - off` underflows (size_t) and turns
+// `buf + off` into an out-of-bounds pointer. Routing every accumulation
+// through here means off <= bufsz holds after every single call, so
+// `bufsz - off` can never wrap, no matter how many fields get appended.
+//
+// The clamp doubles as the truncation signal: off only ever reaches bufsz by
+// being clamped there, so `off >= bufsz` after the last append means the
+// response did not fit. resp_send_json() below is what tests it.
+//
+// Call this through the resp_append() macro, which supplies `who` from
+// __func__ so the warning names the handler that overflowed.
+static int __attribute__((format(printf, 5, 6)))
+resp_append_at(const char *who, char *buf, size_t bufsz, int off, const char *fmt, ...)
+{
+    if (off < 0 || (size_t)off > bufsz) {
+        return (int)bufsz;
+    }
+
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + off, bufsz - off, fmt, ap);
+    va_end(ap);
+
+    if (n < 0) {
+        return off;
+    }
+
+    size_t new_off = (size_t)off + (size_t)n;
+
+    // n == bufsz - off already means one character was dropped to make room
+    // for the NUL, hence >= rather than >. Requiring off < bufsz on entry
+    // limits this to the one call that fills the buffer, so a response gets
+    // one warning instead of one per remaining append.
+    //
+    // Deliberately not rate-limited beyond that. A repeating overflow already
+    // puts two lines per second on the console from esp_http_server itself
+    // (the 500 from resp_send_json(), then "uri handler execution failed"),
+    // and those say nothing about which handler or which buffer. Throttling
+    // this one only strips the diagnosis out of a flood that happens anyway.
+    // One warning per failing response keeps it next to the 500 it explains.
+    if ((size_t)off < bufsz && new_off >= bufsz) {
+        // "at least" because the appends that follow this one are never
+        // measured - the real requirement is only ever larger.
+        ESP_LOGW(TAG, "%s: response truncated - %u-byte buffer needs at least %u",
+                 who, (unsigned)bufsz, (unsigned)(new_off + 1));
+    }
+
+    return (int)(new_off > bufsz ? bufsz : new_off);
+}
+
+#define resp_append(buf, bufsz, off, ...) \
+    resp_append_at(__func__, (buf), (bufsz), (off), __VA_ARGS__)
+
+// Sends a JSON body built by resp_append(), or fails the request if it was
+// truncated. Sending the truncated bytes instead would hand the dashboard
+// unparseable JSON, which surfaces as an empty table with nothing to explain
+// it; resp_append_at() has already logged the buffer and the size it needed.
+// Returns false if the caller should return ESP_FAIL.
+static bool resp_send_json(httpd_req_t *req, const char *resp, int off, size_t bufsz)
+{
+    if (off < 0 || (size_t)off >= bufsz) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Response buffer overflow");
+        return false;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, off);
+    return true;
+}
+
 static esp_err_t index_get_handler(httpd_req_t *req)
 {
     if (!check_admin_auth(req)) {
@@ -319,10 +393,11 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     esp_wifi_get_config(WIFI_IF_AP, &cfg);
 
     char resp[80];
-    int len = snprintf(resp, sizeof(resp), "{\"ssid\":\"%s\",\"channel\":%u}",
-                        (const char *)cfg.ap.ssid, (unsigned)cfg.ap.channel);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, resp, len);
+    int len = resp_append(resp, sizeof(resp), 0, "{\"ssid\":\"%s\",\"channel\":%u}",
+                          (const char *)cfg.ap.ssid, (unsigned)cfg.ap.channel);
+    if (!resp_send_json(req, resp, len, sizeof(resp))) {
+        return ESP_FAIL;
+    }
     return ESP_OK;
 }
 
@@ -369,10 +444,11 @@ static esp_err_t wifi_post_handler(httpd_req_t *req)
     const char *err_msg = NULL;
     if (!wifi_cfg_validate(ssid, password, channel, &err_msg)) {
         char resp[128];
-        int len = snprintf(resp, sizeof(resp), "{\"ok\":false,\"error\":\"%s\"}", err_msg);
+        int len = resp_append(resp, sizeof(resp), 0, "{\"ok\":false,\"error\":\"%s\"}", err_msg);
         httpd_resp_set_status(req, "400 Bad Request");
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, resp, len);
+        if (!resp_send_json(req, resp, len, sizeof(resp))) {
+            return ESP_FAIL;
+        }
         return ESP_OK;
     }
 
@@ -431,10 +507,11 @@ static esp_err_t admin_post_handler(httpd_req_t *req)
     const char *err_msg = NULL;
     if (!auth_cfg_validate(new_user, new_password, &err_msg)) {
         char resp[128];
-        int len = snprintf(resp, sizeof(resp), "{\"ok\":false,\"error\":\"%s\"}", err_msg);
+        int len = resp_append(resp, sizeof(resp), 0, "{\"ok\":false,\"error\":\"%s\"}", err_msg);
         httpd_resp_set_status(req, "400 Bad Request");
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, resp, len);
+        if (!resp_send_json(req, resp, len, sizeof(resp))) {
+            return ESP_FAIL;
+        }
         return ESP_OK;
     }
 
@@ -535,11 +612,13 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(err));
         char resp[128];
-        int len = snprintf(resp, sizeof(resp), "{\"ok\":false,\"error\":\"Image validation failed: %s\"}",
-                            esp_err_to_name(err));
+        int len = resp_append(resp, sizeof(resp), 0,
+                              "{\"ok\":false,\"error\":\"Image validation failed: %s\"}",
+                              esp_err_to_name(err));
         httpd_resp_set_status(req, "400 Bad Request");
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, resp, len);
+        if (!resp_send_json(req, resp, len, sizeof(resp))) {
+            return ESP_FAIL;
+        }
         return ESP_OK;
     }
 
@@ -559,35 +638,6 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
     // before tearing everything down for the reboot into the new image.
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
-}
-
-// Appends a formatted string to buf at offset off, like the
-// `off += snprintf(resp + off, sizeof(resp) - off, ...)` pattern this
-// replaces, but clamps the returned offset to at most bufsz. Plain
-// snprintf() returns the length that *would* have been written had the
-// buffer been big enough - if a call truncates, chaining that raw return
-// value into the next call's `bufsz - off` underflows (size_t) and turns
-// `buf + off` into an out-of-bounds pointer. Routing every accumulation
-// through here means off <= bufsz holds after every single call, so
-// `bufsz - off` can never wrap, no matter how many fields get appended.
-static int __attribute__((format(printf, 4, 5)))
-resp_append(char *buf, size_t bufsz, int off, const char *fmt, ...)
-{
-    if (off < 0 || (size_t)off > bufsz) {
-        return (int)bufsz;
-    }
-
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(buf + off, bufsz - off, fmt, ap);
-    va_end(ap);
-
-    if (n < 0) {
-        return off;
-    }
-
-    size_t new_off = (size_t)off + (size_t)n;
-    return (int)(new_off > bufsz ? bufsz : new_off);
 }
 
 static esp_err_t clients_get_handler(httpd_req_t *req)
@@ -631,8 +681,9 @@ static esp_err_t clients_get_handler(httpd_req_t *req)
     }
     off = resp_append(resp, sizeof(resp), off, "]");
 
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, resp, off);
+    if (!resp_send_json(req, resp, off, sizeof(resp))) {
+        return ESP_FAIL;
+    }
     return ESP_OK;
 }
 
@@ -705,8 +756,9 @@ static esp_err_t client_history_get_handler(httpd_req_t *req)
     }
     off = resp_append(resp, sizeof(resp), off, "]}");
 
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, resp, off);
+    if (!resp_send_json(req, resp, off, sizeof(resp))) {
+        return ESP_FAIL;
+    }
     return ESP_OK;
 }
 
@@ -738,18 +790,19 @@ static esp_err_t system_get_handler(httpd_req_t *req)
     const esp_app_desc_t *app_desc = esp_app_get_description();
 
     char resp[400];
-    int len = snprintf(resp, sizeof(resp),
-                        "{\"uptime_s\":%llu,\"free_heap\":%u,\"min_free_heap\":%u,"
-                        "\"cpu_pct\":[%u,%u],\"cpu_freq_mhz\":%u,\"net_rx_bps\":%u,\"net_tx_bps\":%u,"
-                        "\"net_rx_pps\":%u,\"net_tx_pps\":%u,"
-                        "\"traffic_drops\":%u,\"version\":\"%s\"}",
-                        (unsigned long long)(esp_timer_get_time() / 1000000ULL),
-                        (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(),
-                        (unsigned)cpu_pct[0], (unsigned)cpu_pct[1], (unsigned)sys_monitor_get_cpu_freq_mhz(),
-                        (unsigned)rx_total, (unsigned)tx_total, (unsigned)rx_pps, (unsigned)tx_pps,
-                        (unsigned)client_track_get_traffic_drops(), app_desc->version);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, resp, len);
+    int len = resp_append(resp, sizeof(resp), 0,
+                          "{\"uptime_s\":%llu,\"free_heap\":%u,\"min_free_heap\":%u,"
+                          "\"cpu_pct\":[%u,%u],\"cpu_freq_mhz\":%u,\"net_rx_bps\":%u,\"net_tx_bps\":%u,"
+                          "\"net_rx_pps\":%u,\"net_tx_pps\":%u,"
+                          "\"traffic_drops\":%u,\"version\":\"%s\"}",
+                          (unsigned long long)(esp_timer_get_time() / 1000000ULL),
+                          (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(),
+                          (unsigned)cpu_pct[0], (unsigned)cpu_pct[1], (unsigned)sys_monitor_get_cpu_freq_mhz(),
+                          (unsigned)rx_total, (unsigned)tx_total, (unsigned)rx_pps, (unsigned)tx_pps,
+                          (unsigned)client_track_get_traffic_drops(), app_desc->version);
+    if (!resp_send_json(req, resp, len, sizeof(resp))) {
+        return ESP_FAIL;
+    }
     return ESP_OK;
 }
 
