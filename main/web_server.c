@@ -203,6 +203,30 @@ static bool check_admin_auth(httpd_req_t *req)
 // stops on 401 rather than free-running at 1Hz (see index.html's poll()).
 #define AUTH_FAIL_DELAY_MS 1000
 
+// True for a browser navigating to a page, false for fetch()/curl/scripts,
+// which send "*/*". Browsers list text/html first, so a truncated read still
+// answers the question - strlcpy() null-terminates whatever fit.
+static bool client_wants_html(httpd_req_t *req)
+{
+    char accept[48];
+    esp_err_t err = httpd_req_get_hdr_value_str(req, "Accept", accept, sizeof(accept));
+    if (err != ESP_OK && err != ESP_ERR_HTTPD_RESULT_TRUNC) {
+        return false;
+    }
+    return strstr(accept, "text/html") != NULL;
+}
+
+// Sent when the browser's sign-in dialog is dismissed, or when a stale tab
+// navigates here. Without it the address bar would land on raw JSON, which
+// tells a person nothing about what went wrong.
+static const char auth_error_html[] =
+    "<!doctype html><meta charset=\"utf-8\"><title>Sign in &ndash; AgOpen router</title>"
+    "<body style=\"font-family:sans-serif;max-width:420px;margin:2em auto;padding:0 1em;color:#222\">"
+    "<h1 style=\"font-size:1.3em\">Sign in required</h1>"
+    "<p>The bridge didn't accept those credentials. This usually means the admin "
+    "password was changed or reset since this page was opened.</p>"
+    "<p><a href=\"/\">Try again</a></p>";
+
 static void send_auth_error(httpd_req_t *req)
 {
     vTaskDelay(pdMS_TO_TICKS(AUTH_FAIL_DELAY_MS));
@@ -210,6 +234,11 @@ static void send_auth_error(httpd_req_t *req)
 
     httpd_resp_set_status(req, "401 Unauthorized");
     httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"AgOpen router\"");
+    if (client_wants_html(req)) {
+        httpd_resp_set_type(req, "text/html");
+        httpd_resp_send(req, auth_error_html, HTTPD_RESP_USE_STRLEN);
+        return;
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":false,\"error\":\"Authentication required\"}", HTTPD_RESP_USE_STRLEN);
 }
@@ -250,6 +279,11 @@ static esp_err_t index_get_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
+    // no-store, not just no-cache: these pages are only served to an
+    // authenticated caller, and a cached copy would still render after the
+    // credentials behind it stopped working - so a reload meant to re-trigger
+    // the sign-in dialog would come off the disk cache and never reach us.
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, (const char *)index_html_start,
                      index_html_end - index_html_start - 1);
@@ -263,6 +297,7 @@ static esp_err_t admin_get_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, (const char *)admin_html_start,
                      admin_html_end - admin_html_start - 1);

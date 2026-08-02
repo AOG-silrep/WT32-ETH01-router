@@ -483,8 +483,19 @@ async function refreshSystem() {
 let failCount = 0;
 let otaUploading = false;
 let pollTimer = null;
+// setInterval fires every second regardless of how long the previous poll took,
+// so without this guard slow cycles stack up. That is not a hypothetical: the
+// bridge delays a second before answering a failed auth and serves requests
+// from a single worker task, so once credentials go stale each request costs a
+// second of server time and overlapping polls queue behind each other. The
+// queued ones then blow past their own fetch timeout and abort, which reads as
+// "bridge unreachable" instead of "credentials rejected" - the 401 that would
+// stop the loop never arrives in time, so the loop keeps stacking requests and
+// never recovers. One poll at a time keeps the 401 inside its timeout.
+let polling = false;
 async function poll() {
-  if (otaUploading) return;
+  if (otaUploading || polling) return;
+  polling = true;
   try {
     await refreshClients();
     await refreshSystem();
@@ -501,13 +512,18 @@ async function poll() {
       return;
     }
     if (e === AUTH_ERROR) {
-      // Retrying can't help - the browser will keep replaying the same
-      // cached credentials. Stop, and let a reload re-prompt for them.
+      // Retrying can't help - fetch() will keep replaying the same cached
+      // credentials and can't raise the browser's sign-in dialog. Only a
+      // top-level navigation that receives the 401 can, so reload into it.
+      // The bridge sends no-store on this page, so the reload really does hit
+      // the network. If the dialog is dismissed the 401 page explains itself,
+      // and nothing loops: getting back here requires signing in successfully.
       clearInterval(pollTimer);
       const banner = document.getElementById('banner');
-      banner.textContent = 'Sign-in expired — reload the page to sign in again';
+      banner.textContent = 'Sign-in expired — asking for your password…';
       banner.classList.remove('restarting');
       banner.classList.add('show');
+      location.reload();
       return;
     }
     failCount++;
@@ -517,6 +533,8 @@ async function poll() {
       banner.classList.remove('restarting');
       banner.classList.add('show');
     }
+  } finally {
+    polling = false;
   }
 }
 
