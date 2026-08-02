@@ -69,13 +69,12 @@ void auth_cfg_load(char *username, char *password)
     xSemaphoreGive(s_mutex);
 }
 
-bool auth_cfg_is_default(void)
+bool auth_cfg_password_is_default(void)
 {
     char username[AUTH_CFG_USERNAME_MAX_LEN];
     char password[AUTH_CFG_PASSWORD_MAX_LEN];
     auth_cfg_load(username, password);
-    return strcmp(username, AUTH_CFG_DEFAULT_USERNAME) == 0 &&
-           strcmp(password, AUTH_CFG_DEFAULT_PASSWORD) == 0;
+    return strcmp(password, AUTH_CFG_DEFAULT_PASSWORD) == 0;
 }
 
 esp_err_t auth_cfg_save(const char *username, const char *password)
@@ -120,6 +119,14 @@ bool auth_cfg_validate(const char *username, const char *password, const char **
     }
     if (pass_len < 4 || pass_len > AUTH_CFG_PASSWORD_MAX_LEN - 1) {
         *err_msg = "Admin password must be 4-63 characters";
+        return false;
+    }
+    // The default is long enough to pass the length check, so it has to be
+    // rejected by name. Without this, "changing" the credentials back to the
+    // default would leave the device sitting behind admin/admin with every
+    // endpoint gated - a lockout with no explanation.
+    if (strcmp(password, AUTH_CFG_DEFAULT_PASSWORD) == 0) {
+        *err_msg = "Choose an admin password other than the default";
         return false;
     }
     return true;

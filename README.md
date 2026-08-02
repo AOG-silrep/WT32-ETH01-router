@@ -20,9 +20,15 @@ login is the compiled-in default:
 - Username: `admin`
 - Password: `admin`
 
+That default is bootstrap-only: while the password is still `admin`, the device serves nothing
+but the pages needed to change it. `/` redirects to `/admin`, and every `/api/*` route answers
+`403` — including firmware upload — so the bridge can't be driven by a browser or a script
+until setup is finished. Setting a new password is what unlocks it; the username is not a
+secret and changing it alone doesn't count.
+
 Change it from `/admin` (linked via the "Update username & password" button on the main page)
-or with the serial console's `admin` command (see below). Change the default before deploying
-on any network you don't fully trust — anyone who can reach the web UI can use it.
+or with the serial console's `admin` command (see below). The console applies the same rule, so
+`admin -u <name>` on a fresh device fails until you pass `-p <password>` too.
 
 ## Building and flashing
 

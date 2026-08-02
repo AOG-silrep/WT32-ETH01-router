@@ -179,7 +179,12 @@ function formatUptime(seconds) {
 // delays a second before answering any failed auth, and its httpd has a single
 // worker task, so a loop that kept polling with bad credentials would
 // monopolise the server and lock everyone out of the UI.
+// A 403 gets the same treatment for the same reason: the bridge answers it
+// while the admin password is still the default, so retrying is pointless -
+// the fix is to go set one. In a tab that's already showing the dashboard this
+// means someone ran factory-reset over serial underneath us.
 const AUTH_ERROR = Symbol('unauthorized');
+const SETUP_ERROR = Symbol('setup-required');
 
 async function fetchWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController();
@@ -187,6 +192,7 @@ async function fetchWithTimeout(url, options, timeoutMs) {
   try {
     const res = await fetch(url, { ...options, signal: controller.signal });
     if (res.status === 401) throw AUTH_ERROR;
+    if (res.status === 403) throw SETUP_ERROR;
     return res;
   } finally {
     clearTimeout(timer);
@@ -330,9 +336,10 @@ async function refreshHistory() {
     drawChart();
   } catch (e) {
     // Same soft-fail as the rest of poll() - the connection-lost banner
-    // already covers reporting this to the user. A stale-credentials 401 is
-    // the exception: poll() has to see it to stop the loop.
-    if (e === AUTH_ERROR) throw e;
+    // already covers reporting this to the user. A stale-credentials 401 and
+    // a setup-required 403 are the exceptions: poll() has to see them to stop
+    // the loop.
+    if (e === AUTH_ERROR || e === SETUP_ERROR) throw e;
   }
 }
 
@@ -486,6 +493,13 @@ async function poll() {
     const banner = document.getElementById('banner');
     banner.classList.remove('show', 'restarting');
   } catch (e) {
+    if (e === SETUP_ERROR) {
+      // The bridge is back to its default password and won't serve anything
+      // else until that's changed. Go where it wants us.
+      clearInterval(pollTimer);
+      location.href = '/admin?forced=1';
+      return;
+    }
     if (e === AUTH_ERROR) {
       // Retrying can't help - the browser will keep replaying the same
       // cached credentials. Stop, and let a reload re-prompt for them.

@@ -21,16 +21,19 @@ esp_err_t auth_cfg_init(void);
 // AUTH_CFG_PASSWORD_MAX_LEN bytes.
 void auth_cfg_load(char *username, char *password);
 
-// Returns true if the current admin username AND password both still
-// equal the compiled-in defaults (AUTH_CFG_DEFAULT_USERNAME/PASSWORD).
-bool auth_cfg_is_default(void);
+// Returns true if the admin password is still the compiled-in default,
+// meaning the device has never been set up and anyone who can reach it
+// knows the credentials. The username is deliberately not part of this:
+// it isn't a secret, so renaming it protects nothing.
+bool auth_cfg_password_is_default(void);
 
 // Persists a new admin username/password to NVS.
 esp_err_t auth_cfg_save(const char *username, const char *password);
 
 // Validates a candidate admin username (1-31 bytes) and password (4-63
-// bytes). Returns true and leaves *err_msg untouched on success; returns
-// false and sets *err_msg to a static, human-readable reason on failure.
+// bytes, and not the compiled-in default). Returns true and leaves
+// *err_msg untouched on success; returns false and sets *err_msg to a
+// static, human-readable reason on failure.
 bool auth_cfg_validate(const char *username, const char *password, const char **err_msg);
 
 #ifdef __cplusplus

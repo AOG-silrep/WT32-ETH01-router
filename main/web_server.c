@@ -221,13 +221,31 @@ static void send_default_creds_redirect(httpd_req_t *req)
     httpd_resp_send(req, NULL, 0);
 }
 
+// The API half of the same gate the redirect above applies to "/": while the
+// admin password is the compiled-in default, the device is unconfigured and
+// answers nothing but the two routes needed to configure it. Otherwise the
+// forced change would be cosmetic - a script or curl never requests "/", so it
+// would never see the redirect and would drive the whole API, OTA included, on
+// credentials everyone already knows.
+//
+// No AUTH_FAIL_DELAY_MS here, unlike send_auth_error() next door: the caller
+// authenticated fine, so this isn't a guess to throttle, and the httpd's single
+// worker task must not be parked for a second on a legitimate request.
+static void send_setup_required(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "403 Forbidden");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":false,\"error\":\"Default admin password in use - set a new one at /admin\"}",
+                     HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t index_get_handler(httpd_req_t *req)
 {
     if (!check_admin_auth(req)) {
         send_auth_error(req);
         return ESP_OK;
     }
-    if (auth_cfg_is_default()) {
+    if (auth_cfg_password_is_default()) {
         send_default_creds_redirect(req);
         return ESP_OK;
     }
@@ -257,6 +275,10 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         send_auth_error(req);
         return ESP_OK;
     }
+    if (auth_cfg_password_is_default()) {
+        send_setup_required(req);
+        return ESP_OK;
+    }
 
     wifi_config_t cfg;
     esp_wifi_get_config(WIFI_IF_AP, &cfg);
@@ -273,6 +295,10 @@ static esp_err_t wifi_post_handler(httpd_req_t *req)
 {
     if (!check_admin_auth(req)) {
         send_auth_error(req);
+        return ESP_OK;
+    }
+    if (auth_cfg_password_is_default()) {
+        send_setup_required(req);
         return ESP_OK;
     }
 
@@ -393,29 +419,39 @@ static esp_err_t admin_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// Static, not stack-allocated: the httpd worker task's stack is shared across
+// all handlers, and a 4KB local buffer would blow it.
+static uint8_t ota_buf[4096];
+
+// Drain the body ourselves in large chunks after rejecting an upload. Left to
+// the framework, the post-handler purge reads CONFIG_HTTPD_PURGE_BUF_LEN (32)
+// bytes at a time against a multi-megabyte image; any inter-chunk gap past
+// recv_wait_timeout (5s) makes it bail and force-close the socket mid-upload,
+// which surfaces to the client as a connection reset instead of the error
+// response it had already received.
+static void ota_drain_body(httpd_req_t *req)
+{
+    int remaining = req->content_len;
+    while (remaining > 0) {
+        int to_read = remaining < sizeof(ota_buf) ? remaining : sizeof(ota_buf);
+        int received = httpd_req_recv(req, (char *)ota_buf, to_read);
+        if (received <= 0) {
+            break;
+        }
+        remaining -= received;
+    }
+}
+
 static esp_err_t ota_post_handler(httpd_req_t *req)
 {
-    // Static, not stack-allocated: the httpd worker task's stack is shared
-    // across all handlers, and a 4KB local buffer here would blow it.
-    static uint8_t ota_buf[4096];
-
     if (!check_admin_auth(req)) {
         send_auth_error(req);
-        // Drain the body ourselves in large chunks. Left to the framework,
-        // the post-handler purge reads CONFIG_HTTPD_PURGE_BUF_LEN (32)
-        // bytes at a time against a multi-megabyte image; any inter-chunk
-        // gap past recv_wait_timeout (5s) makes it bail and force-close the
-        // socket mid-upload, which surfaces to the client as a connection
-        // reset instead of the 401 it already received.
-        int remaining = req->content_len;
-        while (remaining > 0) {
-            int to_read = remaining < sizeof(ota_buf) ? remaining : sizeof(ota_buf);
-            int received = httpd_req_recv(req, (char *)ota_buf, to_read);
-            if (received <= 0) {
-                break;
-            }
-            remaining -= received;
-        }
+        ota_drain_body(req);
+        return ESP_OK;
+    }
+    if (auth_cfg_password_is_default()) {
+        send_setup_required(req);
+        ota_drain_body(req);
         return ESP_OK;
     }
 
@@ -525,6 +561,10 @@ static esp_err_t clients_get_handler(httpd_req_t *req)
         send_auth_error(req);
         return ESP_OK;
     }
+    if (auth_cfg_password_is_default()) {
+        send_setup_required(req);
+        return ESP_OK;
+    }
 
     client_info_t clients[CLIENT_TRACK_MAX_CLIENTS];
     int count = 0;
@@ -582,6 +622,10 @@ static esp_err_t client_history_get_handler(httpd_req_t *req)
         send_auth_error(req);
         return ESP_OK;
     }
+    if (auth_cfg_password_is_default()) {
+        send_setup_required(req);
+        return ESP_OK;
+    }
 
     char query[128];
     char mac_str[24] = {0};
@@ -635,6 +679,10 @@ static esp_err_t system_get_handler(httpd_req_t *req)
 {
     if (!check_admin_auth(req)) {
         send_auth_error(req);
+        return ESP_OK;
+    }
+    if (auth_cfg_password_is_default()) {
+        send_setup_required(req);
         return ESP_OK;
     }
 
