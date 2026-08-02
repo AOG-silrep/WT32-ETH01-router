@@ -18,7 +18,10 @@
   th, td { text-align: left; padding: 0.4em 0.5em; border-bottom: 1px solid #ddd; }
   .panel table th { white-space: nowrap; }
   td.mac, td.ip { font-family: monospace; }
+  td.ip a.ip-link { color: #2a78d6; text-decoration: none; }
+  td.ip a.ip-link:hover { text-decoration: underline; }
   tr.stale { color: #999; }
+  tr.stale td.ip a.ip-link { color: inherit; }
   tr.stale .rate::after { content: " (idle)"; font-size: 0.85em; }
   #banner { display: none; background: #b00020; color: #fff; padding: 0.6em 1em; border-radius: 4px; margin-bottom: 1em; }
   #banner.show { display: block; }
@@ -168,6 +171,17 @@ function esc(s) {
   ));
 }
 
+// The IP column links to whatever the client itself serves on port 80 - most
+// devices on this network have their own web UI. A client that hasn't been
+// given a lease yet reports 0.0.0.0 (see client_track.h), which is not
+// something you can open, so that stays plain text. Opens in a new tab: this
+// tab is mid-poll and may be holding chart state.
+function ipCell(ip) {
+  if (!ip || ip === '0.0.0.0') return ip ? esc(ip) : '&ndash;';
+  return '<a class="ip-link" href="http://' + esc(ip) + '/" target="_blank" rel="noopener">'
+    + esc(ip) + '</a>';
+}
+
 function formatUptime(seconds) {
   const d = Math.floor(seconds / 86400);
   const h = Math.floor((seconds % 86400) / 3600);
@@ -231,7 +245,7 @@ async function refreshClients() {
     tr.innerHTML =
       '<td>' + (c.name ? esc(c.name) : '&ndash;') + '</td>' +
       '<td class="mac">' + esc(c.mac) + '</td>' +
-      '<td class="ip">' + esc(c.ip) + '</td>' +
+      '<td class="ip">' + ipCell(c.ip) + '</td>' +
       '<td>' + esc(c.link) + '</td>' +
       '<td>' + (c.rssi === null ? '&ndash;' : esc(c.rssi) + ' dBm') + '</td>' +
       '<td class="rate">' + formatRate(c.rx_bps) + '</td>' +
