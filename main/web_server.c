@@ -230,10 +230,69 @@ static const char auth_error_html[] =
     "password was changed or reset since this page was opened.</p>"
     "<p><a href=\"/\">Try again</a></p>";
 
+// The rejection line below is the only thing an *unauthenticated* caller can
+// put in the log ring, and AUTH_FAIL_DELAY_MS sets its pace: one line per
+// second, which is LOG_BUF_LINES (128) - the whole ring - in a little over two
+// minutes. So a bare `while :; do curl -s http://bridge/api/status; done`
+// quietly erases every line describing what the device was actually doing,
+// which is exactly the history worth having while someone is probing the box.
+//
+// At most one line therefore goes out per window; the rest are counted and
+// reported on the next one. A probe still shows up in the log - it just costs a
+// line a minute instead of a line a second, leaving the ring holding hours of
+// everything else.
+#define AUTH_FAIL_LOG_INTERVAL_MS 60000
+
+// How much of the URI that line carries. The caller chooses this string, so its
+// length is capped here rather than left to fill LOG_BUF_MSG_MAX (144) and push
+// the rest of the message - the suppressed count included - off the end. The
+// path leads the URI, so the head is the part that says what was probed.
+#define AUTH_FAIL_LOG_URI_MAX 48
+
+// Unguarded on purpose: esp_http_server dispatches every handler from its one
+// worker task - the same property AUTH_FAIL_DELAY_MS above leans on - so these
+// are only ever touched from a single task.
+static uint32_t s_auth_fail_unreported;
+static TickType_t s_auth_fail_last_log;
+static bool s_auth_fail_logged;
+
+static void log_auth_failure(httpd_req_t *req)
+{
+    TickType_t now = xTaskGetTickCount();
+    s_auth_fail_unreported++;
+
+    // Unsigned tick subtraction, so the window stays correct across the
+    // TickType_t rollover. The flag is what makes the first rejection after
+    // boot print: s_auth_fail_last_log starts at 0, which within the first
+    // minute of uptime reads as "just logged".
+    if (s_auth_fail_logged &&
+        (TickType_t)(now - s_auth_fail_last_log) < pdMS_TO_TICKS(AUTH_FAIL_LOG_INTERVAL_MS)) {
+        return;
+    }
+
+    uint32_t also = s_auth_fail_unreported - 1;
+    s_auth_fail_unreported = 0;
+    s_auth_fail_last_log = now;
+    s_auth_fail_logged = true;
+
+    if (also == 0) {
+        ESP_LOGW(TAG, "Rejected request for %.*s: bad or missing credentials",
+                 AUTH_FAIL_LOG_URI_MAX, req->uri);
+        return;
+    }
+    // "since the last of these" rather than "in the last minute": the count is
+    // carried until there is a line to print it on, so a burst that stops
+    // mid-window is still reported by whatever rejection comes next, however
+    // much later that is, instead of being dropped for want of an occasion.
+    ESP_LOGW(TAG, "Rejected request for %.*s: bad or missing credentials "
+                  "(%u more since the last of these)",
+             AUTH_FAIL_LOG_URI_MAX, req->uri, (unsigned)also);
+}
+
 static void send_auth_error(httpd_req_t *req)
 {
     vTaskDelay(pdMS_TO_TICKS(AUTH_FAIL_DELAY_MS));
-    ESP_LOGW(TAG, "Rejected request for %s: bad or missing credentials", req->uri);
+    log_auth_failure(req);
 
     httpd_resp_set_status(req, "401 Unauthorized");
     httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"AgOpen router\"");
