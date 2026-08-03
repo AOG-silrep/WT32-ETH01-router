@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
@@ -21,7 +22,14 @@ static log_line_t s_lines[LOG_BUF_LINES];
 // given seq is simply (seq - 1) % LOG_BUF_LINES and no per-line seq field is
 // needed.
 static uint32_t s_total;
-static uint32_t s_missed;
+
+// The one counter that is *not* covered by s_mutex, and can't be: it counts the
+// calls that failed to take the mutex. Two tasks - the two cores each run their
+// own - can time out at the same moment, so a plain ++ would be a read-modify-
+// write race that loses counts exactly when contention is highest and the
+// number matters most. Relaxed ordering is enough; nothing is published through
+// it, and the value is only ever read for display.
+static _Atomic uint32_t s_missed;
 
 // Guards s_lines/s_total *and* s_staging below. A mutex (not a spinlock) is
 // the right primitive here: everything that reaches the esp_log vprintf hook
@@ -227,7 +235,7 @@ static esp_log_level_t capture(const char *fmt, va_list ap)
         return ESP_LOG_ERROR;
     }
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(LOG_BUF_LOCK_TIMEOUT_MS)) != pdTRUE) {
-        s_missed++;
+        atomic_fetch_add_explicit(&s_missed, 1, memory_order_relaxed);
         // Unparsed, so err towards showing it on the console.
         return ESP_LOG_ERROR;
     }
@@ -328,10 +336,14 @@ void log_buf_get_range(uint32_t *oldest, uint32_t *newest, uint32_t *missed)
         *missed = 0;
         return;
     }
+    // s_missed is read outside the lock because it lives outside it - the mutex
+    // says nothing about a counter incremented by the tasks that failed to take
+    // it.
+    *missed = atomic_load_explicit(&s_missed, memory_order_relaxed);
+
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     *newest = s_total;
     *oldest = (s_total > LOG_BUF_LINES) ? (s_total - LOG_BUF_LINES + 1) : 1;
-    *missed = s_missed;
     xSemaphoreGive(s_mutex);
 }
 
