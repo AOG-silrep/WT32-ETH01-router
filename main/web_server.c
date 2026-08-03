@@ -200,11 +200,15 @@ static bool check_admin_auth(httpd_req_t *req)
     return strcmp(password, expected_password) == 0;
 }
 
-// Throttles credential guessing: every failed attempt costs a full second,
+// Throttles credential guessing: a rejected *guess* costs a full second,
 // capping a brute-force run at ~1 guess/sec instead of as fast as the server
 // can answer. The httpd runs a single worker task, so this parks the whole
-// server for that second - acceptable only because the UI's polling loop
-// stops on 401 rather than free-running at 1Hz (see index.html's poll()).
+// server for that second - which is why send_auth_error() spends it only on
+// requests that actually presented credentials, never on the header-less
+// first request of the Basic-auth handshake. What is left is a caller who
+// already chose to sit through a second per attempt, plus the UI's polling
+// loops, which stop on 401 rather than free-run at 1Hz (see index.html's
+// poll()).
 #define AUTH_FAIL_DELAY_MS 1000
 
 // True for a browser navigating to a page, false for fetch()/curl/scripts,
@@ -232,16 +236,18 @@ static const char auth_error_html[] =
     "<p><a href=\"/\">Try again</a></p>";
 
 // The rejection line below is the only thing an *unauthenticated* caller can
-// put in the log ring, and AUTH_FAIL_DELAY_MS sets its pace: one line per
-// second, which is LOG_BUF_LINES (128) - the whole ring - in a little over two
-// minutes. So a bare `while :; do curl -s http://bridge/api/status; done`
-// quietly erases every line describing what the device was actually doing,
-// which is exactly the history worth having while someone is probing the box.
+// put in the log ring, and nothing else paces it: that caller sends no
+// credentials, so AUTH_FAIL_DELAY_MS never applies to them and their requests
+// come back as fast as the server can answer. Unmetered, a bare
+// `while :; do curl -s http://bridge/api/status; done` writes LOG_BUF_LINES
+// (128) - the whole ring - in a fraction of a second, quietly erasing every
+// line describing what the device was actually doing, which is exactly the
+// history worth having while someone is probing the box.
 //
-// At most one line therefore goes out per window; the rest are counted and
-// reported on the next one. A probe still shows up in the log - it just costs a
-// line a minute instead of a line a second, leaving the ring holding hours of
-// everything else.
+// This interval is therefore the entire limit. At most one line goes out per
+// window; the rest are counted and reported on the next one. A probe still
+// shows up in the log - it just costs a line a minute however hard it is
+// driven, leaving the ring holding hours of everything else.
 #define AUTH_FAIL_LOG_INTERVAL_MS 60000
 
 // How much of the URI that line carries. The caller chooses this string, so its
@@ -257,8 +263,14 @@ static uint32_t s_auth_fail_unreported;
 static TickType_t s_auth_fail_last_log;
 static bool s_auth_fail_logged;
 
-static void log_auth_failure(httpd_req_t *req)
+// had_credentials picks the wording: a caller grinding passwords and one that
+// never sends a header at all read very differently, and the server now treats
+// them differently too (see send_auth_error()), so the log should say which it
+// saw. Both share one counter and one window - the suppressed tail below is
+// worded generically because a window can hold a mix of the two.
+static void log_auth_failure(httpd_req_t *req, bool had_credentials)
 {
+    const char *why = had_credentials ? "bad credentials" : "no credentials sent";
     TickType_t now = xTaskGetTickCount();
     s_auth_fail_unreported++;
 
@@ -277,23 +289,35 @@ static void log_auth_failure(httpd_req_t *req)
     s_auth_fail_logged = true;
 
     if (also == 0) {
-        ESP_LOGW(TAG, "Rejected request for %.*s: bad or missing credentials",
-                 AUTH_FAIL_LOG_URI_MAX, req->uri);
+        ESP_LOGW(TAG, "Rejected request for %.*s: %s",
+                 AUTH_FAIL_LOG_URI_MAX, req->uri, why);
         return;
     }
     // "since the last of these" rather than "in the last minute": the count is
     // carried until there is a line to print it on, so a burst that stops
     // mid-window is still reported by whatever rejection comes next, however
     // much later that is, instead of being dropped for want of an occasion.
-    ESP_LOGW(TAG, "Rejected request for %.*s: bad or missing credentials "
+    ESP_LOGW(TAG, "Rejected request for %.*s: %s "
                   "(%u more since the last of these)",
-             AUTH_FAIL_LOG_URI_MAX, req->uri, (unsigned)also);
+             AUTH_FAIL_LOG_URI_MAX, req->uri, why, (unsigned)also);
 }
 
 static void send_auth_error(httpd_req_t *req)
 {
-    vTaskDelay(pdMS_TO_TICKS(AUTH_FAIL_DELAY_MS));
-    log_auth_failure(req);
+    // Credentials that were sent and rejected are a guess, and get the throttle.
+    // A request with no Authorization header at all is not one: it is the first
+    // half of the Basic-auth handshake, which every browser opens with and which
+    // check_admin_auth() has no choice but to fail. Delaying that would put a
+    // second in front of every fresh page load, and - the httpd having a single
+    // worker task - would let a stranger park the whole server without knowing,
+    // or even attempting, a single credential.
+    //
+    // A malformed or over-long header still counts as present: it was an attempt.
+    bool had_credentials = httpd_req_get_hdr_value_len(req, "Authorization") > 0;
+    if (had_credentials) {
+        vTaskDelay(pdMS_TO_TICKS(AUTH_FAIL_DELAY_MS));
+    }
+    log_auth_failure(req, had_credentials);
 
     httpd_resp_set_status(req, "401 Unauthorized");
     httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"AgOpen router\"");

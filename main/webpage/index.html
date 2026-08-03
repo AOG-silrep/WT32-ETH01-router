@@ -201,9 +201,10 @@ function formatUptime(seconds) {
 // A 401 throws AUTH_ERROR instead of returning, so the polling loop can tell
 // "credentials are stale" apart from "bridge is unreachable". The two need
 // opposite responses: retry the second, stop dead on the first. The bridge
-// delays a second before answering any failed auth, and its httpd has a single
-// worker task, so a loop that kept polling with bad credentials would
-// monopolise the server and lock everyone out of the UI.
+// delays a second before rejecting credentials it was actually sent - which is
+// this case exactly - and its httpd has a single worker task, so a loop that
+// kept polling with stale credentials would monopolise the server and lock
+// everyone out of the UI.
 // A 403 gets the same treatment for the same reason: the bridge answers it
 // while the admin password is still the default, so retrying is pointless -
 // the fix is to go set one. In a tab that's already showing the dashboard this

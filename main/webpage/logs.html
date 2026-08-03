@@ -91,9 +91,9 @@
 // Mirrors the dashboard's fetchWithTimeout(): plain fetch() can hang for the
 // OS connect timeout when the bridge stops answering without closing the
 // socket, and a 401/403 needs to stop the loop rather than be retried. The
-// bridge delays a second on every failed auth and serves from a single worker
-// task, so a loop that kept retrying with stale credentials would lock everyone
-// out of the whole UI.
+// bridge delays a second before rejecting credentials it was actually sent, and
+// serves from a single worker task, so a loop that kept retrying with stale
+// credentials would lock everyone out of the whole UI.
 const AUTH_ERROR = Symbol('unauthorized');
 const SETUP_ERROR = Symbol('setup-required');
 
