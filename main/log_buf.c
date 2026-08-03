@@ -72,9 +72,11 @@ static size_t s_pending_len;
 static TaskHandle_t s_pending_task;
 
 // Level of the line currently being assembled. Only the prefix fragment carries
-// it, so it is recorded when a line starts and every later fragment of that
-// line inherits it - otherwise the serial console would print fragments 2 and 3
-// of a line whose prefix its own threshold had just suppressed.
+// it, so it is recorded when a line starts (s_pending_len == 0) and every later
+// fragment of that line inherits it - otherwise the serial console would print
+// fragments 2 and 3 of a line whose prefix its own threshold had just
+// suppressed. Valid only while a line is pending; the initialiser just keeps it
+// defined before the first one.
 static esp_log_level_t s_pending_level = ESP_LOG_ERROR;
 
 static vprintf_like_t s_orig_vprintf;
@@ -214,11 +216,18 @@ static void commit_pending(void)
     }
 
     s_pending_len = 0;
-    s_pending_level = ESP_LOG_ERROR;
 }
 
 // Commits early when the buffer fills, so a line that never terminates costs an
 // extra entry instead of wedging the accumulator or dropping its tail.
+//
+// Note this leaves s_pending_len non-zero, so the fragments that follow are
+// still read as a continuation and keep the line's level. That is why
+// commit_pending() does not reset s_pending_level: doing so demoted the tail of
+// an over-long line to an unparsed fragment, and unparsed means ESP_LOG_ERROR -
+// the console would print the remainder of an INFO line its own threshold had
+// suppressed the head of. The level is instead (re)established below, on the
+// one path that genuinely starts a new line.
 static void pending_putc(char c)
 {
     if (s_pending_len + 1 >= sizeof(s_pending)) {
