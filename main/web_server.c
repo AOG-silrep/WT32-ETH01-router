@@ -1,5 +1,6 @@
 #include <stdarg.h>
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include "web_server.h"
@@ -451,6 +452,115 @@ static bool resp_send_json(httpd_req_t *req, const char *resp, int off, size_t b
     return true;
 }
 
+// Drops a ":80" suffix so the Origin and Host spellings of the same address
+// compare equal - a browser leaves the default port out of Origin, while a
+// client may well spell it out in Host, or the other way round.
+static void strip_default_port(char *authority)
+{
+    size_t len = strlen(authority);
+    const char *port = ":80";
+    size_t port_len = strlen(port);
+    if (len > port_len && strcmp(authority + len - port_len, port) == 0) {
+        authority[len - port_len] = '\0';
+    }
+}
+
+// Caps the caller-chosen part of the URI in the lines below, for the reason
+// AUTH_FAIL_LOG_URI_MAX gives: req->uri carries the query string, and an
+// unbounded one would push the rest of the message past LOG_BUF_MSG_MAX.
+#define CSRF_LOG_URI_MAX 48
+
+// Guards the state-changing POSTs against a request this device's own pages did
+// not make. Basic Auth alone can't: the credentials are ambient, so the browser
+// replays them on any request to this origin, including one a page on some other
+// site made. And json_get_string() is a strstr() over the raw body, which parses
+// a text/plain body exactly as happily as a JSON one - so a form post or a
+// no-cors fetch() from an attacker's page, both CORS *simple* requests that go
+// out with no preflight to ask us about, used to arrive here fully authenticated
+// and be acted on. One click on the wrong link while signed in was enough to
+// change the AP password, take over the admin account, or flash firmware.
+//
+// Requiring the exact Content-Type is what closes that. Neither
+// application/json nor application/octet-stream is a simple content type, so
+// sending either cross-origin costs a preflight OPTIONS - and no OPTIONS handler
+// is registered here, so the browser blocks the request before it is ever made.
+// The Origin check is defence in depth behind it. Both are free for the pages
+// themselves, which already send these exact headers.
+//
+// Answers the caller itself and returns false, rather than pairing with a
+// send_*() the way check_admin_auth() does: the rejection comes in two flavours,
+// and neither is shared with any other path. No AUTH_FAIL_DELAY_MS either - this
+// is only reachable by a caller that authenticated, so there is no guessing to
+// throttle, and (see send_setup_required()) the one worker task must not be
+// parked on a legitimate request. That also means the log lines here need no
+// rate limit: a stranger can't reach them.
+static bool csrf_check(httpd_req_t *req, const char *expected_type)
+{
+    char type[64];
+    // Absent, or too long to be one of the two short types we accept.
+    bool type_ok = httpd_req_get_hdr_value_str(req, "Content-Type", type, sizeof(type)) == ESP_OK;
+    if (type_ok) {
+        // "application/json; charset=utf-8" is the same media type as
+        // "application/json" - keep the type, drop the parameters and any
+        // padding around them.
+        char *semi = strchr(type, ';');
+        if (semi != NULL) {
+            *semi = '\0';
+        }
+        char *start = type;
+        while (*start == ' ' || *start == '\t') {
+            start++;
+        }
+        size_t type_len = strlen(start);
+        while (type_len > 0 && (start[type_len - 1] == ' ' || start[type_len - 1] == '\t')) {
+            start[--type_len] = '\0';
+        }
+        type_ok = strcasecmp(start, expected_type) == 0;
+    }
+    if (!type_ok) {
+        ESP_LOGW(TAG, "Rejected %.*s: Content-Type is not %s",
+                 CSRF_LOG_URI_MAX, req->uri, expected_type);
+        char resp[128];
+        int len = resp_append(resp, sizeof(resp), 0,
+                              "{\"ok\":false,\"error\":\"Send this as Content-Type: %s\"}",
+                              expected_type);
+        httpd_resp_set_status(req, "415 Unsupported Media Type");
+        resp_send_json(req, resp, len, sizeof(resp));
+        return false;
+    }
+
+    char origin[64];
+    esp_err_t err = httpd_req_get_hdr_value_str(req, "Origin", origin, sizeof(origin));
+    if (err == ESP_ERR_NOT_FOUND) {
+        // No Origin means no browser behind the request: curl and scripts send
+        // none, and no browser omits it on a cross-origin POST. The README
+        // documents scripted API access, so this stays allowed.
+        return true;
+    }
+
+    bool same_origin = false;
+    const char *scheme = "http://";
+    char host[64];
+    // Anything that isn't a plain-http origin can't be this server, which serves
+    // http on port 80 only - the literal "null" a sandboxed frame sends included.
+    if (err == ESP_OK && strncasecmp(origin, scheme, strlen(scheme)) == 0 &&
+        httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) == ESP_OK) {
+        char *origin_host = origin + strlen(scheme);
+        strip_default_port(origin_host);
+        strip_default_port(host);
+        same_origin = strcasecmp(origin_host, host) == 0;
+    }
+    if (!same_origin) {
+        ESP_LOGW(TAG, "Rejected %.*s: cross-origin request", CSRF_LOG_URI_MAX, req->uri);
+        httpd_resp_set_status(req, "403 Forbidden");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"Cross-origin request refused\"}",
+                        HTTPD_RESP_USE_STRLEN);
+        return false;
+    }
+    return true;
+}
+
 // How many idle stretches a body may span. httpd_req_recv() returns what one
 // socket read produced, not what was asked for, and a gap longer than
 // recv_wait_timeout (5s) between segments comes back as a timeout rather than an
@@ -568,6 +678,9 @@ static esp_err_t wifi_post_handler(httpd_req_t *req)
         send_setup_required(req);
         return ESP_OK;
     }
+    if (!csrf_check(req, "application/json")) {
+        return ESP_OK;
+    }
 
     char buf[256];
     if (recv_body(req, buf, sizeof(buf)) < 0) {
@@ -626,6 +739,9 @@ static esp_err_t admin_post_handler(httpd_req_t *req)
 {
     if (!check_admin_auth(req)) {
         send_auth_error(req);
+        return ESP_OK;
+    }
+    if (!csrf_check(req, "application/json")) {
         return ESP_OK;
     }
 
@@ -706,6 +822,10 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
     }
     if (auth_cfg_password_is_default()) {
         send_setup_required(req);
+        ota_drain_body(req);
+        return ESP_OK;
+    }
+    if (!csrf_check(req, "application/octet-stream")) {
         ota_drain_body(req);
         return ESP_OK;
     }
@@ -1157,6 +1277,9 @@ static esp_err_t logs_level_post_handler(httpd_req_t *req)
     }
     if (auth_cfg_password_is_default()) {
         send_setup_required(req);
+        return ESP_OK;
+    }
+    if (!csrf_check(req, "application/json")) {
         return ESP_OK;
     }
 

@@ -75,6 +75,20 @@ Change it from `/admin` (linked via the "Update username & password" button on t
 or with the serial console's `admin` command (see below). The console applies the same rule, so
 `admin -u <name>` on a fresh device fails until you pass `-p <password>` too.
 
+Because a browser attaches those credentials to *any* request it makes to the bridge — including
+one started by a page on some other site — the routes that change something (`/api/wifi`,
+`/api/admin`, `/api/logs/level`, `/api/ota`) additionally require the right `Content-Type`, and
+refuse a request whose `Origin` names somewhere other than the bridge. A script sends no `Origin`
+and is unaffected by the second rule, but it does have to set the header:
+
+```sh
+curl -u admin:<password> -H 'Content-Type: application/json' \
+     -d '{"level":"warn"}' http://192.168.5.1/api/logs/level
+```
+
+Without it the answer is `415`. `/api/ota` wants `application/octet-stream`; the other three want
+`application/json`.
+
 ## Building and flashing
 
 Requires [ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/get-started/index.html) (v5.3+).
