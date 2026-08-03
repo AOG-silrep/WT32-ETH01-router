@@ -775,7 +775,16 @@ static esp_err_t client_history_get_handler(httpd_req_t *req)
     char query[128];
     char mac_str[24] = {0};
     char since_str[16] = {0};
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+    // Same split as logs_get_handler(): a query too long for the buffer comes
+    // back as ESP_ERR_HTTPD_RESULT_TRUNC with nothing copied, so folding it in
+    // with ESP_ERR_NOT_FOUND would blame the caller's "mac" for a length
+    // problem it doesn't have.
+    esp_err_t query_err = httpd_req_get_url_query_str(req, query, sizeof(query));
+    if (query_err == ESP_ERR_HTTPD_RESULT_TRUNC) {
+        httpd_resp_send_err(req, HTTPD_414_URI_TOO_LONG, "Query string too long");
+        return ESP_FAIL;
+    }
+    if (query_err == ESP_OK) {
         httpd_query_key_value(query, "mac", mac_str, sizeof(mac_str));
         httpd_query_key_value(query, "since", since_str, sizeof(since_str));
     }
@@ -930,7 +939,18 @@ static esp_err_t logs_get_handler(httpd_req_t *req)
 
     char query[64];
     char since_str[16] = {0};
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+    // No query at all (ESP_ERR_NOT_FOUND) is the fresh-reader case and falls
+    // through to since == 0. A query too long for the buffer is not: the IDF
+    // returns ESP_ERR_HTTPD_RESULT_TRUNC without copying anything, so lumping
+    // it in with "no query" would replay the whole ring and report lost == 0 -
+    // telling a reader that had a position it had missed nothing. Only a
+    // cursor we actually read can be trusted to mean that.
+    esp_err_t query_err = httpd_req_get_url_query_str(req, query, sizeof(query));
+    if (query_err == ESP_ERR_HTTPD_RESULT_TRUNC) {
+        httpd_resp_send_err(req, HTTPD_414_URI_TOO_LONG, "Query string too long");
+        return ESP_FAIL;
+    }
+    if (query_err == ESP_OK) {
         httpd_query_key_value(query, "since", since_str, sizeof(since_str));
     }
     uint32_t since = since_str[0] ? (uint32_t)strtoul(since_str, NULL, 10) : 0;
