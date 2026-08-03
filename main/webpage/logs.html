@@ -203,6 +203,10 @@ function addNote(text) {
   cell.textContent = text;
 }
 
+function lostNote(n) {
+  return '— ' + n + ' line(s) scrolled out of the device buffer —';
+}
+
 function applyFilter() {
   for (const row of body.rows) {
     row.style.display = Number(row.dataset.rank) > filterRank ? 'none' : '';
@@ -286,13 +290,21 @@ async function fetchOnce() {
     addNote('— device restarted —');
     trimRows();
   }
+  // Only lines that aged out before this batch begins; a hole inside the batch
+  // arrives as a gap entry below, positioned where it actually happened.
   if (data.lost > 0) {
-    addNote('— ' + data.lost + ' line(s) scrolled out of the device buffer —');
+    addNote(lostNote(data.lost));
     trimRows();
   }
 
   for (const line of data.lines) {
-    addLine(line);
+    // Not a log line: the device dropped this many lines at this point in the
+    // batch, and put the marker here rather than in front of everything.
+    if (line.gap) {
+      addNote(lostNote(line.gap));
+    } else {
+      addLine(line);
+    }
   }
   if (data.lines.length > 0 || data.restarted || data.lost > 0) {
     trimRows();

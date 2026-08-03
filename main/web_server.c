@@ -1151,6 +1151,10 @@ static esp_err_t logs_page_get_handler(httpd_req_t *req)
 // up so the two stay decoupled - the reservation only has to be an upper bound.
 #define LOGS_TRAILER_MAX 192
 
+// Longest gap entry the packing loop can emit: ",{\"gap\":4294967295}" is 20
+// bytes, plus the NUL. Rounded up for the same reason as the trailer.
+#define LOGS_GAP_MAX 32
+
 // Serves log lines newer than ?since=<seq>, following the same cursor contract
 // as /api/client/history: the caller echoes back the "seq" from the previous
 // response and gets only what it hasn't seen.
@@ -1195,8 +1199,11 @@ static esp_err_t logs_get_handler(httpd_req_t *req)
     // reader (sequence numbers restart at 1), so start it over from the top.
     bool restarted = since > newest;
     uint32_t next = restarted ? oldest : (since + 1);
-    // Lines that aged out of the ring between polls. Reported so the page can
-    // show a gap marker instead of silently splicing over the missing ones.
+    // Lines that aged out of the ring between polls, before the first line of
+    // this batch. Reported so the page can show a gap marker instead of
+    // silently splicing over the missing ones. Lines that age out *during* the
+    // packing loop below are not counted here - they belong inside the batch,
+    // not in front of it, and are emitted in place (see "gap").
     // since == 0 is a reader starting fresh, which hasn't missed anything -
     // only a reader that had a position and fell behind it has.
     uint32_t lost = 0;
@@ -1212,6 +1219,9 @@ static esp_err_t logs_get_handler(httpd_req_t *req)
 
     uint32_t seq = next;
     int emitted = 0;
+    // Lines dropped since the last entry was emitted, waiting to be written out
+    // as a gap entry in front of whichever line follows them.
+    uint32_t gap = 0;
     for (; seq <= newest; seq++) {
         char level = '?';
         uint32_t ts_ms = 0;
@@ -1225,10 +1235,13 @@ static esp_err_t logs_get_handler(httpd_req_t *req)
             // ring's lock between lines, so a burst can wrap past a batch still
             // being packed. Counted, because skipping it silently would advance
             // the cursor over the gap and splice the two halves together with
-            // nothing to show for it. This is counted even for a fresh reader
-            // (which starts with lost == 0 by definition): the gap falls inside
-            // the lines it is being handed, not before them.
-            lost++;
+            // nothing to show for it. Held until the next line is emitted
+            // rather than added to "lost": the hole is inside the batch, and a
+            // count reported alongside it could only be drawn in front of the
+            // whole batch, pointing at the wrong place. A burst can wrap the
+            // ring more than once while one response is packed, so there may be
+            // several of these runs, each with lines emitted between them.
+            gap++;
             continue;
         }
 
@@ -1250,9 +1263,23 @@ static esp_err_t logs_get_handler(httpd_req_t *req)
         // can expand any byte to \uXXXX. Worst case is 64 + 6 * (31 + 143) =
         // 1108, so no line is ever too large to emit - one that was would wedge
         // the cursor here permanently, which is the state this check prevents.
+        //
+        // Two gap entries are reserved on every pass, whether or not one is
+        // pending: the entry may be preceded by a gap that is pending now, and
+        // the loop may then drop more lines and have to write a second one on
+        // the way out. Both are unconditional because a gap can never be
+        // deferred to the next poll - the lines it stands for are below the
+        // cursor this response reports, so nothing later will see them.
         size_t needed = 64 + 6 * strlen(tag) + 6 * strlen(msg);
-        if ((size_t)off + needed + LOGS_TRAILER_MAX >= sizeof(resp)) {
+        if ((size_t)off + needed + 2 * LOGS_GAP_MAX + LOGS_TRAILER_MAX >= sizeof(resp)) {
             break;
+        }
+
+        if (gap > 0) {
+            off = resp_append(resp, sizeof(resp), off, "%s{\"gap\":%u}",
+                               emitted == 0 ? "" : ",", (unsigned)gap);
+            emitted++;
+            gap = 0;
         }
 
         off = resp_append(resp, sizeof(resp), off, "%s{\"n\":%u,\"l\":\"%c\",\"t\":%u,\"g\":\"",
@@ -1262,6 +1289,16 @@ static esp_err_t logs_get_handler(httpd_req_t *req)
         off = json_append_escaped(resp, sizeof(resp), off, msg);
         off = resp_append(resp, sizeof(resp), off, "\"}");
         emitted++;
+    }
+
+    // Dropped lines with nothing after them: the loop ran out of range, or out
+    // of buffer at a line this response won't carry. Either way they are below
+    // the cursor this response reports, so the marker goes at the end of the
+    // batch rather than being left for a poll that will never see them. The
+    // reservation above guarantees the room.
+    if (gap > 0) {
+        off = resp_append(resp, sizeof(resp), off, "%s{\"gap\":%u}",
+                           emitted == 0 ? "" : ",", (unsigned)gap);
     }
 
     off = resp_append(resp, sizeof(resp), off,
