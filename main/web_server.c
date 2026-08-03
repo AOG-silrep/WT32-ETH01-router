@@ -451,6 +451,50 @@ static bool resp_send_json(httpd_req_t *req, const char *resp, int off, size_t b
     return true;
 }
 
+// How many idle stretches a body may span. httpd_req_recv() returns what one
+// socket read produced, not what was asked for, and a gap longer than
+// recv_wait_timeout (5s) between segments comes back as a timeout rather than an
+// error - retrying is what makes a body split across TCP segments arrive whole.
+// Bounded, though: the httpd has one worker task, so retrying forever would let
+// any client stall every other request for as long as it cared to dribble a body
+// out.
+#define RECV_BODY_MAX_TIMEOUTS 3
+
+// Reads the whole request body into buf and NUL-terminates it, returning its
+// length, or -1 having already answered the caller.
+//
+// The single httpd_req_recv() this replaces stopped at whatever the first read
+// returned. Short of content_len that leaves truncated JSON, which
+// json_get_string() then reports as a missing field - a transport hiccup blamed
+// on the request. On /api/admin it was worse than a bad message: the cut can
+// fall between the two fields, saving a new username against the old password
+// while the response says the request was rejected.
+static int recv_body(httpd_req_t *req, char *buf, size_t bufsz)
+{
+    // content_len is unsigned, so this is the "missing" half of the message.
+    if (req->content_len == 0 || req->content_len >= bufsz) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body missing or too large");
+        return -1;
+    }
+
+    size_t total = 0;
+    int timeouts = 0;
+    while (total < req->content_len) {
+        int received = httpd_req_recv(req, buf + total, req->content_len - total);
+        if (received > 0) {
+            total += (size_t)received;
+            continue;
+        }
+        if (received == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts <= RECV_BODY_MAX_TIMEOUTS) {
+            continue;
+        }
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Failed to read body");
+        return -1;
+    }
+    buf[total] = '\0';
+    return (int)total;
+}
+
 static esp_err_t index_get_handler(httpd_req_t *req)
 {
     if (!check_admin_auth(req)) {
@@ -526,16 +570,9 @@ static esp_err_t wifi_post_handler(httpd_req_t *req)
     }
 
     char buf[256];
-    if (req->content_len <= 0 || req->content_len >= sizeof(buf)) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body missing or too large");
+    if (recv_body(req, buf, sizeof(buf)) < 0) {
         return ESP_FAIL;
     }
-    int received = httpd_req_recv(req, buf, req->content_len);
-    if (received <= 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Failed to read body");
-        return ESP_FAIL;
-    }
-    buf[received] = '\0';
 
     char ssid[WIFI_CFG_SSID_MAX_LEN] = {0};
     char password[WIFI_CFG_PASSWORD_MAX_LEN] = {0};
@@ -593,16 +630,9 @@ static esp_err_t admin_post_handler(httpd_req_t *req)
     }
 
     char buf[256];
-    if (req->content_len <= 0 || req->content_len >= sizeof(buf)) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body missing or too large");
+    if (recv_body(req, buf, sizeof(buf)) < 0) {
         return ESP_FAIL;
     }
-    int received = httpd_req_recv(req, buf, req->content_len);
-    if (received <= 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Failed to read body");
-        return ESP_FAIL;
-    }
-    buf[received] = '\0';
 
     char new_user[AUTH_CFG_USERNAME_MAX_LEN];
     char new_password[AUTH_CFG_PASSWORD_MAX_LEN];
@@ -1131,16 +1161,9 @@ static esp_err_t logs_level_post_handler(httpd_req_t *req)
     }
 
     char buf[64];
-    if (req->content_len <= 0 || req->content_len >= sizeof(buf)) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body missing or too large");
+    if (recv_body(req, buf, sizeof(buf)) < 0) {
         return ESP_FAIL;
     }
-    int received = httpd_req_recv(req, buf, req->content_len);
-    if (received <= 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Failed to read body");
-        return ESP_FAIL;
-    }
-    buf[received] = '\0';
 
     char level_str[16];
     if (!json_get_string(buf, "level", level_str, sizeof(level_str))) {
