@@ -7,6 +7,7 @@
 #include "auth_cfg.h"
 #include "client_track.h"
 #include "sys_monitor.h"
+#include "log_buf.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -21,6 +22,8 @@ extern const uint8_t index_html_start[] asm("_binary_index_html_start");
 extern const uint8_t index_html_end[] asm("_binary_index_html_end");
 extern const uint8_t admin_html_start[] asm("_binary_admin_html_start");
 extern const uint8_t admin_html_end[] asm("_binary_admin_html_end");
+extern const uint8_t logs_html_start[] asm("_binary_logs_html_start");
+extern const uint8_t logs_html_end[] asm("_binary_logs_html_end");
 
 // Pulls a JSON string field's value out of a flat {"key":"value",...}
 // object. Good enough for the small, fixed-shape request bodies this
@@ -330,11 +333,11 @@ resp_append_at(const char *who, char *buf, size_t bufsz, int off, const char *fm
 // caller's), escaping the three things that would otherwise produce a document
 // no parser will accept: '"', '\', and raw control characters.
 //
-// The strings this server emits are device-controlled but not device-authored -
-// a DHCP hostname, the SSID - so "in practice these never contain a quote" is
-// an assumption about other people's input, not an invariant. When it breaks,
-// the dashboard's JSON.parse() throws and the whole page goes blank with
-// nothing on screen to explain why.
+// Every string this server emits is device-controlled but not device-authored -
+// log messages, DHCP hostnames, the SSID - so "in practice these never contain
+// a quote" is an assumption about other people's input, not an invariant. When
+// it breaks, the dashboard's JSON.parse() throws and the whole page goes blank
+// with nothing on screen to explain why.
 //
 // Follows resp_append_at()'s contract: returns an offset clamped to bufsz, so
 // chaining into `bufsz - off` can never underflow. Truncation is silent here
@@ -862,6 +865,227 @@ static esp_err_t system_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// Level names shared by the log API, matching the ones the "loglevel" console
+// command accepts so the two interfaces speak the same vocabulary.
+static const struct {
+    const char *name;
+    esp_log_level_t level;
+} log_level_names[] = {
+    {"none", ESP_LOG_NONE}, {"error", ESP_LOG_ERROR}, {"warn", ESP_LOG_WARN},
+    {"info", ESP_LOG_INFO}, {"debug", ESP_LOG_DEBUG}, {"verbose", ESP_LOG_VERBOSE},
+};
+
+static const char *log_level_name(esp_log_level_t level)
+{
+    for (size_t i = 0; i < sizeof(log_level_names) / sizeof(log_level_names[0]); i++) {
+        if (log_level_names[i].level == level) {
+            return log_level_names[i].name;
+        }
+    }
+    return "unknown";
+}
+
+static esp_err_t logs_page_get_handler(httpd_req_t *req)
+{
+    if (!check_admin_auth(req)) {
+        send_auth_error(req);
+        return ESP_OK;
+    }
+    if (auth_cfg_password_is_default()) {
+        send_default_creds_redirect(req);
+        return ESP_OK;
+    }
+
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, (const char *)logs_html_start,
+                     logs_html_end - logs_html_start - 1);
+    return ESP_OK;
+}
+
+// Longest possible trailer appended after the packing loop in
+// logs_get_handler(), with every %u at 10 digits and all three level names at
+// their longest ("verbose"): 153 bytes, plus the NUL vsnprintf writes. Rounded
+// up so the two stay decoupled - the reservation only has to be an upper bound.
+#define LOGS_TRAILER_MAX 192
+
+// Serves log lines newer than ?since=<seq>, following the same cursor contract
+// as /api/client/history: the caller echoes back the "seq" from the previous
+// response and gets only what it hasn't seen.
+//
+// The cursor lives entirely on the client, so reads are non-destructive and any
+// number of browser tabs (or curl loops) can tail the log independently - each
+// at its own position. A queue that consumed on read would force them to
+// compete for lines, and the page would have to police having only one tab open.
+static esp_err_t logs_get_handler(httpd_req_t *req)
+{
+    if (!check_admin_auth(req)) {
+        send_auth_error(req);
+        return ESP_OK;
+    }
+    if (auth_cfg_password_is_default()) {
+        send_setup_required(req);
+        return ESP_OK;
+    }
+
+    char query[64];
+    char since_str[16] = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        httpd_query_key_value(query, "since", since_str, sizeof(since_str));
+    }
+    uint32_t since = since_str[0] ? (uint32_t)strtoul(since_str, NULL, 10) : 0;
+
+    uint32_t oldest = 0, newest = 0, missed = 0;
+    log_buf_get_range(&oldest, &newest, &missed);
+
+    // A cursor ahead of the newest line means the device rebooted under this
+    // reader (sequence numbers restart at 1), so start it over from the top.
+    bool restarted = since > newest;
+    uint32_t next = restarted ? oldest : (since + 1);
+    // Lines that aged out of the ring between polls. Reported so the page can
+    // show a gap marker instead of silently splicing over the missing ones.
+    // since == 0 is a reader starting fresh, which hasn't missed anything -
+    // only a reader that had a position and fell behind it has.
+    uint32_t lost = 0;
+    if (next < oldest) {
+        lost = (since == 0) ? 0 : (oldest - next);
+        next = oldest;
+    }
+
+    // Static, not a local: the 8KB worker stack is shared with the OTA
+    // handler's call chain into esp_ota_write() (see ota_buf below).
+    static char resp[4096];
+    int off = resp_append(resp, sizeof(resp), 0, "{\"lines\":[");
+
+    uint32_t seq = next;
+    int emitted = 0;
+    for (; seq <= newest; seq++) {
+        char level = '?';
+        uint32_t ts_ms = 0;
+        char tag[LOG_BUF_TAG_MAX];
+        char msg[LOG_BUF_MSG_MAX];
+        // Copied out before appending, never while holding log_buf's lock:
+        // resp_append() logs on truncation, which would re-enter the capture
+        // hook and deadlock against a lock this handler was still holding.
+        if (!log_buf_get_line(seq, &level, &ts_ms, tag, sizeof(tag), msg, sizeof(msg))) {
+            continue;  // Overwritten between the range read and here.
+        }
+
+        // Stop before the append rather than after: a partially written entry
+        // would have to be unwound, and resp_send_json() would reject the whole
+        // response anyway. Leaving it for the next poll (via "more") costs one
+        // extra round trip and keeps every response complete.
+        //
+        // The reservation covers the trailer as well as the entry. It has to:
+        // packing up to the end of the buffer and only then discovering the
+        // trailer doesn't fit produces a 500, and since the client can't
+        // advance its cursor past a response it couldn't parse, the next poll
+        // rebuilds the same over-packed batch and fails identically. The page
+        // stays on "Lost connection" until the ring wraps past that cursor.
+        //
+        // 64 covers the entry's own fixed JSON (54 bytes at 10-digit seq and
+        // timestamp) with room for vsnprintf's NUL; both tag and msg get the
+        // 6x allowance because both go through json_append_escaped(), which
+        // can expand any byte to \uXXXX. Worst case is 64 + 6 * (31 + 143) =
+        // 1108, so no line is ever too large to emit - one that was would wedge
+        // the cursor here permanently, which is the state this check prevents.
+        size_t needed = 64 + 6 * strlen(tag) + 6 * strlen(msg);
+        if ((size_t)off + needed + LOGS_TRAILER_MAX >= sizeof(resp)) {
+            break;
+        }
+
+        off = resp_append(resp, sizeof(resp), off, "%s{\"n\":%u,\"l\":\"%c\",\"t\":%u,\"g\":\"",
+                           emitted == 0 ? "" : ",", (unsigned)seq, level, (unsigned)ts_ms);
+        off = json_append_escaped(resp, sizeof(resp), off, tag);
+        off = resp_append(resp, sizeof(resp), off, "\",\"m\":\"");
+        off = json_append_escaped(resp, sizeof(resp), off, msg);
+        off = resp_append(resp, sizeof(resp), off, "\"}");
+        emitted++;
+    }
+
+    off = resp_append(resp, sizeof(resp), off,
+                       "],\"seq\":%u,\"lost\":%u,\"missed\":%u,\"more\":%s,"
+                       "\"restarted\":%s,\"level\":\"%s\",\"serial_level\":\"%s\","
+                       "\"max_level\":\"%s\"}",
+                       (unsigned)(seq - 1), (unsigned)lost, (unsigned)missed,
+                       seq <= newest ? "true" : "false",
+                       restarted ? "true" : "false",
+                       log_level_name(esp_log_level_get("*")),
+                       log_level_name(log_buf_get_serial_level()),
+                       // What the build kept, not what it will accept: ESP_LOGD
+                       // and ESP_LOGV compile to nothing above this, so a
+                       // capture level past it records not one extra line. The
+                       // page needs it to say so instead of leaving the reader
+                       // staring at an unchanged log.
+                       log_level_name((esp_log_level_t)CONFIG_LOG_MAXIMUM_LEVEL));
+
+    if (!resp_send_json(req, resp, off, sizeof(resp))) {
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+// Sets the capture level - how much reaches the ring the log page reads. The
+// serial console's own threshold is separate and stays where "loglevel" put it
+// (see log_buf.h), except that it can never exceed this one.
+//
+// All six names stay accepted here, including "none", even though the page no
+// longer offers it: reaching for the API directly is a deliberate act, and
+// "loglevel" at the console can raise the level back out of any of them.
+static esp_err_t logs_level_post_handler(httpd_req_t *req)
+{
+    if (!check_admin_auth(req)) {
+        send_auth_error(req);
+        return ESP_OK;
+    }
+    if (auth_cfg_password_is_default()) {
+        send_setup_required(req);
+        return ESP_OK;
+    }
+
+    char buf[64];
+    int received = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (received <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty request body");
+        return ESP_FAIL;
+    }
+    buf[received] = '\0';
+
+    char level_str[16];
+    if (!json_get_string(buf, "level", level_str, sizeof(level_str))) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing \"level\"");
+        return ESP_FAIL;
+    }
+
+    for (size_t i = 0; i < sizeof(log_level_names) / sizeof(log_level_names[0]); i++) {
+        if (strcmp(level_str, log_level_names[i].name) == 0) {
+            // The announcement has to survive its own change, and which side of
+            // the set that takes depends on the direction. A move down to
+            // "error" or "none" filters it out if logged after, leaving the
+            // ring with no record of why it went quiet; a move up out of
+            // "error" or "none" is filtered by the old level if logged before,
+            // leaving no record of the raise. Log on the more permissive side
+            // either way.
+            esp_log_level_t old_level = esp_log_level_get("*");
+            esp_log_level_t new_level = log_level_names[i].level;
+            if (new_level > old_level) {
+                esp_log_level_set("*", new_level);
+                ESP_LOGW(TAG, "Log capture level set to %s", log_level_names[i].name);
+            } else {
+                ESP_LOGW(TAG, "Log capture level set to %s", log_level_names[i].name);
+                esp_log_level_set("*", new_level);
+            }
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+            return ESP_OK;
+        }
+    }
+
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                         "Unknown level (want none|error|warn|info|debug|verbose)");
+    return ESP_FAIL;
+}
+
 httpd_handle_t web_server_start(void)
 {
     httpd_handle_t server = NULL;
@@ -870,10 +1094,11 @@ httpd_handle_t web_server_start(void)
     // Default 4KB is too tight once the OTA handler's call chain into
     // esp_ota_write()/SPI flash is included on this same worker task's stack.
     config.stack_size = 8192;
-    // Default (8) is one short of the 9 routes registered below - the 9th
-    // registration (ota_uri, being last) would silently fail to register,
-    // leaving /api/ota unhandled with no error logged.
-    config.max_uri_handlers = 12;
+    // The default (8) is short of the routes registered below, and
+    // httpd_register_uri_handler()'s return value is not checked - overshooting
+    // the cap silently drops whichever routes came last, with no error logged.
+    // Keep comfortable headroom over the actual count for that reason.
+    config.max_uri_handlers = 16;
 
     esp_err_t err = httpd_start(&server, &config);
     if (err != ESP_OK) {
@@ -890,6 +1115,9 @@ httpd_handle_t web_server_start(void)
     const httpd_uri_t history_uri = {.uri = "/api/client/history", .method = HTTP_GET, .handler = client_history_get_handler};
     const httpd_uri_t system_uri = {.uri = "/api/system", .method = HTTP_GET, .handler = system_get_handler};
     const httpd_uri_t ota_uri = {.uri = "/api/ota", .method = HTTP_POST, .handler = ota_post_handler};
+    const httpd_uri_t logs_page_uri = {.uri = "/logs", .method = HTTP_GET, .handler = logs_page_get_handler};
+    const httpd_uri_t logs_uri = {.uri = "/api/logs", .method = HTTP_GET, .handler = logs_get_handler};
+    const httpd_uri_t logs_level_uri = {.uri = "/api/logs/level", .method = HTTP_POST, .handler = logs_level_post_handler};
 
     httpd_register_uri_handler(server, &index_uri);
     httpd_register_uri_handler(server, &admin_page_uri);
@@ -900,6 +1128,9 @@ httpd_handle_t web_server_start(void)
     httpd_register_uri_handler(server, &history_uri);
     httpd_register_uri_handler(server, &system_uri);
     httpd_register_uri_handler(server, &ota_uri);
+    httpd_register_uri_handler(server, &logs_page_uri);
+    httpd_register_uri_handler(server, &logs_uri);
+    httpd_register_uri_handler(server, &logs_level_uri);
 
     ESP_LOGI(TAG, "Web server started");
     return server;

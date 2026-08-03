@@ -5,6 +5,7 @@
 #include "auth_cfg.h"
 #include "client_track.h"
 #include "sys_monitor.h"
+#include "log_buf.h"
 #include "esp_console.h"
 #include "argtable3/argtable3.h"
 #include "esp_wifi.h"
@@ -201,6 +202,20 @@ static struct {
     struct arg_end *end;
 } loglevel_args;
 
+// Mirrors log_level_name() in web_server.c, down to the "unknown" fallback -
+// the two tables are the same six names on purpose, so the console and the log
+// page describe the device identically. Every esp_log_level_t value is in the
+// table, so the fallback is unreachable defence.
+static const char *level_name(esp_log_level_t level)
+{
+    for (size_t i = 0; i < sizeof(log_levels) / sizeof(log_levels[0]); i++) {
+        if (log_levels[i].level == level) {
+            return log_levels[i].name;
+        }
+    }
+    return "unknown";
+}
+
 static int cmd_loglevel(int argc, char **argv)
 {
     int nerrors = arg_parse(argc, argv, (void **)&loglevel_args);
@@ -210,22 +225,47 @@ static int cmd_loglevel(int argc, char **argv)
     }
 
     if (loglevel_args.level->count == 0) {
-        esp_log_level_t cur = esp_log_level_get("*");
-        for (size_t i = 0; i < sizeof(log_levels) / sizeof(log_levels[0]); i++) {
-            if (log_levels[i].level == cur) {
-                printf("Log level: %s\n", log_levels[i].name);
-                return 0;
-            }
-        }
-        printf("Log level: %d\n", (int)cur);
+        // Both, because the capture level is what explains a serial level that
+        // isn't delivering: nothing above it reaches the hook to be printed.
+        printf("Serial log level: %s\n", level_name(log_buf_get_serial_level()));
+        printf("Capture level:    %s\n", level_name(esp_log_level_get("*")));
         return 0;
     }
 
     const char *name = loglevel_args.level->sval[0];
     for (size_t i = 0; i < sizeof(log_levels) / sizeof(log_levels[0]); i++) {
         if (strcmp(name, log_levels[i].name) == 0) {
-            esp_log_level_set("*", log_levels[i].level);
-            printf("Log level set to %s\n", name);
+            log_buf_set_serial_level(log_levels[i].level);
+            printf("Serial log level set to %s\n", name);
+
+            // Only lines that pass the global filter reach the capture hook at
+            // all, so asking for more serial verbosity than is being captured
+            // is meaningless unless capture comes up with it. Raise it here
+            // rather than printing a note and doing nothing: the web page can
+            // set capture to "none", and this console has to be able to get
+            // itself talking again without a reboot.
+            //
+            // Raise-only. Lowering capture to match would let someone at the
+            // cable blind a web log page they can't see, and "quieter serial"
+            // never needs it - that is what the serial level itself is for.
+            esp_log_level_t captured = esp_log_level_get("*");
+            if (log_levels[i].level > captured) {
+                esp_log_level_set("*", log_levels[i].level);
+                printf("Capture level raised to %s (was %s) so these lines can "
+                       "reach this console.\n", name, level_name(captured));
+            }
+
+            // Both thresholds now say "debug", and the build emits no DEBUG
+            // lines to pass them: ESP_LOGD and ESP_LOGV compile to nothing
+            // above CONFIG_LOG_MAXIMUM_LEVEL. Without this the two confident
+            // lines above are the only feedback for a change that cannot
+            // produce a single extra line.
+            if (log_levels[i].level > CONFIG_LOG_MAXIMUM_LEVEL) {
+                printf("Note: this build compiles out everything above \"%s\" "
+                       "(CONFIG_LOG_MAXIMUM_LEVEL), so no %s lines exist to "
+                       "show.\n", level_name((esp_log_level_t)CONFIG_LOG_MAXIMUM_LEVEL),
+                       name);
+            }
             return 0;
         }
     }
@@ -345,7 +385,7 @@ static void register_commands(void)
     loglevel_args.end = arg_end(1);
     const esp_console_cmd_t loglevel_cmd = {
         .command = "loglevel",
-        .help = "Show or set the default log verbosity (lowered to \"warn\" while the console is active).",
+        .help = "Show or set how much log output reaches this serial console (defaults to \"warn\" so it doesn't bury command output). Raises the web log page's capture level too if that is what's holding the output back.",
         .hint = NULL,
         .func = &cmd_loglevel,
         .argtable = &loglevel_args,
@@ -374,10 +414,16 @@ static void register_commands(void)
 
 esp_err_t serial_console_init(void)
 {
-    // Routine INFO-level traffic/connect logs would otherwise interleave
-    // with command output on this same UART; "loglevel" can raise this
-    // back for debugging.
-    esp_log_level_set("*", ESP_LOG_WARN);
+    // Routine INFO-level traffic/connect logs would otherwise interleave with
+    // command output on this same UART, so serial stays at "warn" and above.
+    // That used to be done by pinning the *global* level, which also starved
+    // the web log page of anything to show - the two thresholds are now
+    // separate (see log_buf.h): everything from INFO up is captured for the
+    // web page, and only warnings and errors reach this UART. "loglevel"
+    // raises the serial side back for debugging, and raises the capture level
+    // with it if that is what's in the way.
+    esp_log_level_set("*", ESP_LOG_INFO);
+    log_buf_set_serial_level(ESP_LOG_WARN);
 
     esp_console_repl_t *repl = NULL;
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();

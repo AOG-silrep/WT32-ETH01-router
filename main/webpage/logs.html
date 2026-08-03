@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgOpen router &ndash; Log</title>
+<style>
+  body { font-family: sans-serif; max-width: 1100px; margin: 2em auto; padding: 0 1em; color: #222; }
+  h1 { font-size: 1.3em; }
+  h1 a { font-size: 0.7em; font-weight: normal; color: #2a78d6; text-decoration: none; margin-left: 0.6em; }
+  h1 a:hover { text-decoration: underline; }
+  button { padding: 0.4em 1em; font-size: 0.9em; }
+  select { padding: 0.3em; font-size: 0.9em; }
+  label { font-size: 0.9em; }
+  #banner { display: none; background: #b00020; color: #fff; padding: 0.6em 1em; border-radius: 4px; margin-bottom: 1em; }
+  #banner.show { display: block; }
+  .panel { border: 2px solid #888; border-radius: 4px; padding: 0.8em; margin-top: 1em; }
+  .controls { display: flex; flex-wrap: wrap; gap: 1.2em; align-items: center; font-size: 0.9em; }
+  .controls .spacer { flex: 1; }
+  #log-scroll { height: 65vh; overflow-y: auto; margin-top: 0.8em; border-top: 1px solid #ddd; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+  th, td { text-align: left; padding: 0.25em 0.5em; border-bottom: 1px solid #eee; vertical-align: top; }
+  th { position: sticky; top: 0; background: #fff; border-bottom: 1px solid #ddd; }
+  td.n, td.t { font-family: monospace; color: #898781; white-space: nowrap; text-align: right; }
+  td.g { font-family: monospace; white-space: nowrap; }
+  td.m { font-family: monospace; white-space: pre-wrap; word-break: break-word; width: 100%; }
+  .badge { display: inline-block; min-width: 4.2em; text-align: center; padding: 0.1em 0.4em;
+           border-radius: 3px; font-size: 0.85em; color: #fff; }
+  .badge.E { background: #b00020; }
+  .badge.W { background: #c26a00; }
+  .badge.I { background: #0a7a2f; }
+  .badge.D { background: #6c6a63; }
+  .badge.V { background: #a9a79e; }
+  .badge.Q { background: #444; }
+  tr.E td.m { color: #b00020; }
+  tr.W td.m { color: #8a4b00; }
+  tr.note td { background: #fbf3e0; color: #8a4b00; font-style: italic; text-align: center; }
+  #empty { color: #898781; font-size: 0.9em; padding: 1em 0.5em; }
+  #status { font-size: 0.85em; color: #898781; margin-top: 0.6em; }
+</style>
+</head>
+<body>
+
+<div id="banner">Lost connection to bridge &mdash; retrying&hellip;</div>
+
+<h1>Device log <a href="/">&larr; Dashboard</a></h1>
+
+<div class="panel">
+  <div class="controls">
+    <span>
+      <label for="filter">Show</label>
+      <select id="filter">
+        <option value="5">Everything</option>
+        <option value="3">Info and above</option>
+        <option value="2">Warnings and errors</option>
+        <option value="1">Errors only</option>
+      </select>
+    </span>
+    <span>
+      <label for="capture" title="How much the device records. The serial console has its own, quieter threshold set with the &quot;loglevel&quot; command &mdash; but nothing above this level reaches it either, so raising it there raises this one too.">Capture level</label>
+      <select id="capture">
+        <option value="error">error</option>
+        <option value="warn">warn</option>
+        <option value="info">info</option>
+        <option value="debug">debug</option>
+        <option value="verbose">verbose</option>
+      </select>
+    </span>
+    <span class="spacer"></span>
+    <button type="button" id="pause">Pause</button>
+    <button type="button" id="clear">Clear</button>
+  </div>
+
+  <div id="log-scroll">
+    <table>
+      <thead>
+        <tr><th>#</th><th>Time</th><th>Level</th><th>Tag</th><th>Message</th></tr>
+      </thead>
+      <tbody id="log-body"></tbody>
+    </table>
+    <div id="empty">Waiting for log lines&hellip;</div>
+  </div>
+  <div id="status"></div>
+</div>
+
+<script>
+// Same Basic Auth realm as the dashboard, so the browser reuses the credentials
+// it already holds and there's no login code here - see check_admin_auth() in
+// web_server.c.
+
+// Mirrors the dashboard's fetchWithTimeout(): plain fetch() can hang for the
+// OS connect timeout when the bridge stops answering without closing the
+// socket, and a 401/403 needs to stop the loop rather than be retried. The
+// bridge delays a second on every failed auth and serves from a single worker
+// task, so a loop that kept retrying with stale credentials would lock everyone
+// out of the whole UI.
+const AUTH_ERROR = Symbol('unauthorized');
+const SETUP_ERROR = Symbol('setup-required');
+
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    if (res.status === 401) throw AUTH_ERROR;
+    if (res.status === 403) throw SETUP_ERROR;
+    return res;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const LEVEL_RANK = { E: 1, W: 2, I: 3, D: 4, V: 5 };
+const LEVEL_NAME = { E: 'ERROR', W: 'WARN', I: 'INFO', D: 'DEBUG', V: 'VERBOSE' };
+// Threshold names in device order, for comparing the reported capture level
+// against the build's compiled-in ceiling. Includes "none", which the select
+// doesn't offer but the device can report.
+const LEVEL_ORDER = ['none', 'error', 'warn', 'info', 'debug', 'verbose'];
+// Keeping the DOM bounded matters more here than elsewhere: this page is meant
+// to be left open, and an unbounded table would grow until the tab dies.
+const MAX_ROWS = 500;
+
+const body = document.getElementById('log-body');
+const scroller = document.getElementById('log-scroll');
+const emptyMsg = document.getElementById('empty');
+const statusLine = document.getElementById('status');
+
+let cursor = 0;
+let paused = false;
+let filterRank = 5;
+
+// The poll rewrites the status line every second, so anything written straight
+// into it is gone before it can be read. Both sources are kept here and
+// rendered together instead.
+let statusText = '';
+let captureError = '';
+// Last capture level the device reported, so a failed change can say what the
+// device is actually at and put the select back there.
+let deviceLevel = null;
+
+function renderStatus() {
+  statusLine.textContent = captureError ? captureError + ' · ' + statusText : statusText;
+  statusLine.style.color = captureError ? '#b00020' : '';
+}
+
+function formatTime(ms) {
+  const s = Math.floor(ms / 1000);
+  const h = String(Math.floor(s / 3600)).padStart(2, '0');
+  const m = String(Math.floor(s / 60) % 60).padStart(2, '0');
+  const sec = String(s % 60).padStart(2, '0');
+  return h + ':' + m + ':' + sec + '.' + String(ms % 1000).padStart(3, '0');
+}
+
+function trimRows() {
+  while (body.rows.length > MAX_ROWS) {
+    body.deleteRow(0);
+  }
+}
+
+// Every cell is filled with textContent rather than innerHTML. Log messages
+// quote things the device was told by others - a DHCP hostname, an HTTP path -
+// so treating them as markup would let a client on the network run script in
+// this authenticated page just by naming itself appropriately.
+function addLine(line) {
+  const rank = LEVEL_RANK[line.l] || 1;
+  const row = body.insertRow();
+  row.className = line.l;
+  row.dataset.rank = rank;
+  if (rank > filterRank) row.style.display = 'none';
+
+  const n = row.insertCell();
+  n.className = 'n';
+  n.textContent = line.n;
+
+  const t = row.insertCell();
+  t.className = 't';
+  t.textContent = formatTime(line.t);
+
+  const lvl = row.insertCell();
+  const badge = document.createElement('span');
+  // '?' is what the device stores for a line that didn't match the standard
+  // "L (time) tag: message" shape. Those are shown, not dropped - an unusual
+  // line is exactly when this page earns its keep.
+  badge.className = 'badge ' + (LEVEL_NAME[line.l] ? line.l : 'Q');
+  badge.textContent = LEVEL_NAME[line.l] || 'RAW';
+  lvl.appendChild(badge);
+
+  const g = row.insertCell();
+  g.className = 'g';
+  g.textContent = line.g;
+
+  const m = row.insertCell();
+  m.className = 'm';
+  m.textContent = line.m;
+}
+
+function addNote(text) {
+  const row = body.insertRow();
+  row.className = 'note';
+  row.dataset.rank = 0;
+  const cell = row.insertCell();
+  cell.colSpan = 5;
+  cell.textContent = text;
+}
+
+function applyFilter() {
+  for (const row of body.rows) {
+    row.style.display = Number(row.dataset.rank) > filterRank ? 'none' : '';
+  }
+}
+
+document.getElementById('filter').addEventListener('change', (e) => {
+  filterRank = Number(e.target.value);
+  applyFilter();
+});
+
+document.getElementById('pause').addEventListener('click', (e) => {
+  paused = !paused;
+  e.target.textContent = paused ? 'Resume' : 'Pause';
+});
+
+document.getElementById('clear').addEventListener('click', () => {
+  body.textContent = '';
+  emptyMsg.style.display = '';
+});
+
+// "none" is deliberately not offered in the list (it would silence the serial
+// console too), but the API still accepts it, so the device can report a level
+// this select has no option for. Showing whichever option happened to be
+// selected would be a lie about the device's state, so blank it instead and let
+// the status line carry the real level.
+function showCaptureLevel(capture, level) {
+  if ([...capture.options].some((o) => o.value === level)) {
+    capture.value = level;
+  } else {
+    capture.selectedIndex = -1;
+  }
+}
+
+// Changing this changes what the device records, not just what's displayed, so
+// it is a request rather than a local toggle. The filter above is the local one.
+document.getElementById('capture').addEventListener('change', async (e) => {
+  const capture = e.target;
+  const level = capture.value;
+  captureError = '';
+  try {
+    const res = await fetchWithTimeout('/api/logs/level', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ level }),
+    }, 2000);
+    // A refused level comes back as a normal response, not a thrown error, so
+    // without this check a rejected change would look like it took.
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+  } catch (err) {
+    // The poll is running too and will redirect or reload on these; reporting
+    // them here as a failed level change would just be noise.
+    if (err === AUTH_ERROR || err === SETUP_ERROR) return;
+    captureError = deviceLevel === null
+      ? 'Could not change the capture level.'
+      : 'Could not change the capture level — the device is still at "' + deviceLevel + '".';
+    // The poll only re-syncs the select while it is unfocused, and a click
+    // leaves it focused, so without putting it back by hand the page would go
+    // on showing a level the device never accepted.
+    capture.blur();
+    if (deviceLevel !== null) showCaptureLevel(capture, deviceLevel);
+  }
+  renderStatus();
+});
+
+let polling = false;
+let failCount = 0;
+
+async function fetchOnce() {
+  const res = await fetchWithTimeout('/api/logs?since=' + cursor, {}, 2000);
+  const data = await res.json();
+
+  // Read before anything is appended: adding rows grows scrollHeight while
+  // scrollTop stays put, which would make an already-followed tail look as if
+  // the reader had scrolled up.
+  const atBottom = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 40;
+
+  // Sequence numbers restart at 1 on boot, so a cursor ahead of the device's
+  // newest line means it rebooted rather than that we got ahead of it.
+  if (data.restarted) {
+    addNote('— device restarted —');
+    trimRows();
+  }
+  if (data.lost > 0) {
+    addNote('— ' + data.lost + ' line(s) scrolled out of the device buffer —');
+    trimRows();
+  }
+
+  for (const line of data.lines) {
+    addLine(line);
+  }
+  if (data.lines.length > 0 || data.restarted || data.lost > 0) {
+    trimRows();
+    emptyMsg.style.display = 'none';
+    // Only follow the tail if the reader was already at the bottom; scrolling
+    // up to look at something has to survive the next poll a second later.
+    if (atBottom) scroller.scrollTop = scroller.scrollHeight;
+  }
+
+  cursor = data.seq;
+
+  // The device is the authority on the capture level - another tab or the
+  // serial console can change it too - so track it rather than assuming this
+  // page is the only thing setting it. The select is left alone while it has
+  // focus, so this doesn't yank the list out from under someone mid-selection.
+  const capture = document.getElementById('capture');
+  const known = [...capture.options].some((o) => o.value === data.level);
+  if (document.activeElement !== capture) showCaptureLevel(capture, data.level);
+
+  // A level that has moved since the failed change means something else set it
+  // (another tab, the serial console) and the old complaint is stale.
+  if (data.level !== deviceLevel) {
+    deviceLevel = data.level;
+    captureError = '';
+  }
+
+  statusText = 'Serial console level: ' + data.serial_level +
+               ' · set with "loglevel" over UART.';
+  // "debug" and "verbose" are offered because the device accepts them and a
+  // build with a higher CONFIG_LOG_MAXIMUM_LEVEL would deliver them - but in a
+  // build that compiles them out, picking one succeeds, moves the select, and
+  // produces not one extra line. Say so, or the only reading left is that the
+  // page is broken.
+  const ceiling = LEVEL_ORDER.indexOf(data.max_level);
+  const capped = ceiling >= 0 && LEVEL_ORDER.indexOf(data.level) > ceiling;
+  if (!known) {
+    statusText = 'Capture level is "' + data.level + '" · pick one above, or use ' +
+                 '"loglevel" over UART, to start recording again. · ' + statusText;
+  } else if (capped) {
+    statusText = '"' + data.level + '" is above this build\'s compiled-in maximum ("' +
+                 data.max_level + '") · nothing above that exists to record. · ' + statusText;
+  }
+  if (data.missed > 0) {
+    statusText += ' · ' + data.missed + ' line(s) the device could not record.';
+  }
+  renderStatus();
+
+  return data.more;
+}
+
+async function poll() {
+  if (paused || polling) return;
+  polling = true;
+  try {
+    // Catch up when the device has more buffered than one response can hold,
+    // but cap the burst: the httpd has a single worker task, and an unbounded
+    // catch-up loop here would starve the dashboard in another tab.
+    let more = await fetchOnce();
+    for (let i = 0; more && i < 3; i++) {
+      more = await fetchOnce();
+    }
+    failCount = 0;
+    document.getElementById('banner').classList.remove('show');
+  } catch (e) {
+    if (e === SETUP_ERROR) {
+      clearInterval(pollTimer);
+      location.href = '/admin?forced=1';
+      return;
+    }
+    if (e === AUTH_ERROR) {
+      // fetch() replays the same cached credentials and can't raise the
+      // browser's sign-in dialog; only a top-level navigation can, and this
+      // page is served no-store so the reload really hits the network.
+      clearInterval(pollTimer);
+      location.reload();
+      return;
+    }
+    failCount++;
+    if (failCount >= 2) {
+      document.getElementById('banner').classList.add('show');
+    }
+  } finally {
+    polling = false;
+  }
+}
+
+poll();
+const pollTimer = setInterval(poll, 1000);
+</script>
+
+</body>
+</html>

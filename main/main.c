@@ -27,6 +27,7 @@
 #include "auth_cfg.h"
 #include "web_server.h"
 #include "serial_console.h"
+#include "log_buf.h"
 
 static const char *TAG = "AOG-BRIDGE";
 
@@ -182,6 +183,11 @@ static void setup_bridge(esp_netif_t *eth_netif, esp_netif_t *wifi_netif, const 
 
 void app_main(void)
 {
+    // First thing in app_main so the banner below and every subsystem's
+    // startup logging land in the ring the web log page reads. Anything
+    // earlier (bootloader, pre-scheduler ROM output) goes to the UART only.
+    log_buf_init();
+
     ESP_LOGI(TAG, "\n====================================");
     ESP_LOGI(TAG, "WT32-ETH01 Ethernet-WiFi Bridge");
     ESP_LOGI(TAG, "Shared Network: 192.168.5.0/24");
