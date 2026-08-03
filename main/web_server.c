@@ -1052,9 +1052,13 @@ static esp_err_t logs_level_post_handler(httpd_req_t *req)
     }
 
     char buf[64];
-    int received = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (req->content_len <= 0 || req->content_len >= sizeof(buf)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body missing or too large");
+        return ESP_FAIL;
+    }
+    int received = httpd_req_recv(req, buf, req->content_len);
     if (received <= 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty request body");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Failed to read body");
         return ESP_FAIL;
     }
     buf[received] = '\0';
