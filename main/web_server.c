@@ -968,7 +968,15 @@ static esp_err_t logs_get_handler(httpd_req_t *req)
         // resp_append() logs on truncation, which would re-enter the capture
         // hook and deadlock against a lock this handler was still holding.
         if (!log_buf_get_line(seq, &level, &ts_ms, tag, sizeof(tag), msg, sizeof(msg))) {
-            continue;  // Overwritten between the range read and here.
+            // Overwritten between the range read and here - the loop drops the
+            // ring's lock between lines, so a burst can wrap past a batch still
+            // being packed. Counted, because skipping it silently would advance
+            // the cursor over the gap and splice the two halves together with
+            // nothing to show for it. This is counted even for a fresh reader
+            // (which starts with lost == 0 by definition): the gap falls inside
+            // the lines it is being handed, not before them.
+            lost++;
+            continue;
         }
 
         // Stop before the append rather than after: a partially written entry
