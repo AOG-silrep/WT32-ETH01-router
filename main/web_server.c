@@ -326,6 +326,53 @@ resp_append_at(const char *who, char *buf, size_t bufsz, int off, const char *fm
 #define resp_append(buf, bufsz, off, ...) \
     resp_append_at(__func__, (buf), (bufsz), (off), __VA_ARGS__)
 
+// Appends src as the body of a JSON string (the surrounding quotes are the
+// caller's), escaping the three things that would otherwise produce a document
+// no parser will accept: '"', '\', and raw control characters.
+//
+// The strings this server emits are device-controlled but not device-authored -
+// a DHCP hostname, the SSID - so "in practice these never contain a quote" is
+// an assumption about other people's input, not an invariant. When it breaks,
+// the dashboard's JSON.parse() throws and the whole page goes blank with
+// nothing on screen to explain why.
+//
+// Follows resp_append_at()'s contract: returns an offset clamped to bufsz, so
+// chaining into `bufsz - off` can never underflow. Truncation is silent here
+// because the resp_append() that closes the field will report it.
+static int json_append_escaped(char *buf, size_t bufsz, int off, const char *src)
+{
+    // >= bufsz, not > bufsz: an earlier append that filled the buffer returns
+    // exactly bufsz, and the empty-string path below still writes a NUL at
+    // buf[off]. At off == bufsz that is one byte past the end.
+    if (off < 0 || (size_t)off >= bufsz) {
+        return (int)bufsz;
+    }
+    size_t o = (size_t)off;
+    for (const unsigned char *p = (const unsigned char *)src; *p != '\0'; p++) {
+        // Worst case below is 6 bytes plus the NUL that terminates the buffer
+        // for the appends that follow.
+        if (o + 7 > bufsz) {
+            return (int)bufsz;
+        }
+        switch (*p) {
+            case '"':  buf[o++] = '\\'; buf[o++] = '"';  break;
+            case '\\': buf[o++] = '\\'; buf[o++] = '\\'; break;
+            case '\n': buf[o++] = '\\'; buf[o++] = 'n';  break;
+            case '\r': buf[o++] = '\\'; buf[o++] = 'r';  break;
+            case '\t': buf[o++] = '\\'; buf[o++] = 't';  break;
+            default:
+                if (*p < 0x20) {
+                    o += (size_t)snprintf(buf + o, bufsz - o, "\\u%04x", *p);
+                } else {
+                    buf[o++] = (char)*p;
+                }
+                break;
+        }
+    }
+    buf[o] = '\0';
+    return (int)o;
+}
+
 // Sends a JSON body built by resp_append(), or fails the request if it was
 // truncated. Sending the truncated bytes instead would hand the dashboard
 // unparseable JSON, which surfaces as an empty table with nothing to explain
@@ -392,9 +439,13 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     wifi_config_t cfg;
     esp_wifi_get_config(WIFI_IF_AP, &cfg);
 
-    char resp[80];
-    int len = resp_append(resp, sizeof(resp), 0, "{\"ssid\":\"%s\",\"channel\":%u}",
-                          (const char *)cfg.ap.ssid, (unsigned)cfg.ap.channel);
+    // The SSID is user-supplied text, and escaping can grow it up to 6x
+    // (a control character becomes "\u00xx"), so size for the worst case
+    // rather than for what a reasonable SSID looks like.
+    char resp[6 * 32 + 48];
+    int len = resp_append(resp, sizeof(resp), 0, "{\"ssid\":\"");
+    len = json_append_escaped(resp, sizeof(resp), len, (const char *)cfg.ap.ssid);
+    len = resp_append(resp, sizeof(resp), len, "\",\"channel\":%u}", (unsigned)cfg.ap.channel);
     if (!resp_send_json(req, resp, len, sizeof(resp))) {
         return ESP_FAIL;
     }
@@ -655,7 +706,9 @@ static esp_err_t clients_get_handler(httpd_req_t *req)
     int count = 0;
     client_track_get_snapshot(clients, CLIENT_TRACK_MAX_CLIENTS, &count);
 
-    static char resp[CLIENT_TRACK_MAX_CLIENTS * (200 + CLIENT_TRACK_NAME_MAX_LEN) + 16];
+    // 6x the name length: JSON-escaping a control character expands it to
+    // "\u00xx", and the hostname is the one field here a client controls.
+    static char resp[CLIENT_TRACK_MAX_CLIENTS * (200 + 6 * CLIENT_TRACK_NAME_MAX_LEN) + 16];
     int off = resp_append(resp, sizeof(resp), 0, "[");
     for (int i = 0; i < count && off < sizeof(resp); i++) {
         client_info_t *c = &clients[i];
@@ -671,13 +724,16 @@ static esp_err_t clients_get_handler(httpd_req_t *req)
                            "%s{\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"ip\":\"%s\","
                            "\"link\":\"%s\",\"rssi\":%s,\"rx_bps\":%u,\"tx_bps\":%u,"
                            "\"rx_pps\":%u,\"tx_pps\":%u,"
-                           "\"last_seen_s\":%u,\"name\":\"%s\"}",
+                           "\"last_seen_s\":%u,\"name\":\"",
                            i == 0 ? "" : ",",
                            c->mac[0], c->mac[1], c->mac[2], c->mac[3], c->mac[4], c->mac[5],
                            ip_str, c->is_wifi ? "wifi" : "eth", rssi_str,
                            (unsigned)c->rx_bps, (unsigned)c->tx_bps,
-                           (unsigned)c->rx_pps, (unsigned)c->tx_pps, (unsigned)c->last_seen_s,
-                           c->name);
+                           (unsigned)c->rx_pps, (unsigned)c->tx_pps, (unsigned)c->last_seen_s);
+        // A DHCP hostname is whatever the client claimed it is - the one field
+        // here that an untrusted device on the network gets to choose.
+        off = json_append_escaped(resp, sizeof(resp), off, c->name);
+        off = resp_append(resp, sizeof(resp), off, "\"}");
     }
     off = resp_append(resp, sizeof(resp), off, "]");
 
