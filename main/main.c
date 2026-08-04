@@ -18,10 +18,10 @@
 #include "lwip/err.h"
 #include "lwip/sys.h"
 #include "lwip/ip_addr.h"
-#include "dhcpserver/dhcpserver.h"
 #include "netif/ethernet.h"
 #include <sys/socket.h>
 #include "wifi_cfg.h"
+#include "dhcp_server.h"
 #include "client_track.h"
 #include "sys_monitor.h"
 #include "auth_cfg.h"
@@ -36,10 +36,6 @@ static const char *TAG = "AOG-BRIDGE";
 #define BRIDGE_NETMASK "255.255.255.0"
 #define BRIDGE_GW      "192.168.5.1"
 #define DHCP_START     "192.168.5.2"
-// Not .254. A range wider than DHCPS_MAX_LEASE (100, fixed in ESP-IDF's
-// dhcpserver.h) is rejected outright by esp_netif_dhcps_option(), which then
-// leaves the server on its own default range - so asking for .2-.254 got a
-// narrower pool than asking for .2-.101 does, and said nothing about it.
 #define DHCP_END       "192.168.5.101"
 
 // ETH Configuration
@@ -136,7 +132,7 @@ static void eth_init(esp_netif_t **out_eth_netif, esp_eth_handle_t *out_eth_hand
 static void setup_bridge(esp_netif_t *eth_netif, esp_netif_t *wifi_netif, const uint8_t *common_mac,
                           esp_netif_t **out_br_netif)
 {
-    ESP_LOGI(TAG, "Configuring bridge + DHCP Server...");
+    ESP_LOGI(TAG, "Configuring bridge + DHCP server...");
 
     esp_netif_ip_info_t br_ip_info;
     memset(&br_ip_info, 0, sizeof(br_ip_info));
@@ -166,6 +162,15 @@ static void setup_bridge(esp_netif_t *eth_netif, esp_netif_t *wifi_netif, const 
     };
 
     esp_netif_inherent_config_t br_netif_cfg = ESP_NETIF_INHERENT_DEFAULT_BR_DHCPS();
+    // Drop ESP_NETIF_DHCP_SERVER from the inherent defaults, the same way the
+    // two bridge ports above override their own flags. dhcp_server.c owns port
+    // 67 on this LAN, and everything about IDF's server is gated on this one
+    // bit - esp_netif never calls dhcps_new() or dhcps_start() without it - so
+    // clearing it means no second server is ever created, rather than one
+    // being started and stopped again. Nothing else about the netif changes:
+    // it still comes up, still becomes the default route, and still takes its
+    // static address from ip_info below.
+    br_netif_cfg.flags = ESP_NETIF_FLAG_IS_BRIDGE;
     br_netif_cfg.ip_info = &br_ip_info;
     br_netif_cfg.bridge_info = &bridge_config;
     memcpy(br_netif_cfg.mac, common_mac, sizeof(br_netif_cfg.mac));
@@ -180,55 +185,23 @@ static void setup_bridge(esp_netif_t *eth_netif, esp_netif_t *wifi_netif, const 
         return;
     }
 
-    // Configure the DHCP lease range before the bridge attach below starts
-    // the DHCP server automatically.
-    //
-    // The result is checked because this call has a silent failure mode that
-    // this code sat in for some time: esp_netif_dhcps_option() validates the
-    // range and returns ESP_ERR_ESP_NETIF_INVALID_PARAMS without storing
-    // anything if it is wider than DHCPS_MAX_LEASE, out of subnet, or covers
-    // the bridge's own address. The DHCP server then quietly runs on a default
-    // range of its own choosing, which is not the one logged below.
-    dhcps_lease_t lease;
-    lease.enable = true;
-    inet_pton(AF_INET, DHCP_START, &lease.start_ip);
-    inet_pton(AF_INET, DHCP_END, &lease.end_ip);
-    esp_err_t lease_err = esp_netif_dhcps_option(br_netif, ESP_NETIF_OP_SET,
-                                                  ESP_NETIF_REQUESTED_IP_ADDRESS,
-                                                  &lease, sizeof(lease));
-    if (lease_err != ESP_OK) {
-        ESP_LOGE(TAG, "DHCP lease range %s-%s refused (%s) - the server will use "
-                      "a default range instead", DHCP_START, DHCP_END,
-                 esp_err_to_name(lease_err));
-    }
-
     esp_netif_br_glue_handle_t br_glue = esp_netif_br_glue_new();
     ESP_ERROR_CHECK(esp_netif_br_glue_add_port(br_glue, eth_netif));
     ESP_ERROR_CHECK(esp_netif_br_glue_add_wifi_port(br_glue, wifi_netif));
-    // Attaching starts the bridge (and, with it, the DHCP server) immediately.
+    // Attaching only wires up the glue's port event handlers - it does not
+    // start the bridge netif. That happens when esp_eth_start()/esp_wifi_start()
+    // below raise ETHERNET_EVENT_START/WIFI_EVENT_AP_START, and the netif comes
+    // up on the first link-up or station association after that. The DHCP
+    // server below needs none of it to have happened yet.
     ESP_ERROR_CHECK(esp_netif_attach(br_netif, br_glue));
 
-    ESP_LOGI(TAG, "Bridge + DHCP Server started");
+    ESP_LOGI(TAG, "Bridge started");
 
-    // Read the range back rather than printing DHCP_START/DHCP_END. What was
-    // asked for and what the server ended up with are not the same thing when
-    // the request is refused, and the whole point of this line is to say which
-    // addresses clients will actually be given.
-    dhcps_lease_t in_use;
-    if (esp_netif_dhcps_option(br_netif, ESP_NETIF_OP_GET, ESP_NETIF_REQUESTED_IP_ADDRESS,
-                               &in_use, sizeof(in_use)) == ESP_OK) {
-        // dhcps_lease_t carries lwIP's ip4_addr_t, while esp_ip4addr_ntoa()
-        // takes esp_netif's esp_ip4_addr_t. Same 32 bits, different declared
-        // type, so copy the address across rather than casting the pointer.
-        esp_ip4_addr_t start_ip = { .addr = in_use.start_ip.addr };
-        esp_ip4_addr_t end_ip = { .addr = in_use.end_ip.addr };
-        char start_str[16], end_str[16];
-        esp_ip4addr_ntoa(&start_ip, start_str, sizeof(start_str));
-        esp_ip4addr_ntoa(&end_ip, end_str, sizeof(end_str));
-        ESP_LOGI(TAG, "  IP Pool: %s - %s", start_str, end_str);
-    } else {
-        ESP_LOGW(TAG, "  IP Pool: could not be read back");
-    }
+    esp_ip4_addr_t pool_start, pool_end;
+    inet_pton(AF_INET, DHCP_START, &pool_start);
+    inet_pton(AF_INET, DHCP_END, &pool_end);
+    ESP_ERROR_CHECK(dhcp_server_start(br_netif, br_ip_info.ip, br_ip_info.netmask,
+                                       pool_start, pool_end));
 
     *out_br_netif = br_netif;
 }
@@ -327,9 +300,10 @@ void app_main(void)
     ESP_LOGI(TAG, "Web Interface: http://192.168.5.1");
     ESP_LOGI(TAG, "Network: 192.168.5.0/24");
     ESP_LOGI(TAG, "Gateway: 192.168.5.1");
-    // Hardcoded literals here would be a second place to get this wrong; the
-    // range setup_bridge() read back and logged is the authoritative one.
-    ESP_LOGI(TAG, "DHCP Pool: %s - %s (see \"IP Pool\" above for what took effect)",
-             DHCP_START, DHCP_END);
+    // The requested range is the effective one now that dhcp_server.c serves
+    // it - there is no validation step in between that can quietly substitute
+    // a different one, as there was when ESP-IDF's server owned the pool.
+    ESP_LOGI(TAG, "DHCP Pool: %s - %s (%d reservation(s) restored from flash)",
+             DHCP_START, DHCP_END, dhcp_server_get_restored_count());
     ESP_LOGI(TAG, "====================================\n");
 }

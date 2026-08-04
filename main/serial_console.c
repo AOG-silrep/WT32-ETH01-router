@@ -4,6 +4,7 @@
 #include "wifi_cfg.h"
 #include "auth_cfg.h"
 #include "client_track.h"
+#include "dhcp_server.h"
 #include "sys_monitor.h"
 #include "log_buf.h"
 #include "esp_console.h"
@@ -187,6 +188,73 @@ static int cmd_clients(int argc, char **argv)
     return 0;
 }
 
+// ---- leases ----
+
+static int cmd_leases(int argc, char **argv)
+{
+    dhcp_lease_info_t leases[DHCP_SERVER_MAX_LEASES];
+    int count = dhcp_server_get_leases(leases, DHCP_SERVER_MAX_LEASES);
+
+    if (count == 0) {
+        printf("No DHCP leases.\n");
+        return 0;
+    }
+
+    printf("%-18s %-15s %9s %-13s %s\n", "MAC", "IP", "EXPIRES", "SEEN", "STATE");
+    for (int i = 0; i < count; i++) {
+        dhcp_lease_info_t *l = &leases[i];
+        char mac_str[18];
+        snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+                  l->mac[0], l->mac[1], l->mac[2], l->mac[3], l->mac[4], l->mac[5]);
+
+        // An address the client set for itself is what it is actually on, so
+        // that is the one to lead with; the lease it ignored goes in the state
+        // column, where it explains why the two differ.
+        bool manual = (l->observed_ip.addr != 0);
+        char ip_str[16];
+        esp_ip4addr_ntoa(manual ? &l->observed_ip : &l->ip, ip_str, sizeof(ip_str));
+
+        char expires_str[12] = "-";
+        if (!manual && l->expires_in_s > 0) {
+            snprintf(expires_str, sizeof(expires_str), "%us", (unsigned)l->expires_in_s);
+        }
+
+        char state[48];
+        if (manual && l->ip.addr != 0) {
+            char leased_str[16];
+            esp_ip4addr_ntoa(&l->ip, leased_str, sizeof(leased_str));
+            snprintf(state, sizeof(state), "manual (leased %s)", leased_str);
+        } else if (manual) {
+            strlcpy(state, "manual", sizeof(state));
+        } else if (l->expires_in_s > 0) {
+            strlcpy(state, "active", sizeof(state));
+        } else {
+            // No time left: a reservation held for a client that isn't here -
+            // restored from flash, or released on shutdown. It is still the
+            // address that client gets back when it returns.
+            strlcpy(state, "reserved", sizeof(state));
+        }
+        if (!l->stored) {
+            strlcat(state, ", unsaved", sizeof(state));
+        }
+
+        // Reclaim order, not a clock: this device cannot measure elapsed time
+        // across a power cycle, so staleness is counted in boots that wrote the
+        // table rather than in hours. "now" means the client has been heard
+        // from since boot, which is what keeps it from being reclaimed.
+        char seen_str[24];   // "4294967295 boots ago"
+        if (l->boots_since_seen == 0) {
+            strlcpy(seen_str, "now", sizeof(seen_str));
+        } else {
+            snprintf(seen_str, sizeof(seen_str), "%u boot%s ago",
+                     (unsigned)l->boots_since_seen, l->boots_since_seen == 1 ? "" : "s");
+        }
+
+        printf("%-18s %-15s %9s %-13s %s\n", mac_str, ip_str, expires_str, seen_str, state);
+    }
+    return 0;
+}
+
 // ---- loglevel ----
 
 static const struct {
@@ -315,16 +383,18 @@ static int cmd_factory_reset(int argc, char **argv)
     }
 
     if (factory_reset_args.confirm->count == 0 || strcmp(factory_reset_args.confirm->sval[0], "yes") != 0) {
-        printf("This erases the saved WiFi and admin credentials, restoring compiled-in\n"
-               "defaults, then reboots. Run \"factory-reset yes\" to confirm.\n");
+        printf("This erases the saved WiFi and admin credentials and the saved DHCP\n"
+               "address reservations, restoring compiled-in defaults, then reboots.\n"
+               "Clients will be given fresh addresses. Run \"factory-reset yes\" to confirm.\n");
         return 0;
     }
 
     esp_err_t err1 = erase_nvs_namespace("wifi_config");
     esp_err_t err2 = erase_nvs_namespace("auth_cfg");
-    if (err1 != ESP_OK || err2 != ESP_OK) {
-        printf("Error: failed to erase config (wifi: %s, admin: %s)\n",
-               esp_err_to_name(err1), esp_err_to_name(err2));
+    esp_err_t err3 = erase_nvs_namespace("dhcp_leases");
+    if (err1 != ESP_OK || err2 != ESP_OK || err3 != ESP_OK) {
+        printf("Error: failed to erase config (wifi: %s, admin: %s, leases: %s)\n",
+               esp_err_to_name(err1), esp_err_to_name(err2), esp_err_to_name(err3));
         return 1;
     }
 
@@ -381,6 +451,14 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&clients_cmd));
 
+    const esp_console_cmd_t leases_cmd = {
+        .command = "leases",
+        .help = "List DHCP leases and the MAC->IP reservations kept in flash across reboots.",
+        .hint = NULL,
+        .func = &cmd_leases,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&leases_cmd));
+
     loglevel_args.level = arg_str0(NULL, NULL, "<level>", "none|error|warn|info|debug|verbose");
     loglevel_args.end = arg_end(1);
     const esp_console_cmd_t loglevel_cmd = {
@@ -404,7 +482,7 @@ static void register_commands(void)
     factory_reset_args.end = arg_end(1);
     const esp_console_cmd_t factory_reset_cmd = {
         .command = "factory-reset",
-        .help = "Erase saved WiFi/admin config back to compiled-in defaults and reboot.",
+        .help = "Erase saved WiFi/admin config and DHCP reservations back to compiled-in defaults and reboot.",
         .hint = NULL,
         .func = &cmd_factory_reset,
         .argtable = &factory_reset_args,

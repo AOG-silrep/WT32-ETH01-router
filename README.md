@@ -38,25 +38,64 @@ The addressing is compiled in (`main/main.c`) and not configurable from the UI o
 | --- | --- | --- |
 | Bridge address / netmask | `192.168.5.1` / `255.255.255.0` | `BRIDGE_IP`, `BRIDGE_NETMASK` |
 | DHCP pool | `192.168.5.2` – `192.168.5.101` | `DHCP_START`, `DHCP_END` |
-| Concurrent DHCP leases | 16 | `CONFIG_LWIP_DHCPS_MAX_STATION_NUM` |
+| Concurrent DHCP leases | 100 (the whole pool) | `DHCP_START`, `DHCP_END` |
+| Addresses remembered across a reboot | 32 | `DHCP_SERVER_MAX_LEASES` |
 | WiFi stations | 6 | `WIFI_CFG_MAX_STA_CONN` |
 | Clients shown in the table | 16 | `CLIENT_TRACK_MAX_CLIENTS` |
 | Bridge forwarding table | 32 MACs | `max_fdb_dyn_entries` |
 | Client forgotten after | 5 minutes of silence | `CLIENT_AGE_OUT_US` |
 
-Two of these have sharp edges worth knowing about:
+Static addresses outside the pool work fine and are not subject to any of these limits.
 
-- **The DHCP pool cannot simply be widened.** ESP-IDF refuses any range wider than 100
-  addresses (`DHCPS_MAX_LEASE`) and silently falls back to a default range of its own, so
-  asking for `.2`–`.254` gets you *fewer* usable addresses than asking for `.2`–`.101`. The
-  startup log prints the range that actually took effect, not the one requested — trust
-  `IP Pool:` in the log over anything else.
-- **Past 16 leases the DHCP server evicts the oldest**, without notification, and that
-  address can then be handed to someone else while the original holder is still using it.
-  Raise `CONFIG_LWIP_DHCPS_MAX_STATION_NUM` (max 64) before putting more than 16 DHCP
-  clients on the bridge.
+### Clients keep their address across a reboot
 
-Static addresses outside the pool work fine and are not subject to either limit.
+The DHCP server (`main/dhcp_server.c`) records each MAC → IP mapping in flash and consults
+it before allocating anything, so a client gets the same address back after the bridge
+reboots — or after it does — no matter what order the clients come up in. This is automatic;
+there is nothing to configure. `leases` on the serial console shows the table:
+
+```
+MAC                IP                EXPIRES SEEN          STATE
+fc:e8:c0:4d:ab:94  192.168.5.2         7194s now           active
+a4:83:e7:11:22:33  192.168.5.3             - 2 boots ago   reserved
+```
+
+`reserved` is a mapping held for a client that isn't currently here. It is still that
+client's address when it returns, and it is only given to someone else if the pool runs
+out. `factory-reset yes` erases the table along with the rest of the saved config.
+
+### Reservations are not expired on a timer
+
+They are dropped only when something else needs the room — a new client with the table
+full, or an address request with the pool exhausted — taking whichever entry has gone
+longest without being heard from, and preferring plain leases over manually-addressed
+clients. Nothing is deleted merely because time passed.
+
+That is a deliberate choice on two counts. The lease is two hours, so expiring
+reservations with it would mean a laptop closed overnight loses its address on every
+reboot — precisely what this feature exists to prevent. And the device cannot measure
+elapsed time anyway: `esp_timer_get_time()` restarts at zero each boot, RTC memory is
+wiped by power-on, there is no RTC battery, and a transparent bridge has no uplink it can
+count on for SNTP. A board unplugged for a month is indistinguishable from one
+power-cycled a second ago.
+
+Reclaiming only needs *ordering*, though, and that much does survive. Each save stamps
+the table with a generation number; an entry carries the generation it was last heard
+from in. The `SEEN` column reports the difference — `now` for a client seen since boot,
+which also makes it ineligible for reclaiming, or `N boots ago` for one that has not
+been. Those counts are boots that wrote the table, not hours.
+
+Writes are debounced and only happen when the *mapping* changes: lease renewals, which are
+almost all DHCP traffic, never touch flash. Past 32 remembered clients the least recently
+seen mapping is dropped — those clients still get addresses, they just stop being sticky.
+See [Reservations are not expired on a timer](#reservations-are-not-expired-on-a-timer)
+for what "least recently seen" means on a device with no clock.
+
+This server replaces ESP-IDF's, which is why the two limits that used to be documented here
+are gone. IDF's kept its leases in RAM only, capped the pool at 100 addresses
+(`DHCPS_MAX_LEASE`) while silently substituting a default range if you asked for more, and
+evicted the oldest of 16 leases without telling anyone. `CONFIG_LWIP_DHCPS_*` in `sdkconfig`
+no longer has any effect on this device.
 
 ### Protected Management Frames are off
 
@@ -309,9 +348,10 @@ list; the main ones:
 | `admin [-u <user>] [-p <password>]` | Show or change the web UI admin username/password. |
 | `sysinfo` | Uptime, heap, CPU load, network traffic. |
 | `clients` | List active bridge clients (WiFi + Ethernet). |
+| `leases` | List DHCP leases and the MAC → IP reservations kept in flash — see [Clients keep their address across a reboot](#clients-keep-their-address-across-a-reboot). |
 | `loglevel [none\|error\|warn\|info\|debug\|verbose]` | Show or set how much log output reaches this serial console. Raises the web log page's capture level too, if that is what's holding the output back — see [Device log](#device-log). |
 | `reboot` | Restart the device. |
-| `factory-reset yes` | Erase saved WiFi and admin credentials, restoring compiled-in defaults (WiFi `AOG hub`/`password`; admin `admin`/`admin`), then reboot. Bare `factory-reset` (no `yes`) just prints this warning and changes nothing. |
+| `factory-reset yes` | Erase saved WiFi and admin credentials and the saved DHCP reservations, restoring compiled-in defaults (WiFi `AOG hub`/`password`; admin `admin`/`admin`), then reboot. Clients are given fresh addresses. Bare `factory-reset` (no `yes`) just prints this warning and changes nothing. |
 
 **Locked out of the web UI?** Connect over serial and run `factory-reset yes`. The device
 reboots with the default WiFi AP and `admin`/`admin` web login restored.
@@ -322,6 +362,7 @@ reboots with the default WiFi AP and `admin`/`admin` web login restored.
 - `main/wifi_cfg.c` / `.h` — WiFi AP configuration (SSID, channel, credentials)
 - `main/web_server.c` / `.h` — HTTP server backing the web UI
 - `main/client_track.c` / `.h` — connected-client and traffic tracking
+- `main/dhcp_server.c` / `.h` — DHCP server for the LAN, with MAC → IP reservations in NVS
 - `main/sys_monitor.c` / `.h` — system stats (heap, uptime) for the web UI
 - `main/serial_console.c` / `.h` — interactive UART console for recovery/diagnostics
 - `main/auth_cfg.c` / `.h` — admin username/password storage (NVS) with compiled-in defaults

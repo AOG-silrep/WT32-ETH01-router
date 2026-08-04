@@ -59,8 +59,12 @@ All firmware sources live in `main/` and are listed in `main/CMakeLists.txt`.
   through here, so credential rules only need changing in one place.
 - `web_server.c` / `.h` — HTTP server, Basic Auth, REST API, and OTA upload
 - `serial_console.c` / `.h` — console commands: `wifi`, `admin`, `sysinfo`, `clients`,
-  `loglevel`, `reboot`, `factory-reset`
+  `leases`, `loglevel`, `reboot`, `factory-reset`
 - `client_track.c` / `.h` — per-client accounting and traffic history
+- `dhcp_server.c` / `.h` — the LAN's DHCP server, with MAC → IP reservations in NVS. This
+  replaces ESP-IDF's server rather than configuring it: the bridge netif is created without
+  `ESP_NETIF_DHCP_SERVER` in its flags (`setup_bridge()` in `main.c`), so IDF never creates
+  one, and `esp_netif_dhcps_*` / `CONFIG_LWIP_DHCPS_*` have no effect on this device.
 - `sys_monitor.c` / `.h` — CPU load, heap, and throughput sampling
 - `webpage/index.html` — dashboard UI
 - `webpage/admin.html` — credential-change page

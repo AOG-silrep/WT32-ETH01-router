@@ -1,5 +1,6 @@
 #include <string.h>
 #include "client_track.h"
+#include "dhcp_server.h"
 #include "esp_netif_net_stack.h"
 #include "esp_event.h"
 #include "esp_eth.h"
@@ -546,9 +547,9 @@ static void client_track_tick(void)
     s_net_tx_pps = tx_pps_sum;
     xSemaphoreGive(s_mutex);
 
-    // Resolve IPs outside the lock: DHCP lease table first, ARP cache as a
-    // fallback for statically-addressed clients. This is only a bootstrap
-    // for clients we haven't directly observed traffic from yet - once we
+    // Resolve IPs outside the lock: the DHCP server's lease table first, ARP
+    // cache as a fallback for statically-addressed clients. This is only a
+    // bootstrap for clients we haven't directly observed traffic from yet - once we
     // have a real IP (via on_client_ip_assigned or sniffed uplink traffic),
     // it takes priority, since the lease table can go stale for clients
     // that re-address themselves without renewing.
@@ -558,9 +559,11 @@ static void client_track_tick(void)
         pairs[i].ip.addr = 0;
     }
     if (n > 0) {
-        esp_netif_dhcps_get_clients_by_mac(s_br_netif, n, pairs);
         for (int i = 0; i < n; i++) {
-            if (pairs[i].ip.addr == 0) {
+            // dhcp_server.c rather than esp_netif_dhcps_get_clients_by_mac():
+            // that one only answers for ESP-IDF's own server, which this
+            // device no longer runs (see setup_bridge() in main.c).
+            if (!dhcp_server_lookup_ip(pairs[i].mac, &pairs[i].ip)) {
                 esp_netif_arp_get_client_by_mac(s_br_netif, &pairs[i]);
             }
         }

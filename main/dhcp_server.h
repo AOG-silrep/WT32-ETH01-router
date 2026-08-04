@@ -1,0 +1,89 @@
+#pragma once
+
+#include <stdint.h>
+#include <stdbool.h>
+#include "esp_err.h"
+#include "esp_netif.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// How many MAC -> IP reservations are remembered across a reboot. Above
+// CLIENT_TRACK_MAX_CLIENTS (16), which is what this device claims it can show,
+// and well inside the 100-address pool, so the table is not the first thing to
+// give out. Each stored entry costs 10 bytes of NVS, so the whole table is a
+// few hundred bytes of a 24KB partition.
+#define DHCP_SERVER_MAX_LEASES 32
+
+typedef struct {
+    uint8_t mac[6];
+    esp_ip4_addr_t ip;           // address this server leased; 0 if it never leased one
+    esp_ip4_addr_t observed_ip;  // address the client actually uses, if not the leased one
+    uint32_t expires_in_s;  // 0 if the lease has expired or was only restored from flash
+    // Boot generations since this client was last heard from: 0 means it has
+    // been seen since the device booted, higher means it is that many
+    // table-writing boots stale. This is the reclaim order - entries are never
+    // dropped on a timer, only when something else needs the room, oldest
+    // first. See the note on s_boot_seq in dhcp_server.c for why elapsed time
+    // is not measurable here.
+    uint32_t boots_since_seen;
+    bool stored;            // true once this mapping is committed to NVS
+} dhcp_lease_info_t;
+
+// Starts the DHCP server for the bridge LAN: restores the saved MAC -> IP
+// reservations from NVS, then binds UDP port 67 and serves from a task of its
+// own.
+//
+// This replaces ESP-IDF's DHCP server rather than supplementing it. The bridge
+// netif must have been created *without* ESP_NETIF_DHCP_SERVER in its flags -
+// see setup_bridge() in main.c - or IDF's server will already hold port 67.
+//
+// The bridge netif does not have to be up, or even started: the socket binds
+// to INADDR_ANY, and the server pins itself to the bridge later, when the
+// bridge reports itself up. What this does need is br_netif already created,
+// esp_event_loop_create_default() already called (it registers handlers), and
+// to run before client_track_init(), which depends on this module for address
+// lookups.
+esp_err_t dhcp_server_start(esp_netif_t *br_netif,
+                            esp_ip4_addr_t ip, esp_ip4_addr_t netmask,
+                            esp_ip4_addr_t pool_start, esp_ip4_addr_t pool_end);
+
+// Records that mac was seen using ip, whether or not this server leased it.
+// A client that assigns itself an address never tells the DHCP server about
+// it, so without this the remembered mapping would be the lease it ignored
+// rather than the address it actually uses.
+//
+// Addresses off the bridge's subnet are discarded: this is a transparent
+// bridge, so frames from other subnets cross it legitimately, and a client
+// that self-assigns a 169.254 link-local after failing DHCP is not reporting
+// an address worth keeping either.
+//
+// Cheap and idempotent - it writes to flash only when the mapping actually
+// changes, so calling it on every observation is fine. Thread-safe; called
+// from client_track.c, which is the one place a client's real address is
+// established.
+void dhcp_server_note_observed_ip(const uint8_t mac[6], esp_ip4_addr_t ip);
+
+// Looks up the address this MAC is believed to be at: what it was last
+// observed using if that differs from its lease, otherwise the leased
+// address. Returns false if this MAC has no lease and nothing observed, which
+// includes a reservation restored from flash that the client hasn't claimed
+// yet - an address nobody has taken up is not one to report as theirs.
+//
+// This is what client_track.c calls in place of
+// esp_netif_dhcps_get_clients_by_mac(), which only answers for IDF's own
+// server. Thread-safe.
+bool dhcp_server_lookup_ip(const uint8_t mac[6], esp_ip4_addr_t *out_ip);
+
+// Copies up to max lease entries into out, including reservations restored
+// from flash that no client has claimed yet (those report expires_in_s 0).
+// Returns the number written. Thread-safe; intended for the serial console.
+int dhcp_server_get_leases(dhcp_lease_info_t *out, int max);
+
+// Number of reservations read back from NVS at startup, for the boot log.
+int dhcp_server_get_restored_count(void);
+
+#ifdef __cplusplus
+}
+#endif
