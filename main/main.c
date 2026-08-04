@@ -140,8 +140,23 @@ static void setup_bridge(esp_netif_t *eth_netif, esp_netif_t *wifi_netif, const 
     inet_pton(AF_INET, BRIDGE_NETMASK, &br_ip_info.netmask);
     inet_pton(AF_INET, BRIDGE_GW, &br_ip_info.gw);
 
+    // max_fdb_dyn_entries is a hard cap on how many MAC addresses the bridge
+    // can remember a port for, and running out of it is silent and costly.
+    // lwIP's bridgeif_fdb_update_src() simply stops learning when the table is
+    // full - its last line is literally "not found, no free entry -> flood" -
+    // and bridgeif_fdb_get_dst_ports() then answers BR_FLOOD for every address
+    // it never learnt. A flooded frame goes out *both* ports, so each unicast
+    // to an unlearnt client is also transmitted over the air to no one, which
+    // costs airtime on the side of the bridge that has least to spare.
+    // Entries are only reclaimed on a 5-minute timeout (BR_FDB_TIMEOUT_SEC),
+    // so a table that fills once stays full.
+    //
+    // 32 rather than 10 to keep clear of CLIENT_TRACK_MAX_CLIENTS (16), which
+    // is what this device claims it can track: the forwarding table should not
+    // be the first thing to give out. Each entry is a MAC, a port index and a
+    // timestamp, so the whole increase costs a few hundred bytes.
     bridgeif_config_t bridge_config = {
-        .max_fdb_dyn_entries = 10,
+        .max_fdb_dyn_entries = 32,
         .max_fdb_sta_entries = 2,
         .max_ports = 2,
     };
