@@ -96,7 +96,44 @@ esp_err_t wifi_cfg_apply(const char *ssid, const char *password, uint8_t channel
         return err;
     }
 
-    ESP_LOGI(TAG, "Applied WiFi config - SSID: %s, channel: %u", ssid, channel);
+    // Turn off Protected Management Frames, which the AP would otherwise
+    // advertise whether or not this file asks for it: pmf_cfg.capable is
+    // documented as "deprecated and set to true internally", so leaving the
+    // field alone does not leave PMF alone. This call is the only way off, and
+    // it has to sit here - the API requires it after esp_wifi_set_config() and
+    // before esp_wifi_start(), which is exactly this window.
+    //
+    // It is disabled because the SA Query procedure PMF brings with it does not
+    // survive a station re-associating with this AP. The device's own log,
+    // during a plain TCP download to a WiFi client:
+    //
+    //   wifi: starting SA query procedure with STA(fc:e8:c0:4d:ab:94)
+    //   wifi: Send SA Query req with transaction id ...   (six of these)
+    //   wifi: STA not responded to 6 SA Query attempts, Reset connection ...
+    //   wifi: station: fc:e8:c0:4d:ab:94 leave, AID = 2, reason = 209
+    //   wifi: station: fc:e8:c0:4d:ab:94 join, AID = 2, bgn, 40U
+    //
+    // and then straight back to the top, every few seconds, indefinitely. Each
+    // cycle throws away everything queued for that station, so TCP loses its
+    // congestion window and never gets it back before the next disassociation:
+    // measured downlink was 1.14 Mbit/s against 27.0 in the other direction,
+    // with a third of all bytes retransmitted. UDP looked healthier only
+    // because it does not care - the same disconnects were there, showing up as
+    // a gap rather than as a collapse.
+    //
+    // What this gives up is PMF's protection against forged deauthentication
+    // and disassociation frames, for the stations that support it. That is a
+    // real loss, and on a link that stayed up it would not be worth making. It
+    // is worth making here: an access point that ejects its clients every few
+    // seconds is not delivering the security either, and this bridge exists to
+    // carry traffic. The WPA2-PSK encryption of actual data is untouched.
+    err = esp_wifi_disable_pmf_config(WIFI_IF_AP);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_disable_pmf_config failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "Applied WiFi config - SSID: %s, channel: %u (PMF off)", ssid, channel);
     return ESP_OK;
 }
 
