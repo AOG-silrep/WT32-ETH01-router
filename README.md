@@ -357,6 +357,9 @@ Uplink, UDP, ICMP and anything terminating on the device are all unaffected, so 
 that mostly sends *from* the WiFi side — which is the common AgOpenGPS direction — will not
 notice it.
 
+Full investigation brief, including the rig, every hypothesis already eliminated and how,
+and the experiment to run next: [docs/downlink-fault.md](docs/downlink-fault.md).
+
 ## Troubleshooting high/jittery ping latency
 
 Check `192.168.5.1/api/system` first: `cpu_pct` should be near-idle. **Ignore
