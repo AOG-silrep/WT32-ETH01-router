@@ -296,6 +296,10 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_eth_start(eth_handle));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    // On-air transmit accounting. Unlike the port hooks above this one has to
+    // come *after* esp_wifi_start(), which is why it is a separate call.
+    ESP_ERROR_CHECK(client_track_wifi_txdone_init());
+
     // Start web server
     web_server_start();
 

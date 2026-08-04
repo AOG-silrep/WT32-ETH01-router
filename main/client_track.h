@@ -85,6 +85,39 @@ uint32_t client_track_get_traffic_drops(void);
 // Thread-safe; intended to be called from the HTTP server task.
 void client_track_get_traffic_pps(uint32_t *rx_pps, uint32_t *tx_pps);
 
+// Frames the bridge itself refused to carry, per port and direction. Unlike
+// client_track_get_traffic_drops() above - which counts accounting events this
+// file gave up on, and costs the traffic nothing - every one of these is a
+// frame that was *not forwarded*, so a climbing count here is a real fault.
+//
+// *_in  is the tcpip mailbox rejecting an inbound frame from that port;
+// *_out  is that port's driver having no buffer to transmit into.
+//
+// Neither drop is counted anywhere in lwIP or ESP-IDF; see the long note in
+// client_track.c for where each one happens and why nothing else sees it.
+// Approximate by construction, like the other counter and for the same reason.
+typedef struct {
+    uint32_t eth_in, wifi_in;
+    uint32_t eth_out, wifi_out;
+} client_track_fwd_drops_t;
+
+void client_track_get_forward_drops(client_track_fwd_drops_t *out);
+
+// Registers the WiFi tx-done callback that feeds client_track_get_wifi_tx().
+// Must be called *after* esp_wifi_start(), unlike client_track_init() which
+// must run before it - the underlying API refuses with
+// ESP_ERR_WIFI_NOT_STARTED.
+esp_err_t client_track_wifi_txdone_init(void);
+
+// Frames the radio was asked to send, and how many of them it gave up on after
+// exhausting 802.11 retries. This is the only visibility into on-air loss:
+// the *_out counters above see a frame refused a buffer, but a frame accepted
+// into the WiFi queue and then lost on air is discarded inside the driver
+// without any layer above hearing about it.
+//
+// Read as a ratio, never as a bare failure count.
+void client_track_get_wifi_tx(uint32_t *total, uint32_t *failed);
+
 #ifdef __cplusplus
 }
 #endif

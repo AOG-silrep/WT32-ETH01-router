@@ -1088,19 +1088,33 @@ static esp_err_t system_get_handler(httpd_req_t *req)
     uint32_t rx_pps = 0, tx_pps = 0;
     client_track_get_traffic_pps(&rx_pps, &tx_pps);
 
+    client_track_fwd_drops_t fwd;
+    client_track_get_forward_drops(&fwd);
+
+    uint32_t wifi_tx_total = 0, wifi_tx_failed = 0;
+    client_track_get_wifi_tx(&wifi_tx_total, &wifi_tx_failed);
+
     const esp_app_desc_t *app_desc = esp_app_get_description();
 
-    char resp[400];
+    char resp[640];
     int len = resp_append(resp, sizeof(resp), 0,
                           "{\"uptime_s\":%llu,\"free_heap\":%u,\"min_free_heap\":%u,"
                           "\"cpu_pct\":[%u,%u],\"cpu_freq_mhz\":%u,\"net_rx_bps\":%u,\"net_tx_bps\":%u,"
                           "\"net_rx_pps\":%u,\"net_tx_pps\":%u,"
-                          "\"traffic_drops\":%u,\"version\":\"%s\"}",
+                          "\"traffic_drops\":%u,"
+                          "\"fwd_drop_eth_in\":%u,\"fwd_drop_wifi_in\":%u,"
+                          "\"fwd_drop_eth_out\":%u,\"fwd_drop_wifi_out\":%u,"
+                          "\"wifi_tx_total\":%u,\"wifi_tx_failed\":%u,"
+                          "\"version\":\"%s\"}",
                           (unsigned long long)(esp_timer_get_time() / 1000000ULL),
                           (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(),
                           (unsigned)cpu_pct[0], (unsigned)cpu_pct[1], (unsigned)sys_monitor_get_cpu_freq_mhz(),
                           (unsigned)rx_total, (unsigned)tx_total, (unsigned)rx_pps, (unsigned)tx_pps,
-                          (unsigned)client_track_get_traffic_drops(), app_desc->version);
+                          (unsigned)client_track_get_traffic_drops(),
+                          (unsigned)fwd.eth_in, (unsigned)fwd.wifi_in,
+                          (unsigned)fwd.eth_out, (unsigned)fwd.wifi_out,
+                          (unsigned)wifi_tx_total, (unsigned)wifi_tx_failed,
+                          app_desc->version);
     if (!resp_send_json(req, resp, len, sizeof(resp))) {
         return ESP_FAIL;
     }

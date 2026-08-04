@@ -373,6 +373,17 @@ def main():
             "bridge_before": before,
             "bridge_after": after,
             "drops_delta": after["traffic_drops"] - before["traffic_drops"],
+            # Frames the bridge refused to forward over the run, per port and
+            # direction. Unlike traffic_drops above these are real losses, so
+            # they are the figure to read first. Absent on firmware older than
+            # the counters, hence the guard rather than a plain subtraction.
+            "fwd_drops_delta": {
+                k: after[k] - before[k]
+                for k in ("fwd_drop_eth_in", "fwd_drop_wifi_in",
+                          "fwd_drop_eth_out", "fwd_drop_wifi_out",
+                          "wifi_tx_total", "wifi_tx_failed")
+                if k in after and k in before
+            },
             "peer_ip": peer_ip,
             "medians": {
                 "idle_wired_to_wifi_avg_ms":
@@ -411,6 +422,15 @@ def main():
 
     print(f"\ngate: {args.label} -> {outdir}/summary.json")
     print(f"gate: traffic_drops over the run: {summary['drops_delta']}")
+    fwd = summary["fwd_drops_delta"]
+    if fwd:
+        print("gate: frames the bridge did not forward: " +
+              ", ".join(f"{k.removeprefix('fwd_drop_')} {v}"
+                        for k, v in fwd.items() if k.startswith("fwd_drop_")))
+        total, failed = fwd.get("wifi_tx_total"), fwd.get("wifi_tx_failed")
+        if total:
+            print(f"gate: wifi frames the radio gave up on: {failed}/{total} "
+                  f"({100.0 * failed / total:.2f}%)")
     for k, v in summary["medians"].items():
         if v:
             print(f"       {k:34s} {v['median']:>9}  (spread {v['spread']}, "

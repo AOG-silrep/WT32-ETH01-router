@@ -4,6 +4,7 @@
 #include "esp_event.h"
 #include "esp_eth.h"
 #include "esp_wifi.h"
+#include "esp_private/wifi.h"   // esp_wifi_set_tx_done_cb()
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -84,6 +85,49 @@ static QueueHandle_t s_traffic_q;
 // is what this device is for. If an exact count is ever genuinely needed, the
 // way to get it is per-core counters summed on read, not a shared atomic.
 static volatile uint32_t s_traffic_drops;
+
+// Frames the *bridge* refused, as opposed to accounting events this file lost.
+// Indexed [0] = eth port, [1] = wifi port, matching the is_wifi flag the
+// wrappers already carry. Racy for the same reason s_traffic_drops is, and
+// acceptable for the same reason: these are diagnostics, and the hot path they
+// sit in is the one thing this device must not slow down.
+//
+// There are two silent drop points on the forwarding path and neither is
+// counted anywhere in lwIP or ESP-IDF:
+//
+//   in[]   lwIP's bridgeif does not forward in the caller's context. With
+//          BRIDGEIF_PORT_NETIFS_OUTPUT_DIRECT == 0 (which is what ESP-IDF
+//          builds, since it defaults to NO_SYS) bridgeif_add_port() points
+//          each port's input at bridgeif_tcpip_input(), which is
+//          tcpip_inpkt() -> sys_mbox_trypost() onto the single tcpip mailbox.
+//          trypost does not block: when the mailbox is full the frame is
+//          dropped and ERR_MEM comes back. That mailbox is
+//          CONFIG_LWIP_TCPIP_RECVMBOX_SIZE deep and is shared by *both*
+//          directions plus the bridge's own IP stack, so a burst one way can
+//          evict the other way's traffic.
+//
+//   out[]  esp_netif's low_level_output() returns ERR_MEM when the WiFi driver
+//          has no TX buffer left, but bridgeif_input() throws away what
+//          bridgeif_send_to_ports() returns and frees the pbuf regardless.
+//
+// Both wrappers below already call through to the function that reports these
+// and already return its value; they just never looked at it.
+static volatile uint32_t s_fwd_in_drops[2];
+static volatile uint32_t s_fwd_out_drops[2];
+
+// What the radio actually managed to deliver, which is the one thing the
+// counters above cannot see. esp_wifi_internal_tx() returning ESP_OK only means
+// the frame was accepted into the WiFi driver's queue; a frame that then
+// exhausts its 802.11 retry limit is discarded inside the driver and no layer
+// above is told. So s_fwd_out_drops[] counts buffers, not airtime, and a
+// downlink could be losing every other frame on air with all of it reading zero.
+//
+// The tx-done callback is the only report of that. Both counters are kept, not
+// just the failures, because a failure count on its own says nothing - six
+// failures out of ten frames and six out of a million are different faults.
+static volatile uint32_t s_wifi_tx_total;
+static volatile uint32_t s_wifi_tx_failed;
+
 static uint32_t s_net_rx_pps, s_net_tx_pps; // bridge-wide, summed across clients each 1Hz tick
 
 static esp_netif_t *s_eth_netif;
@@ -184,6 +228,28 @@ static void account_traffic(const uint8_t *mac, bool is_wifi, uint16_t bytes, bo
     xSemaphoreGive(s_mutex);
 }
 
+// Chain to the bridge's input and count what it refuses. See s_fwd_in_drops.
+static err_t chain_input(netif_input_fn orig, struct pbuf *p, struct netif *inp, bool is_wifi)
+{
+    err_t err = orig(p, inp);
+    if (err != ERR_OK) {
+        s_fwd_in_drops[is_wifi ? 1 : 0]++;
+    }
+    return err;
+}
+
+// Chain to the port's real transmit and count what it refuses. See
+// s_fwd_out_drops.
+static err_t chain_output(netif_linkoutput_fn orig, struct netif *netif, struct pbuf *p,
+                           bool is_wifi)
+{
+    err_t err = orig(netif, p);
+    if (err != ERR_OK) {
+        s_fwd_out_drops[is_wifi ? 1 : 0]++;
+    }
+    return err;
+}
+
 // RX wrapper (client -> bridge, uplink). Installed in place of the input
 // pointer the bridge glue already assigned, so we chain to that, not to
 // the raw driver input.
@@ -211,7 +277,7 @@ static err_t traffic_input_wrapper(struct pbuf *p, struct netif *inp, bool is_wi
         hdr = (struct eth_hdr *)p->payload;
         have_ip_hdr = false;
     } else {
-        return orig(p, inp);
+        return chain_input(orig, p, inp, is_wifi);
     }
 
     if (mac_is_client(hdr->src.addr)) {
@@ -243,7 +309,7 @@ static err_t traffic_input_wrapper(struct pbuf *p, struct netif *inp, bool is_wi
             s_traffic_drops++;
         }
     }
-    return orig(p, inp);
+    return chain_input(orig, p, inp, is_wifi);
 }
 
 static err_t eth_input_wrapper(struct pbuf *p, struct netif *inp)
@@ -270,7 +336,7 @@ static err_t traffic_output_wrapper(struct netif *netif, struct pbuf *p, bool is
         pbuf_copy_partial(p, hdrbuf, sizeof(hdrbuf), 0);
         hdr = (struct eth_hdr *)hdrbuf;
     } else {
-        return orig(netif, p);
+        return chain_output(orig, netif, p, is_wifi);
     }
 
     if (mac_is_client(hdr->dest.addr)) {
@@ -286,7 +352,7 @@ static err_t traffic_output_wrapper(struct netif *netif, struct pbuf *p, bool is
             s_traffic_drops++;
         }
     }
-    return orig(netif, p);
+    return chain_output(orig, netif, p, is_wifi);
 }
 
 static err_t eth_output_wrapper(struct netif *netif, struct pbuf *p)
@@ -546,6 +612,42 @@ esp_err_t client_track_init(esp_netif_t *eth_netif, esp_netif_t *wifi_netif,
 uint32_t client_track_get_traffic_drops(void)
 {
     return s_traffic_drops;
+}
+
+// Runs in the WiFi driver's own context, once per transmitted frame, so it does
+// the least it possibly can: two increments and no lock. Racy for the same
+// reason as every other counter in this file.
+static void wifi_tx_done_cb(uint8_t ifidx, uint8_t *data, uint16_t *data_len, bool txStatus)
+{
+    (void)ifidx;
+    (void)data;
+    (void)data_len;
+    s_wifi_tx_total++;
+    if (!txStatus) {
+        s_wifi_tx_failed++;
+    }
+}
+
+esp_err_t client_track_wifi_txdone_init(void)
+{
+    // Has to be called after esp_wifi_start() - the API returns
+    // ESP_ERR_WIFI_NOT_STARTED otherwise, which is why this is not folded into
+    // client_track_init() with the rest of the hooks.
+    return esp_wifi_set_tx_done_cb(wifi_tx_done_cb);
+}
+
+void client_track_get_wifi_tx(uint32_t *total, uint32_t *failed)
+{
+    *total = s_wifi_tx_total;
+    *failed = s_wifi_tx_failed;
+}
+
+void client_track_get_forward_drops(client_track_fwd_drops_t *out)
+{
+    out->eth_in = s_fwd_in_drops[0];
+    out->wifi_in = s_fwd_in_drops[1];
+    out->eth_out = s_fwd_out_drops[0];
+    out->wifi_out = s_fwd_out_drops[1];
 }
 
 void client_track_get_traffic_pps(uint32_t *rx_pps, uint32_t *tx_pps)
