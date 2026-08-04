@@ -13,6 +13,61 @@ An ESP-IDF firmware project that turns a [WT32-ETH01](https://en.wireless-tag.co
 - Device log viewable in a browser (`/logs`), not just over serial
 - Configurable WiFi channel (1, 6, or 11)
 
+## First boot
+
+Out of the box the device brings up a WiFi access point and a wired port on one bridged
+`192.168.5.0/24` network, with compiled-in defaults:
+
+| | Default |
+| --- | --- |
+| WiFi SSID | `AOG hub` |
+| WiFi password | `password` |
+| Web UI login | `admin` / `admin` |
+| Bridge address | `192.168.5.1` |
+
+Changing the admin password is forced before the device will do anything else (see
+[Web UI login](#web-ui-login)). **Changing it does not change the WiFi password** — the two
+are separate, and a device left on the default PSK is joinable by anyone in range whatever
+the admin password says. Set both, from `/admin` and the `wifi` console command respectively.
+
+## Network and capacity
+
+The addressing is compiled in (`main/main.c`) and not configurable from the UI or console:
+
+| | Value | Set by |
+| --- | --- | --- |
+| Bridge address / netmask | `192.168.5.1` / `255.255.255.0` | `BRIDGE_IP`, `BRIDGE_NETMASK` |
+| DHCP pool | `192.168.5.2` – `192.168.5.101` | `DHCP_START`, `DHCP_END` |
+| Concurrent DHCP leases | 16 | `CONFIG_LWIP_DHCPS_MAX_STATION_NUM` |
+| WiFi stations | 6 | `WIFI_CFG_MAX_STA_CONN` |
+| Clients shown in the table | 16 | `CLIENT_TRACK_MAX_CLIENTS` |
+| Bridge forwarding table | 32 MACs | `max_fdb_dyn_entries` |
+| Client forgotten after | 5 minutes of silence | `CLIENT_AGE_OUT_US` |
+
+Two of these have sharp edges worth knowing about:
+
+- **The DHCP pool cannot simply be widened.** ESP-IDF refuses any range wider than 100
+  addresses (`DHCPS_MAX_LEASE`) and silently falls back to a default range of its own, so
+  asking for `.2`–`.254` gets you *fewer* usable addresses than asking for `.2`–`.101`. The
+  startup log prints the range that actually took effect, not the one requested — trust
+  `IP Pool:` in the log over anything else.
+- **Past 16 leases the DHCP server evicts the oldest**, without notification, and that
+  address can then be handed to someone else while the original holder is still using it.
+  Raise `CONFIG_LWIP_DHCPS_MAX_STATION_NUM` (max 64) before putting more than 16 DHCP
+  clients on the bridge.
+
+Static addresses outside the pool work fine and are not subject to either limit.
+
+### Protected Management Frames are off
+
+The access point disables PMF (802.11w) explicitly, in `wifi_cfg_apply()`. With it enabled —
+which is ESP-IDF's default, and cannot be avoided by leaving the config field alone, since
+`pmf_cfg.capable` is documented as "deprecated and set to true internally" — the AP runs an
+SA Query against re-associating stations, and disassociates any that fail to answer. In
+practice stations failed it every few seconds, giving an access point that ejected its own
+clients on a loop. The cost of turning it off is PMF's protection against forged
+deauthentication frames; WPA2 encryption of data is unaffected.
+
 ## Web UI
 
 Browse to the device (`192.168.5.1` by default) for WiFi settings, firmware update, and live
@@ -89,9 +144,59 @@ curl -u admin:<password> -H 'Content-Type: application/json' \
 Without it the answer is `415`. `/api/ota` wants `application/octet-stream`; the other three want
 `application/json`.
 
+## HTTP API
+
+Every route is behind Basic Auth, and every one answers `403` while the admin password is
+still the default. `GET`s need nothing else; the four `POST`s need the `Content-Type` above.
+
+| Route | Method | Body / query | Returns |
+| --- | --- | --- | --- |
+| `/` `/admin` `/logs` | GET | — | the three HTML pages |
+| `/api/status` | GET | — | `{ssid, channel}` |
+| `/api/system` | GET | — | see the table below |
+| `/api/clients` | GET | — | array, one object per client |
+| `/api/client/history?mac=&since=` | GET | `mac` required, `since` optional | fine-grained traffic history |
+| `/api/logs?since=` | GET | `since` optional | log lines newer than the cursor |
+| `/api/logs/level` | POST | `{"level":"info"}` | sets the capture level |
+| `/api/wifi` | POST | `{"ssid":…,"password":…,"channel":…}` | saves and **reboots** |
+| `/api/admin` | POST | `{"new_admin_user":…,"new_admin_password":…}` | saves, no reboot |
+| `/api/ota` | POST | raw firmware image | flashes and **reboots** |
+
+`/api/logs` and `/api/client/history` share a cursor contract: echo the `seq` from the
+previous response back as `since` and you get only what you have not seen. Both cap the
+response size, so `seq` is **the last line in this response, not the newest on the device** —
+when `more` is `true` there is more waiting, and you should poll again immediately rather
+than wait for the next interval. `/api/logs` also reports `lost` (lines that aged out of the
+ring before this batch), in-band `{"gap":N}` entries where lines were overwritten mid-batch,
+and `restarted` when the device rebooted under your cursor.
+
+### `/api/system` fields
+
+| Field | Meaning |
+| --- | --- |
+| `uptime_s`, `free_heap`, `min_free_heap` | seconds since boot; heap now and its low-water mark |
+| `cpu_pct` | `[core0, core1]` percent busy, sampled over the last second |
+| `cpu_freq_mhz` | *measured*, not configured — a cycle count timed against a hardware timer |
+| `net_rx_bps`, `net_tx_bps` | bridge-wide bytes/sec, summed over tracked clients |
+| `net_rx_pps`, `net_tx_pps` | the same as packet rates, all protocols |
+| `traffic_drops` | dropped **accounting events** — see the caveat below |
+| `version` | contents of `version.txt` at build time |
+
+`traffic_drops` is the one that misleads. It counts events the per-client accounting queue
+could not keep up with; it never counts forwarded frames, and nothing in that path can drop a
+packet. It scales with packet rate rather than with anything being wrong — measured on this
+device with no data lost in any case: 0 at 2 Mbit/s, ~4k over eight seconds at 20 Mbit/s,
+~33k at 40, and 50–130k across a three-run throughput test. A large number means the
+per-client byte and packet figures undercount, and nothing more. On an idle bridge it stays
+at 0.
+
 ## Building and flashing
 
-Requires [ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/get-started/index.html) (v5.3+).
+Requires [ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/get-started/index.html)
+**v6.0 or newer**. This is not a soft floor: `dependencies.lock` pins IDF 6.0.2, the
+`espressif/lan87xx` managed component declares `idf >= 6.0`, and `main/log_buf.c` depends on
+`CONFIG_LOG_VERSION_1` behaviour for its one-hook-call-per-line assumption. Older versions
+will not resolve dependencies.
 
 Firmware images are signed (ECDSA), so a local private key is required to build. Generate
 one once per machine you build from:
@@ -118,6 +223,73 @@ Because this changes the bootloader itself, a device previously flashed without 
 enabled needs one full serial reflash (as above, which writes bootloader + partition table +
 app) to start enforcing it. After that, only images signed with `secure_boot_signing_key.pem`
 will boot.
+
+### Updating over the air
+
+Once a device is deployed, `/api/ota` is the update path — no cable, and no boot-mode jumper
+(the WT32-ETH01 has no auto-reset wiring, so serial flashing means shorting IO0 to ground by
+hand):
+
+```sh
+curl -u admin:<password> -H 'Content-Type: application/octet-stream' \
+     --data-binary @build/wt32-bridge.bin http://192.168.5.1/api/ota
+```
+
+It answers `{"ok":true}` and reboots about half a second later. The image must be signed with
+the same key — the bootloader rejects anything else, so an OTA from a machine without the key
+will upload happily and then fail to boot.
+
+Failing to boot is survivable. `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` is on, so a new image
+is booted "pending verify"; `app_main()` only calls `esp_ota_mark_app_valid_cancel_rollback()`
+after every startup-critical subsystem has come up. An image that panics or hangs before that
+point is rolled back to the previous one on the next boot. A bad *configuration* that still
+boots is not caught by this — that you fix with another OTA, or over serial.
+
+`scripts/ota.sh` wraps the above: it refuses to flash an image older than the sources, waits
+for the device to come back, and reports the version and heap it came back with.
+
+## Hardware
+
+Built for the [WT32-ETH01](https://en.wireless-tag.com/product-item-2.html) (ESP32-WROOM +
+LAN8720A). The pin assignments are compiled in (`main/main.c`) and are specific to this
+board — a lookalike with different strapping needs these changed:
+
+| Function | GPIO |
+| --- | --- |
+| PHY power enable | 16 |
+| RMII MDC | 23 |
+| RMII MDIO | 18 |
+| PHY address | 1 (SMI) |
+| Console / flashing UART | UART0, 115200 8N1 |
+
+Flash layout is 4 MB with a custom `partitions.csv`: the partition table sits at `0x10000`
+(moved down to make room for the signed bootloader), and there are two 1.5 MB OTA app slots.
+1.5 MB is therefore the hard ceiling on firmware size; the current image uses about
+two-thirds of it, leaving roughly 500 KB of headroom.
+
+## Diagnostics harness
+
+`scripts/` holds what was used to measure this device, so a change can be shown not to have
+made it worse:
+
+| Script | Purpose |
+| --- | --- |
+| `gate.py` | ping (idle and loaded), throughput both directions, TCP retransmits, CPU, drops — median of N runs, written to `bench/<label>/` |
+| `smoke.sh` | functional regression: pages load, JSON parses, auth and CSRF still refuse what they should |
+| `ota.sh` | build-freshness-checked OTA flash |
+| `serial_cmd.py` | drives a serial console; note that opening the port reboots the target, so one invocation must carry every command |
+
+`gate.py` expects a wired client on the Ethernet side and a WiFi client it can drive over
+serial (an ESP32 running the ESP-IDF `iperf` example). Both ends need iperf **2.x** — the
+ESP-IDF example does not speak the iperf3 protocol. Credentials come from `BRIDGE_PASS` in
+the environment, never the repo.
+
+```sh
+BRIDGE_PASS=<password> scripts/gate.py --label my-change --runs 3
+BRIDGE_PASS=<password> scripts/smoke.sh
+```
+
+Recorded runs live in `bench/`; `00-baseline` is the reference.
 
 ## Serial console (recovery & diagnostics)
 
@@ -157,12 +329,41 @@ reboots with the default WiFi AP and `admin`/`admin` web login restored.
 - `main/webpage/index.html` — the web UI itself
 - `main/webpage/admin.html` — the `/admin` settings page
 - `main/webpage/logs.html` — the `/logs` device log page
+- `scripts/` — measurement gate, smoke tests, OTA helper (see [Diagnostics harness](#diagnostics-harness))
+- `bench/` — recorded gate runs; `00-baseline` is the reference
+
+## Known limitation: slow TCP downlink
+
+**Wired → WiFi TCP runs at roughly 1.4 Mbit/s**, against 27 Mbit/s in the other direction.
+This is a real, reproducible fault in the bridge and is not yet fixed.
+
+What is known, all measured (`bench/`):
+
+- It is the bridge, not the client. The same WiFi client, same iperf binary, gets
+  64 Mbit/s with zero retransmits through an ordinary access point.
+- It is specific to TCP. Paced UDP over the identical path is clean at 20 Mbit/s, and ICMP
+  through it loses nothing and arrives in order *while a TCP transfer is collapsing on the
+  same path*.
+- It is not a rate mismatch between the fast wired side and the slower WiFi side. TCP paced
+  down to 5 Mbit/s — far below WiFi capacity — collapses just the same.
+- The bridge forwards what it is handed: its own per-client counters show 1.39 Mb/s in
+  against 1.37 Mb/s out.
+- Ruled out by measurement, each tried and reverted: WiFi TX buffer count, block-ack window
+  size, Ethernet DMA buffer count, TCP segment size down to 200 bytes, concurrent reverse
+  traffic, and this project's own accounting hooks (removed entirely — no change).
+
+The untested suspect is the lwIP bridge layer itself (`esp_netif_br_glue` / `bridgeif`).
+Uplink, UDP, ICMP and anything terminating on the device are all unaffected, so a deployment
+that mostly sends *from* the WiFi side — which is the common AgOpenGPS direction — will not
+notice it.
 
 ## Troubleshooting high/jittery ping latency
 
-Check `192.168.5.1/api/system` first: `cpu_pct` should be near-idle and `traffic_drops`
-should be ~0 under normal load. If both look fine, the bridge's software
-isn't the bottleneck — check WiFi channel congestion/interference next.
+Check `192.168.5.1/api/system` first: `cpu_pct` should be near-idle. **Ignore
+`traffic_drops`** — it counts accounting events, not packets, and runs to tens of thousands
+under normal load with nothing wrong (see [`/api/system` fields](#apisystem-fields)). If the
+CPU looks fine, the bridge's software isn't the bottleneck — check WiFi channel
+congestion/interference next.
 
 Per-client traffic accounting (`client_track.c`) is intentionally decoupled
 from the packet-forwarding path: `traffic_input_wrapper`/`traffic_output_wrapper`
