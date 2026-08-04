@@ -1,0 +1,313 @@
+{
+  "label": "00-baseline",
+  "when": "2026-08-04T12:50:10+00:00",
+  "git": "965fa69",
+  "bridge_before": {
+    "uptime_s": 5683,
+    "free_heap": 113332,
+    "min_free_heap": 51988,
+    "cpu_pct": [
+      4,
+      4
+    ],
+    "cpu_freq_mhz": 160,
+    "net_rx_bps": 1522,
+    "net_tx_bps": 2255,
+    "net_rx_pps": 9,
+    "net_tx_pps": 22,
+    "traffic_drops": 158729,
+    "version": "1.1.0"
+  },
+  "bridge_after": {
+    "uptime_s": 6004,
+    "free_heap": 113344,
+    "min_free_heap": 51988,
+    "cpu_pct": [
+      7,
+      6
+    ],
+    "cpu_freq_mhz": 160,
+    "net_rx_bps": 158870,
+    "net_tx_bps": 159677,
+    "net_rx_pps": 194,
+    "net_tx_pps": 207,
+    "traffic_drops": 290865,
+    "version": "1.1.0"
+  },
+  "drops_delta": 132136,
+  "peer_ip": "192.168.5.4",
+  "medians": {
+    "idle_wired_to_wifi_avg_ms": {
+      "median": 2.631,
+      "runs": [
+        2.693,
+        2.631,
+        2.628
+      ],
+      "spread": 0.065
+    },
+    "idle_wired_to_wifi_max_ms": {
+      "median": 6.621,
+      "runs": [
+        13.721,
+        6.621,
+        6.522
+      ],
+      "spread": 7.199
+    },
+    "idle_wired_to_bridge_avg_ms": {
+      "median": 0.96,
+      "runs": [
+        0.96,
+        0.986,
+        0.96
+      ],
+      "spread": 0.026
+    },
+    "loaded_wired_to_wifi_avg_ms": {
+      "median": 2.757,
+      "runs": [
+        2.757,
+        2.649,
+        2.847
+      ],
+      "spread": 0.198
+    },
+    "loaded_wired_to_wifi_max_ms": {
+      "median": 8.95,
+      "runs": [
+        11.963,
+        6.123,
+        8.95
+      ],
+      "spread": 5.84
+    },
+    "loaded_loss_pct": {
+      "median": 0.5,
+      "runs": [
+        0.5,
+        0.5,
+        0.0
+      ],
+      "spread": 0.5
+    },
+    "up_mbits": {
+      "median": 27.0,
+      "runs": [
+        27.0,
+        27.0,
+        26.97
+      ],
+      "spread": 0.03
+    },
+    "down_mbits": {
+      "median": 1.14,
+      "runs": [
+        1.14,
+        1.4,
+        0.82
+      ],
+      "spread": 0.58
+    },
+    "down_bytes_retrans": {
+      "median": 437760,
+      "runs": [
+        619200,
+        437760,
+        342720
+      ],
+      "spread": 276480
+    },
+    "down_cwnd_min": {
+      "median": 1,
+      "runs": [
+        1,
+        1,
+        1
+      ],
+      "spread": 0
+    },
+    "cpu0_pct": {
+      "median": 8,
+      "runs": [
+        14,
+        8,
+        7
+      ],
+      "spread": 7
+    },
+    "cpu1_pct": {
+      "median": 8,
+      "runs": [
+        11,
+        8,
+        6
+      ],
+      "spread": 5
+    }
+  },
+  "runs": [
+    {
+      "ping_idle": {
+        "wired_to_bridge": {
+          "sent": 200,
+          "recv": 200,
+          "loss_pct": 0.0,
+          "min": 0.453,
+          "avg": 0.96,
+          "max": 2.337,
+          "mdev": 0.224
+        },
+        "wired_to_wifi": {
+          "sent": 200,
+          "recv": 200,
+          "loss_pct": 0.0,
+          "min": 1.876,
+          "avg": 2.693,
+          "max": 13.721,
+          "mdev": 1.06
+        }
+      },
+      "throughput": {
+        "up_mbits": 27.0,
+        "up_peer_report": "iperf -c 192.168.5.2 -t 10 -i 1\r\nI (47855) IPERF: mode=tcp-client sip=localhost:5001, dip=192.168.5.2:5001, interval=1, time=10\r\niperf> I (47860) iperf: Successfully connected\r\n\r\nInterval       Bandwidth\r\n\r\niperf>  0.0- 1.0 sec  27.12 Mbits/sec\r\n 1.0- 2.0 sec  27.38 Mbits/sec\r\n 2.0- 3.0 sec  27.00 Mbits/sec\r\n 3.0- 4.0 sec  27.12 Mbits/sec\r\n 4.0- 5.0 sec  26.88 Mbits/sec\r\n 5.0- 6.0 sec  27.38 Mbits/sec\r\n 6.0- 7.0 sec  27.50 Mbits/sec\r\n 7.0- 8.0 sec  26.38 Mbits/sec\r\n 8.0- 9.0 sec  27.00 Mbits/sec\r\n 9.0-10.0 sec  26.25 Mbits/sec\r\n 0.0-10.0 sec  27.00 Mbits/sec\r\nI (57889) iperf: TCP Socket client is closed.\r\nI (57890) iperf: iperf exit\r\n",
+        "down_mbits": 1.14,
+        "down_bytes_retrans": 619200,
+        "down_cwnd_min": 1
+      },
+      "ping_loaded": {
+        "sent": 200,
+        "recv": 199,
+        "loss_pct": 0.5,
+        "min": 1.775,
+        "avg": 2.757,
+        "max": 11.963,
+        "mdev": 1.142
+      },
+      "system": {
+        "uptime_s": 5793,
+        "free_heap": 113356,
+        "min_free_heap": 51988,
+        "cpu_pct": [
+          14,
+          11
+        ],
+        "cpu_freq_mhz": 159,
+        "net_rx_bps": 183442,
+        "net_tx_bps": 184020,
+        "net_rx_pps": 211,
+        "net_tx_pps": 223,
+        "traffic_drops": 201765,
+        "version": "1.1.0"
+      }
+    },
+    {
+      "ping_idle": {
+        "wired_to_bridge": {
+          "sent": 200,
+          "recv": 200,
+          "loss_pct": 0.0,
+          "min": 0.467,
+          "avg": 0.986,
+          "max": 1.892,
+          "mdev": 0.186
+        },
+        "wired_to_wifi": {
+          "sent": 200,
+          "recv": 200,
+          "loss_pct": 0.0,
+          "min": 1.865,
+          "avg": 2.631,
+          "max": 6.621,
+          "mdev": 0.747
+        }
+      },
+      "throughput": {
+        "up_mbits": 27.0,
+        "up_peer_report": "iperf -c 192.168.5.2 -t 10 -i 1\r\nI (151402) IPERF: mode=tcp-client sip=localhost:5001, dip=192.168.5.2:5001, interval=1, time=10\r\niperf> I (151407) iperf: Successfully connected\r\n\r\n\r\nInterval       Bandwidth\r\niperf>  0.0- 1.0 sec  27.25 Mbits/sec\r\n 1.0- 2.0 sec  27.25 Mbits/sec\r\n 2.0- 3.0 sec  27.50 Mbits/sec\r\n 3.0- 4.0 sec  27.12 Mbits/sec\r\n 4.0- 5.0 sec  26.50 Mbits/sec\r\n 5.0- 6.0 sec  26.50 Mbits/sec\r\n 6.0- 7.0 sec  27.12 Mbits/sec\r\n 7.0- 8.0 sec  26.88 Mbits/sec\r\n 8.0- 9.0 sec  26.75 Mbits/sec\r\n 9.0-10.0 sec  27.12 Mbits/sec\r\n 0.0-10.0 sec  27.00 Mbits/sec\r\nI (161423) iperf: TCP Socket client is closed.\r\nI (161424) iperf: iperf exit\r\n",
+        "down_mbits": 1.4,
+        "down_bytes_retrans": 437760,
+        "down_cwnd_min": 1
+      },
+      "ping_loaded": {
+        "sent": 200,
+        "recv": 199,
+        "loss_pct": 0.5,
+        "min": 1.787,
+        "avg": 2.649,
+        "max": 6.123,
+        "mdev": 0.753
+      },
+      "system": {
+        "uptime_s": 5899,
+        "free_heap": 113152,
+        "min_free_heap": 51988,
+        "cpu_pct": [
+          8,
+          8
+        ],
+        "cpu_freq_mhz": 160,
+        "net_rx_bps": 80250,
+        "net_tx_bps": 81107,
+        "net_rx_pps": 99,
+        "net_tx_pps": 112,
+        "traffic_drops": 245396,
+        "version": "1.1.0"
+      }
+    },
+    {
+      "ping_idle": {
+        "wired_to_bridge": {
+          "sent": 200,
+          "recv": 200,
+          "loss_pct": 0.0,
+          "min": 0.468,
+          "avg": 0.96,
+          "max": 1.993,
+          "mdev": 0.225
+        },
+        "wired_to_wifi": {
+          "sent": 200,
+          "recv": 200,
+          "loss_pct": 0.0,
+          "min": 1.837,
+          "avg": 2.628,
+          "max": 6.522,
+          "mdev": 0.762
+        }
+      },
+      "throughput": {
+        "up_mbits": 26.97,
+        "up_peer_report": "iperf -c 192.168.5.2 -t 10 -i 1\r\nI (257450) IPERF: mode=tcp-client sip=localhost:5001, dip=192.168.5.2:5001, interval=1, time=10\r\niperf> I (257455) iperf: Successfully connected\r\n\r\n\r\nInterval       Bandwidth\r\niperf>  0.0- 1.0 sec  26.50 Mbits/sec\r\n 1.0- 2.0 sec  27.00 Mbits/sec\r\n 2.0- 3.0 sec  26.50 Mbits/sec\r\n 3.0- 4.0 sec  26.50 Mbits/sec\r\n 4.0- 5.0 sec  27.38 Mbits/sec\r\n 5.0- 6.0 sec  27.25 Mbits/sec\r\n 6.0- 7.0 sec  27.25 Mbits/sec\r\n 7.0- 8.0 sec  27.38 Mbits/sec\r\n 8.0- 9.0 sec  26.62 Mbits/sec\r\n 9.0-10.0 sec  27.38 Mbits/sec\r\n 0.0-10.0 sec  26.97 Mbits/sec\r\nI (267472) iperf: TCP Socket client is closed.\r\nI (267473) iperf: iperf exit\r\n",
+        "down_mbits": 0.82,
+        "down_bytes_retrans": 342720,
+        "down_cwnd_min": 1
+      },
+      "ping_loaded": {
+        "sent": 200,
+        "recv": 200,
+        "loss_pct": 0.0,
+        "min": 1.747,
+        "avg": 2.847,
+        "max": 8.95,
+        "mdev": 1.072
+      },
+      "system": {
+        "uptime_s": 6004,
+        "free_heap": 113340,
+        "min_free_heap": 51988,
+        "cpu_pct": [
+          7,
+          6
+        ],
+        "cpu_freq_mhz": 160,
+        "net_rx_bps": 158870,
+        "net_tx_bps": 159677,
+        "net_rx_pps": 194,
+        "net_tx_pps": 207,
+        "traffic_drops": 290865,
+        "version": "1.1.0"
+      }
+    }
+  ]
+}
