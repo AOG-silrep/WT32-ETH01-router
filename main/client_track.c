@@ -428,6 +428,90 @@ static void on_client_ip_assigned(void *arg, esp_event_base_t base, int32_t id, 
     xSemaphoreGive(s_mutex);
 }
 
+// Disconnect reasons that actually turn up on a soft-AP. Anything else prints
+// as a bare number: the full 802.11 list is long, mostly concerns station-mode
+// roaming, and transcribing all of it would go stale against ESP-IDF's enum
+// for no benefit.
+static const char *disconnect_reason_str(uint16_t reason)
+{
+    switch (reason) {
+    case WIFI_REASON_AUTH_EXPIRE:                return "auth expired";
+    case WIFI_REASON_AUTH_LEAVE:                 return "deauthenticated";
+    case WIFI_REASON_DISASSOC_DUE_TO_INACTIVITY: return "idle too long";
+    case WIFI_REASON_ASSOC_TOOMANY:              return "AP full";
+    case WIFI_REASON_ASSOC_LEAVE:                return "left";
+    case WIFI_REASON_MIC_FAILURE:                return "MIC failure";
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:     return "wrong password, or handshake timed out";
+    case WIFI_REASON_GROUP_KEY_UPDATE_TIMEOUT:   return "group key update timed out";
+    case WIFI_REASON_STA_LEAVING:                return "leaving";
+    case WIFI_REASON_TIMEOUT:                    return "timeout";
+    // The one this device has a history with - see the PMF note in
+    // wifi_cfg_apply(), where turning 802.11w off is what stopped it.
+    case WIFI_REASON_SA_QUERY_TIMEOUT:           return "SA query timeout";
+    default:                                     return NULL;
+    }
+}
+
+// Describes a station by the address and name the client table already knows,
+// so a join line says which device it was and not only which MAC. Writes into
+// a caller-supplied buffer and returns it, for use inline in a log call.
+static const char *describe_client(const uint8_t mac[6], char *buf, size_t len)
+{
+    char ip_str[20] = "no address yet";
+    char name[CLIENT_TRACK_NAME_MAX_LEN] = "";
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < CLIENT_TRACK_MAX_CLIENTS; i++) {
+        client_entry_t *e = &s_clients[i];
+        if (e->active && memcmp(e->mac, mac, 6) == 0) {
+            if (e->ip.addr != 0) {
+                esp_ip4addr_ntoa(&e->ip, ip_str, sizeof(ip_str));
+            }
+            strlcpy(name, e->name, sizeof(name));
+            break;
+        }
+    }
+    xSemaphoreGive(s_mutex);
+
+    if (name[0] != '\0') {
+        snprintf(buf, len, "%s, %s", ip_str, name);
+    } else {
+        snprintf(buf, len, "%s", ip_str);
+    }
+    return buf;
+}
+
+// The WiFi driver logs its own join and leave lines, but they are internal
+// ("<ba-add>idx:2 (ifx:1, ...)"), sit at INFO under the noisy "wifi" tag, and
+// identify a station only by MAC and AID. These say plainly which client came
+// or went, so a re-association loop reads as what it is rather than having to
+// be inferred from block-ack churn.
+static void on_wifi_sta_connected(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    wifi_event_ap_staconnected_t *evt = (wifi_event_ap_staconnected_t *)data;
+    char who[64];
+    ESP_LOGI(TAG, "wifi station joined: %02x:%02x:%02x:%02x:%02x:%02x (aid %u) - %s",
+             evt->mac[0], evt->mac[1], evt->mac[2], evt->mac[3], evt->mac[4], evt->mac[5],
+             (unsigned)evt->aid, describe_client(evt->mac, who, sizeof(who)));
+}
+
+static void on_wifi_sta_disconnected(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    wifi_event_ap_stadisconnected_t *evt = (wifi_event_ap_stadisconnected_t *)data;
+
+    char reason_buf[16];
+    const char *why = disconnect_reason_str(evt->reason);
+    if (why == NULL) {
+        snprintf(reason_buf, sizeof(reason_buf), "reason %u", (unsigned)evt->reason);
+        why = reason_buf;
+    }
+
+    char who[64];
+    ESP_LOGI(TAG, "wifi station left: %02x:%02x:%02x:%02x:%02x:%02x (aid %u) - %s (%s)",
+             evt->mac[0], evt->mac[1], evt->mac[2], evt->mac[3], evt->mac[4], evt->mac[5],
+             (unsigned)evt->aid, why, describe_client(evt->mac, who, sizeof(who)));
+}
+
 static void client_track_tick(void)
 {
     int64_t now = esp_timer_get_time();
@@ -592,6 +676,15 @@ esp_err_t client_track_init(esp_netif_t *eth_netif, esp_netif_t *wifi_netif,
                                                 &on_wifi_port_started, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ASSIGNED_IP_TO_CLIENT,
                                                 &on_client_ip_assigned, NULL));
+
+    // Purely for the log - neither handler touches the client table, which
+    // learns about stations from their traffic and from esp_wifi_ap_get_sta_list()
+    // in the tick. Registered here rather than in main.c because saying which
+    // client joined needs the table this file owns.
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED,
+                                                &on_wifi_sta_connected, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED,
+                                                &on_wifi_sta_disconnected, NULL));
 
     BaseType_t ok = xTaskCreatePinnedToCore(client_track_task, "client_track", 4096,
                                              NULL, tskIDLE_PRIORITY + 2, NULL, 1);
