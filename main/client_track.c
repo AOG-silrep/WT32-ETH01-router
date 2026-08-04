@@ -14,6 +14,7 @@
 #include "freertos/queue.h"
 #include "lwip/netif.h"
 #include "lwip/pbuf.h"
+#include "lwip/prot/ip.h"    // IP_PROTO_UDP
 #include "lwip/prot/ip4.h"
 #include "netif/ethernet.h"
 
@@ -223,10 +224,65 @@ static void account_traffic(const uint8_t *mac, bool is_wifi, uint16_t bytes, bo
         }
         e->last_seen_us = esp_timer_get_time();
         if (observed_ip != NULL) {
+            // Compared before the update so the DHCP server is told only when
+            // the address actually moved, not on every packet: this runs
+            // per-frame, and a mutex plus a table scan each time would slow
+            // the accounting task for nothing. In steady state the address
+            // never changes and this costs one comparison.
+            bool ip_is_new = (e->ip.addr != observed_ip->addr);
             update_client_ip_locked(e, *observed_ip);
+
+            // Tell the DHCP server what this client is really using, so the
+            // mapping it keeps in flash is the client's actual address rather
+            // than a lease the client may have ignored in favour of one it set
+            // itself. Deliberately only from here: this is the sniffed source
+            // address, the one piece of ground truth. The other callers of
+            // update_client_ip_locked() are bootstraps from the lease table
+            // and from the DHCP-assigned event, and an assignment is the
+            // server saying what it offered, not the client saying what it
+            // took - feeding those back would let a client that renews a stale
+            // lease in the background overwrite the static address it is on.
+            //
+            // Safe under s_mutex: dhcp_server.c takes only its own lock and
+            // never calls back into this file, so the two are always acquired
+            // in this order and cannot deadlock.
+            if (ip_is_new) {
+                dhcp_server_note_observed_ip(e->mac, *observed_ip);
+            }
         }
     }
     xSemaphoreGive(s_mutex);
+}
+
+// True for a client's own DHCP traffic, which the source-IP sniffing below
+// must skip.
+//
+// A DHCP packet's source address is what the client's DHCP task believes it
+// holds, which is not the same as the address the client is using. A device
+// given a static address by hand often leaves its DHCP client running, and
+// those background renewals go out with the *leased* address as their source.
+// Sniffing them flips the recorded address back and forth - lease, real
+// address, lease - on every renewal and every re-association, and each flip
+// rewrites the mapping in flash. Observed via a station rejoining:
+//
+//   client e8:9f:6d:55:5b:10 changed IP: 192.168.5.77 -> 192.168.5.3
+//   client e8:9f:6d:55:5b:10 changed IP: 192.168.5.3 -> 192.168.5.77
+//   dhcp_server: saved 2 MAC->IP reservations to flash
+//
+// avail is how many bytes are readable from iph onwards.
+static bool is_dhcp_packet(const struct ip_hdr *iph, size_t avail)
+{
+    // IPH_HL != 5 means IP options, which put the UDP header somewhere other
+    // than the fixed offset used below. DHCP clients do not send those, so
+    // declining to classify such a packet is the right answer rather than a
+    // gap.
+    if (IPH_PROTO(iph) != IP_PROTO_UDP || IPH_HL(iph) != 5 || avail < IP_HLEN + 4) {
+        return false;
+    }
+    const uint8_t *udp = (const uint8_t *)iph + IP_HLEN;
+    uint16_t sport = (uint16_t)((udp[0] << 8) | udp[1]);
+    uint16_t dport = (uint16_t)((udp[2] << 8) | udp[3]);
+    return sport == 67 || sport == 68 || dport == 67 || dport == 68;
 }
 
 // Chain to the bridge's input and count what it refuses. See s_fwd_in_drops.
@@ -262,14 +318,22 @@ static err_t traffic_input_wrapper(struct pbuf *p, struct netif *inp, bool is_wi
     // them. Fast-path the common single-segment case, and fall back to
     // pbuf_copy_partial() (checked against tot_len) for the rare chained one
     // instead of silently dropping the accounting event for that frame.
-    uint8_t hdrbuf[sizeof(struct eth_hdr) + IP_HLEN];
+    // Sized to reach the UDP ports past the IP header as well, so a client's
+    // own DHCP traffic can be told apart from its real traffic below. The
+    // thresholds still test only the eth+IP part, so a short IPv4 frame is
+    // sniffed exactly as before - the extra bytes are read only if present.
+    uint8_t hdrbuf[sizeof(struct eth_hdr) + IP_HLEN + 4];
+    const size_t eth_ip_len = sizeof(struct eth_hdr) + IP_HLEN;
     struct eth_hdr *hdr;
     bool have_ip_hdr;
-    if (p != NULL && p->len >= sizeof(hdrbuf)) {
+    size_t have_len = 0;
+    if (p != NULL && p->len >= eth_ip_len) {
         hdr = (struct eth_hdr *)p->payload;
         have_ip_hdr = true;
-    } else if (p != NULL && p->tot_len >= sizeof(hdrbuf)) {
-        pbuf_copy_partial(p, hdrbuf, sizeof(hdrbuf), 0);
+        have_len = p->len;
+    } else if (p != NULL && p->tot_len >= eth_ip_len) {
+        have_len = (p->tot_len < sizeof(hdrbuf)) ? p->tot_len : sizeof(hdrbuf);
+        pbuf_copy_partial(p, hdrbuf, have_len, 0);
         hdr = (struct eth_hdr *)hdrbuf;
         have_ip_hdr = true;
     } else if (p != NULL && p->len >= 12) {
@@ -290,8 +354,10 @@ static err_t traffic_input_wrapper(struct pbuf *p, struct netif *inp, bool is_wi
         const esp_ip4_addr_t *src_ip_p = NULL;
         if (have_ip_hdr && hdr->type == PP_HTONS(ETHTYPE_IP)) {
             struct ip_hdr *iph = (struct ip_hdr *)((uint8_t *)hdr + sizeof(struct eth_hdr));
-            src_ip.addr = iph->src.addr;
-            src_ip_p = &src_ip;
+            if (!is_dhcp_packet(iph, have_len - sizeof(struct eth_hdr))) {
+                src_ip.addr = iph->src.addr;
+                src_ip_p = &src_ip;
+            }
         }
         traffic_event_t ev = {
             .is_wifi = is_wifi,

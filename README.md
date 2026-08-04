@@ -58,6 +58,7 @@ there is nothing to configure. `leases` on the serial console shows the table:
 MAC                IP                EXPIRES SEEN          STATE
 fc:e8:c0:4d:ab:94  192.168.5.2         7194s now           active
 a4:83:e7:11:22:33  192.168.5.3             - 2 boots ago   reserved
+b8:27:eb:9a:1f:04  192.168.5.60            - now           manual (leased 192.168.5.4)
 ```
 
 `reserved` is a mapping held for a client that isn't currently here. It is still that
@@ -85,8 +86,28 @@ from in. The `SEEN` column reports the difference — `now` for a client seen si
 which also makes it ineligible for reclaiming, or `N boots ago` for one that has not
 been. Those counts are boots that wrote the table, not hours.
 
+**Addresses the device set for itself are recorded too.** A client that ignores DHCP — or
+takes a lease and then applies a static address anyway — never tells the server what it is
+on, so the mapping is learned from the client's own traffic instead: the source address
+seen on its packets is treated as the truth, and written to flash when it changes. That is
+the `manual` row above, showing what the client is really using alongside the lease it
+isn't. Such an address is never handed to another client, even when it falls inside the
+DHCP pool, and the client keeps it in the table across a reboot exactly like a leased one.
+If it later goes back to using its lease, the manual entry clears itself.
+
+Only addresses on the bridge's own subnet are recorded. This is a transparent bridge, so
+traffic from other subnets crosses it legitimately, and a client that fails DHCP and
+self-assigns a `169.254.x.x` link-local isn't reporting an address worth keeping.
+
+The client's own DHCP traffic is excluded from this, which is less obvious than it sounds.
+A device given a static address by hand usually leaves its DHCP client running, and those
+background renewals go out with the *leased* address as their source — so counting them
+would flip the recorded address between the lease and the real one on every renewal and
+every re-association, rewriting flash each time.
+
 Writes are debounced and only happen when the *mapping* changes: lease renewals, which are
-almost all DHCP traffic, never touch flash. Past 32 remembered clients the least recently
+almost all DHCP traffic, never touch flash, and neither does the steady stream of packets
+from a client whose address is not moving. Past 32 remembered clients the least recently
 seen mapping is dropped — those clients still get addresses, they just stop being sticky.
 See [Reservations are not expired on a timer](#reservations-are-not-expired-on-a-timer)
 for what "least recently seen" means on a device with no clock.
