@@ -61,9 +61,23 @@ void client_track_get_snapshot(client_info_t *out, int max, int *count);
 bool client_track_get_history(const uint8_t mac[6], uint32_t since_seq, client_history_t *out);
 
 // Count of traffic events dropped because the hot-path -> accounting-task
-// queue was full (i.e. the accounting task couldn't keep up). Should stay at
-// or near 0 under normal load; a climbing count means
-// TRAFFIC_EVENT_QUEUE_DEPTH in client_track.c needs to be raised.
+// queue was full (i.e. the accounting task couldn't keep up).
+//
+// This counts *accounting* events, never forwarded frames - nothing here can
+// drop a packet, both wrappers hand every pbuf to the original function
+// whatever happens to the queue. A large number means the per-client byte and
+// packet figures undercount, and nothing worse.
+//
+// It is normal for it to be large under load, and it tracks packet rate rather
+// than any kind of fault. Measured on this device, with no data lost in any of
+// them: nothing at 2 Mbit/s, ~4k over eight seconds at 20 Mbit/s, ~33k at 40,
+// and 50-130k across a three-run throughput test. An idle bridge sits at 0.
+// So it is not a health indicator and a climbing count is not a fault; it says
+// the accounting task lost the race with the traffic, which is what it is
+// designed to do rather than block forwarding.
+//
+// The counter is also approximate by construction - see the note in
+// client_track.c on why it is not atomic.
 uint32_t client_track_get_traffic_drops(void);
 
 // Bridge-wide packet rate (all tracked clients summed, every protocol -

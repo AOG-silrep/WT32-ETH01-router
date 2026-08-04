@@ -65,6 +65,24 @@ typedef struct {
 static client_entry_t s_clients[CLIENT_TRACK_MAX_CLIENTS];
 static SemaphoreHandle_t s_mutex;
 static QueueHandle_t s_traffic_q;
+// Deliberately a plain increment, and deliberately racy. The two hot-path
+// wrappers below reach this from different tasks on different cores, so a ++ is
+// a read-modify-write that loses counts when two land together - exactly when
+// the queue is overflowing and the number is being looked at.
+//
+// Making it _Atomic was tried and backed out on measurement. ESP-IDF has no
+// lock-free 32-bit RMW for dual-core Xtensa: __atomic_fetch_add_4 goes through
+// _ATOMIC_ENTER_CRITICAL, which is portENTER_CRITICAL_SAFE on one global
+// spinlock shared by every atomic in the system (esp_libc's esp_stdatomic.h).
+// Taking that inside the RX/TX path, ~50k times per test run, cost 35% of
+// uplink throughput: 24.8 Mbit/s fell to 16.1, reproduced across two runs
+// either way (bench/04-atomic-drops vs bench/04b-plain-counter-control).
+//
+// That is a bad trade for this counter. It is a diagnostic that is only ever
+// displayed, and it is read to answer "is the accounting queue overflowing",
+// where a few lost counts out of tens of thousands changes nothing. Throughput
+// is what this device is for. If an exact count is ever genuinely needed, the
+// way to get it is per-core counters summed on read, not a shared atomic.
 static volatile uint32_t s_traffic_drops;
 static uint32_t s_net_rx_pps, s_net_tx_pps; // bridge-wide, summed across clients each 1Hz tick
 
