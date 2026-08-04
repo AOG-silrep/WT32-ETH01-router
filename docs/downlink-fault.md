@@ -5,8 +5,13 @@ rig, everything already eliminated and how, and where to pick up. Nothing here
 is remembered — every number is from a recorded run in [`bench/`](../bench) or
 from a transcript of the command that produced it.
 
-**Status: the bridge is not at fault.** A packet capture on the wired side
-settles it. The bridge drops nothing, the radio transmits everything, the
+**Status: resolved. The bridge was not at fault.** Raising the *peer's*
+`CONFIG_LWIP_TCP_OOSEQ_MAX_PBUFS` from 4 to 12 and changing nothing else took
+the downlink from **0.58 to 7.47 Mbit/s**, a 13x improvement, on the same board
+over the same bridge. See "Proof: one variable" below. Everything from here on
+is the evidence trail that got there.
+
+A packet capture on the wired side is what identified it. The bridge drops nothing, the radio transmits everything, the
 retransmissions are real rather than spurious — and **the peer discards
 out-of-order data**, so every single lost segment costs a full retransmission
 of the window behind it. The collapse is a property of the *test peer*, not of
@@ -327,11 +332,51 @@ Set ps type: 0                tcp tx win: 65534
 Why the *initial* loss happens at all. The bridge forwards every frame and the
 radio reports every frame delivered, so the drop is above the peer's MAC and
 below its TCP — its WiFi driver RX queue or lwIP. Paced UDP at 21 Mbit/s is
-clean while TCP fails at 1.4, and the difference is burst shape: iperf paces UDP
+clean while TCP fails, and the difference is burst shape: iperf paces UDP
 evenly, whereas TCP puts a whole window on the wire back-to-back at 100 Mbit/s.
 
-That question is worth answering only if the peer still matters. It is a test
-instrument, not a product.
+The loss is still there at OOSEQ 12 — 4.4% of segments — so this is a real
+effect, not an artefact of the small queue. It just stopped being catastrophic.
+Worth chasing only if the remaining gap to the ~10 Mbit/s a laptop gets matters;
+the peer is a test instrument, not a product.
+
+### If you keep using this peer
+
+Rebuild it with `CONFIG_LWIP_TCP_OOSEQ_MAX_PBUFS` at 12 or more, and record
+which build produced any number quoted from it. A stock
+`examples/wifi/iperf` build understates this bridge's downlink by roughly an
+order of magnitude, and that is what `bench/00-baseline` through
+`bench/07-fwd-drop-counters` all measured.
+
+## Proof: one variable
+
+The peer was rebuilt from `$IDF_PATH/examples/wifi/iperf` with
+`CONFIG_LWIP_TCP_OOSEQ_MAX_PBUFS` raised from its default of 4 to 12. Nothing
+else changed — same board, same bridge, same path, same 20-second test:
+
+| | OOSEQ = 4 | OOSEQ = 12 |
+| --- | --- | --- |
+| **downlink** | **0.58 Mbit/s** | **7.47 Mbit/s** |
+| data segments sent | 2092 | 13613 |
+| segments retransmitted | 39.0% | **4.4%** |
+| median first send → resend | 684 ms | **10 ms** |
+| ACK jumped > 1 MSS | 8.2% | **63.2%** |
+| median bytes ACKed beyond the hole | 1440 | 7200 |
+| **max bytes ACKed beyond the hole** | **7200** | **18720** |
+| spurious retransmits | 0.0% | 0.0% |
+
+The ceiling lands exactly where the queue puts it: 7200 = 5 x 1440 and
+18720 = 13 x 1440, i.e. `(N+1)` segments for `OOSEQ_MAX_PBUFS = N`. Before this
+run the 7200-byte cap had already reproduced three times, across two physical
+boards and two builds.
+
+The median resend delay is the mechanism in one number. A receiver that cannot
+buffer past a gap cannot keep generating the duplicate ACKs that trigger fast
+retransmit, so nearly every loss waited out an RTO — 684 ms. With room to
+buffer, the same losses are repaired inside one round trip — 10 ms.
+Retransmissions fell from 39% to 4.4% with no change in the underlying loss
+rate, and spurious retransmits stayed at 0.0% throughout, so the path itself
+behaved identically in both runs.
 
 ## Confirmed against a third-party client
 
