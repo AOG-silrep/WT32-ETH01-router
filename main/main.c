@@ -36,7 +36,11 @@ static const char *TAG = "AOG-BRIDGE";
 #define BRIDGE_NETMASK "255.255.255.0"
 #define BRIDGE_GW      "192.168.5.1"
 #define DHCP_START     "192.168.5.2"
-#define DHCP_END       "192.168.5.254"
+// Not .254. A range wider than DHCPS_MAX_LEASE (100, fixed in ESP-IDF's
+// dhcpserver.h) is rejected outright by esp_netif_dhcps_option(), which then
+// leaves the server on its own default range - so asking for .2-.254 got a
+// narrower pool than asking for .2-.101 does, and said nothing about it.
+#define DHCP_END       "192.168.5.101"
 
 // ETH Configuration
 #define ETH_PHY_ADDR        1
@@ -178,11 +182,25 @@ static void setup_bridge(esp_netif_t *eth_netif, esp_netif_t *wifi_netif, const 
 
     // Configure the DHCP lease range before the bridge attach below starts
     // the DHCP server automatically.
+    //
+    // The result is checked because this call has a silent failure mode that
+    // this code sat in for some time: esp_netif_dhcps_option() validates the
+    // range and returns ESP_ERR_ESP_NETIF_INVALID_PARAMS without storing
+    // anything if it is wider than DHCPS_MAX_LEASE, out of subnet, or covers
+    // the bridge's own address. The DHCP server then quietly runs on a default
+    // range of its own choosing, which is not the one logged below.
     dhcps_lease_t lease;
     lease.enable = true;
     inet_pton(AF_INET, DHCP_START, &lease.start_ip);
     inet_pton(AF_INET, DHCP_END, &lease.end_ip);
-    esp_netif_dhcps_option(br_netif, ESP_NETIF_OP_SET, ESP_NETIF_REQUESTED_IP_ADDRESS, &lease, sizeof(lease));
+    esp_err_t lease_err = esp_netif_dhcps_option(br_netif, ESP_NETIF_OP_SET,
+                                                  ESP_NETIF_REQUESTED_IP_ADDRESS,
+                                                  &lease, sizeof(lease));
+    if (lease_err != ESP_OK) {
+        ESP_LOGE(TAG, "DHCP lease range %s-%s refused (%s) - the server will use "
+                      "a default range instead", DHCP_START, DHCP_END,
+                 esp_err_to_name(lease_err));
+    }
 
     esp_netif_br_glue_handle_t br_glue = esp_netif_br_glue_new();
     ESP_ERROR_CHECK(esp_netif_br_glue_add_port(br_glue, eth_netif));
@@ -191,7 +209,26 @@ static void setup_bridge(esp_netif_t *eth_netif, esp_netif_t *wifi_netif, const 
     ESP_ERROR_CHECK(esp_netif_attach(br_netif, br_glue));
 
     ESP_LOGI(TAG, "Bridge + DHCP Server started");
-    ESP_LOGI(TAG, "  IP Pool: %s - %s", DHCP_START, DHCP_END);
+
+    // Read the range back rather than printing DHCP_START/DHCP_END. What was
+    // asked for and what the server ended up with are not the same thing when
+    // the request is refused, and the whole point of this line is to say which
+    // addresses clients will actually be given.
+    dhcps_lease_t in_use;
+    if (esp_netif_dhcps_option(br_netif, ESP_NETIF_OP_GET, ESP_NETIF_REQUESTED_IP_ADDRESS,
+                               &in_use, sizeof(in_use)) == ESP_OK) {
+        // dhcps_lease_t carries lwIP's ip4_addr_t, while esp_ip4addr_ntoa()
+        // takes esp_netif's esp_ip4_addr_t. Same 32 bits, different declared
+        // type, so copy the address across rather than casting the pointer.
+        esp_ip4_addr_t start_ip = { .addr = in_use.start_ip.addr };
+        esp_ip4_addr_t end_ip = { .addr = in_use.end_ip.addr };
+        char start_str[16], end_str[16];
+        esp_ip4addr_ntoa(&start_ip, start_str, sizeof(start_str));
+        esp_ip4addr_ntoa(&end_ip, end_str, sizeof(end_str));
+        ESP_LOGI(TAG, "  IP Pool: %s - %s", start_str, end_str);
+    } else {
+        ESP_LOGW(TAG, "  IP Pool: could not be read back");
+    }
 
     *out_br_netif = br_netif;
 }
@@ -286,6 +323,9 @@ void app_main(void)
     ESP_LOGI(TAG, "Web Interface: http://192.168.5.1");
     ESP_LOGI(TAG, "Network: 192.168.5.0/24");
     ESP_LOGI(TAG, "Gateway: 192.168.5.1");
-    ESP_LOGI(TAG, "DHCP Pool: 192.168.5.2-254");
+    // Hardcoded literals here would be a second place to get this wrong; the
+    // range setup_bridge() read back and logged is the authoritative one.
+    ESP_LOGI(TAG, "DHCP Pool: %s - %s (see \"IP Pool\" above for what took effect)",
+             DHCP_START, DHCP_END);
     ESP_LOGI(TAG, "====================================\n");
 }

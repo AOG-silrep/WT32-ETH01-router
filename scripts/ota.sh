@@ -26,6 +26,19 @@ IMAGE="build/wt32-bridge.bin"
 
 [[ -f "$IMAGE" ]] || { echo "ota: no $IMAGE - run idf.py build first" >&2; exit 1; }
 
+# Refuse to flash an image older than the sources it was built from. A failed
+# build leaves the previous binary in place, and flashing that reports success
+# while testing the change you did not make - which is exactly what happened
+# once, and cost a measurement round before anyone noticed the device was
+# running last build's code.
+NEWER="$(find main sdkconfig partitions.csv -newer "$IMAGE" 2>/dev/null | head -5)"
+if [[ -n "$NEWER" ]]; then
+  echo "ota: $IMAGE is older than:" >&2
+  printf '  %s\n' $NEWER >&2
+  echo "ota: build failed or was not run - refusing to flash a stale image" >&2
+  exit 1
+fi
+
 before="$(curl -s --max-time 10 -u "${USER}:${PASS}" "http://${HOST}/api/system")"
 echo "ota: before - $(jq -r '"v\(.version), up \(.uptime_s)s, \(.cpu_freq_mhz)MHz"' <<<"$before")"
 echo "ota: uploading $(stat -c%s "$IMAGE") bytes"
