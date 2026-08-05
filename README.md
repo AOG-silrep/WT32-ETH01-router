@@ -365,6 +365,11 @@ serial (an ESP32 running the ESP-IDF `iperf` example). Both ends need iperf **2.
 ESP-IDF example does not speak the iperf3 protocol. Credentials come from `BRIDGE_PASS` in
 the environment, never the repo.
 
+A **stock** `iperf` example build makes a poor downlink instrument — it measures its own
+receive path, not the bridge's (see [below](#the-14-mbits-downlink-figure-was-the-test-peer-not-the-bridge)).
+Raise `CONFIG_LWIP_TCP_OOSEQ_MAX_PBUFS` to 12 or more in the peer before trusting
+`down_mbits`.
+
 ```sh
 BRIDGE_PASS=<password> scripts/gate.py --label my-change --runs 3
 BRIDGE_PASS=<password> scripts/smoke.sh
@@ -415,33 +420,37 @@ reboots with the default WiFi AP and `admin`/`admin` web login restored.
 - `scripts/` — measurement gate, smoke tests, OTA helper (see [Diagnostics harness](#diagnostics-harness))
 - `bench/` — recorded gate runs; `00-baseline` is the reference
 
-## Known limitation: slow TCP downlink
+## The ~1.4 Mbit/s downlink figure was the test peer, not the bridge
 
-**Wired → WiFi TCP runs at roughly 1.4 Mbit/s**, against 27 Mbit/s in the other direction.
-This is a real, reproducible fault in the bridge and is not yet fixed.
+Earlier revisions of this file listed a slow wired → WiFi TCP downlink (~1.4 Mbit/s against
+27 Mbit/s uplink) as a known fault in the bridge. **It is not.** It was a property of the
+measuring instrument: the WiFi peer, a stock ESP-IDF `examples/wifi/iperf` build, cannot
+buffer out-of-order TCP data — `CONFIG_LWIP_TCP_OOSEQ_MAX_PBUFS` defaults to 4 — so every
+lost segment costs it the whole window behind it.
 
-What is known, all measured (`bench/`):
+Raising that one setting on the *peer* to 12, changing nothing on this device, took the same
+measurement from **0.58 to 7.47 Mbit/s** over the same board and the same path.
+Retransmissions fell 39% → 4.4% and the median repair time 684 ms → 10 ms; nothing about the
+path changed. A Linux laptop as the receiving client gets **11.1 Mbit/s** through this bridge
+on a radio link 47 dB weaker.
 
-- It is the bridge, not the client. The same WiFi client, same iperf binary, gets
-  64 Mbit/s with zero retransmits through an ordinary access point.
-- It is specific to TCP. Paced UDP over the identical path is clean at 20 Mbit/s, and ICMP
-  through it loses nothing and arrives in order *while a TCP transfer is collapsing on the
-  same path*.
-- It is not a rate mismatch between the fast wired side and the slower WiFi side. TCP paced
-  down to 5 Mbit/s — far below WiFi capacity — collapses just the same.
-- The bridge forwards what it is handed: its own per-client counters show 1.39 Mb/s in
-  against 1.37 Mb/s out.
-- Ruled out by measurement, each tried and reverted: WiFi TX buffer count, block-ack window
-  size, Ethernet DMA buffer count, TCP segment size down to 200 bytes, concurrent reverse
-  traffic, and this project's own accounting hooks (removed entirely — no change).
+Consequences for anyone reading numbers here:
 
-The untested suspect is the lwIP bridge layer itself (`esp_netif_br_glue` / `bridgeif`).
-Uplink, UDP, ICMP and anything terminating on the device are all unaffected, so a deployment
-that mostly sends *from* the WiFi side — which is the common AgOpenGPS direction — will not
-notice it.
+- **`bench/00-baseline` through `bench/07-fwd-drop-counters` understate the downlink by
+  roughly an order of magnitude.** Their `down_mbits` measures the peer's receive path. The
+  uplink, latency, loss and CPU figures in those runs are unaffected.
+- If you keep using an ESP32 peer, rebuild it with `CONFIG_LWIP_TCP_OOSEQ_MAX_PBUFS` at 12 or
+  more and record which build produced any downlink number you quote.
+- The nine bridge-side config changes tried against this — WiFi TX buffers, block-ack window,
+  Ethernet DMA buffers, TCP segment size, this project's own accounting hooks — were all
+  aimed at the wrong component. Don't re-run them; see the doc for the full list.
 
-Full investigation brief, including the rig, every hypothesis already eliminated and how,
-and the experiment to run next: [docs/downlink-fault.md](docs/downlink-fault.md).
+Still open, and much smaller: the bridge does lose some frames on the eth → air path (4.4% of
+segments retransmit even with a healthy receiver), somewhere above the peer's MAC and below
+its TCP. It is worth chasing only if the remaining gap to a laptop's ~10 Mbit/s matters.
+
+Full evidence trail — rig, packet capture, every hypothesis eliminated and how:
+[docs/downlink-fault.md](docs/downlink-fault.md).
 
 ## Troubleshooting high/jittery ping latency
 
