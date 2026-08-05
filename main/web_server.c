@@ -1535,6 +1535,27 @@ httpd_handle_t web_server_start(void)
     // Keep comfortable headroom over the actual count for that reason.
     config.max_uri_handlers = 20;
 
+    // Without this the server stops listening the moment every session slot is
+    // taken: httpd_server() only adds listen_fd to the select set when a slot is
+    // free, so a full server does not refuse connections so much as stop hearing
+    // them, and the client sits there until it times out. The dashboard polls
+    // three endpoints a second over keep-alive, and a browser opens up to six
+    // connections per host, so it reaches that state on its own within seconds -
+    // measured: with four connections held, every further request failed to
+    // connect at all, and all four recovered the instant they were released.
+    // From the page it reads as "Lost connection to bridge", which is what sent
+    // this looking at the network first.
+    //
+    // With it, a full server closes its least recently used session to admit the
+    // new connection. Idle keep-alive sockets are exactly what that picks off.
+    config.lru_purge_enable = true;
+    // Purging still costs a connection, so leave enough slots that an ordinary
+    // one or two tabs never trigger it. The cap is CONFIG_LWIP_MAX_SOCKETS - 3
+    // (httpd_main.c reserves three for the listener, the control socket pair,
+    // and accept headroom), so this and the sdkconfig bump to 16 go together -
+    // raising this alone makes httpd_start() fail with ESP_ERR_INVALID_ARG.
+    config.max_open_sockets = 13;
+
     esp_err_t err = httpd_start(&server, &config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start failed: %s", esp_err_to_name(err));
