@@ -9,6 +9,7 @@
 #include "client_track.h"
 #include "dhcp_server.h"
 #include "sys_monitor.h"
+#include "eth_link.h"
 #include "log_buf.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
@@ -1183,9 +1184,16 @@ static esp_err_t system_get_handler(httpd_req_t *req)
     uint32_t wifi_tx_total = 0, wifi_tx_failed = 0;
     client_track_get_wifi_tx(&wifi_tx_total, &wifi_tx_failed);
 
+    eth_link_status_t eth;
+    eth_link_get_status(&eth);
+
     const esp_app_desc_t *app_desc = esp_app_get_description();
 
-    char resp[640];
+    // 768 rather than 640: the eth_* fields below add ~130 bytes to a worst
+    // case that was already around 450, which left too little headroom to
+    // trust. Overflow is caught (resp_send_json sends a 500, and smoke.sh
+    // runs this endpoint through jq -e) but it shouldn't be run this close.
+    char resp[768];
     int len = resp_append(resp, sizeof(resp), 0,
                           "{\"uptime_s\":%llu,\"free_heap\":%u,\"min_free_heap\":%u,"
                           "\"cpu_pct\":[%u,%u],\"cpu_freq_mhz\":%u,\"net_rx_bps\":%u,\"net_tx_bps\":%u,"
@@ -1194,6 +1202,8 @@ static esp_err_t system_get_handler(httpd_req_t *req)
                           "\"fwd_drop_eth_in\":%u,\"fwd_drop_wifi_in\":%u,"
                           "\"fwd_drop_eth_out\":%u,\"fwd_drop_wifi_out\":%u,"
                           "\"wifi_tx_total\":%u,\"wifi_tx_failed\":%u,"
+                          "\"eth_link\":%s,\"eth_speed_mbit\":%u,\"eth_duplex\":\"%s\","
+                          "\"eth_autoneg\":%s,\"eth_flaps\":%u,\"eth_change_s\":%u,"
                           "\"version\":\"%s\"}",
                           (unsigned long long)(esp_timer_get_time() / 1000000ULL),
                           (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(),
@@ -1203,6 +1213,12 @@ static esp_err_t system_get_handler(httpd_req_t *req)
                           (unsigned)fwd.eth_in, (unsigned)fwd.wifi_in,
                           (unsigned)fwd.eth_out, (unsigned)fwd.wifi_out,
                           (unsigned)wifi_tx_total, (unsigned)wifi_tx_failed,
+                          // Fixed internal literals, so no json_append_escaped()
+                          // needed - that helper is for device-supplied strings.
+                          eth.up ? "true" : "false", (unsigned)eth.speed_mbit,
+                          eth.up ? (eth.full_duplex ? "full" : "half") : "",
+                          eth.autoneg ? "true" : "false",
+                          (unsigned)eth.flaps, (unsigned)eth.since_change_s,
                           app_desc->version);
     if (!resp_send_json(req, resp, len, sizeof(resp))) {
         return ESP_FAIL;

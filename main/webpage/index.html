@@ -48,7 +48,7 @@
   #ota-msg { margin-top: 0.6em; font-size: 0.9em; }
   #ota-msg.error { color: #b00020; }
   #ota-msg.ok { color: #0a7a2f; }
-  #sys-drops.warn { color: #b00020; font-weight: 600; }
+  td.warn { color: #b00020; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -107,6 +107,16 @@
     <tr><th>Network (up / down)</th><td id="sys-net">&hellip;</td></tr>
     <tr><th title="Frames/sec, all protocols (TCP, UDP, ARP, etc.) combined.">Packets (up / down)</th><td id="sys-pps" title="Frames/sec, all protocols (TCP, UDP, ARP, etc.) combined.">&hellip;</td></tr>
     <tr><th title="Missed bandwidth samples since boot — a rising count means traffic accounting is falling behind under load. Does not mean the bridge is actually dropping network packets.">Unreported traffic</th><td id="sys-drops" title="Missed bandwidth samples since boot — a rising count means traffic accounting is falling behind under load. Does not mean the bridge is actually dropping network packets.">&hellip;</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="panel">
+<h2>Diagnostics</h2>
+<table>
+  <tbody>
+    <tr><th title="What the Ethernet port negotiated with whatever is plugged into it. 100 Mbit full duplex is normal — a 10 Mbit or half-duplex link still passes traffic, but slowly, and usually means a damaged, miswired, or over-long cable rather than a WiFi problem.">Ethernet port</th><td id="eth-link" title="What the Ethernet port negotiated with whatever is plugged into it. 100 Mbit full duplex is normal — a 10 Mbit or half-duplex link still passes traffic, but slowly, and usually means a damaged, miswired, or over-long cable rather than a WiFi problem.">&hellip;</td></tr>
+    <tr><th title="How many times the Ethernet link has dropped since boot, and how long it has held its current state. A count that keeps climbing points at a loose connector or a cable working itself apart under vibration.">Link changes</th><td id="eth-flaps" title="How many times the Ethernet link has dropped since boot, and how long it has held its current state. A count that keeps climbing points at a loose connector or a cable working itself apart under vibration.">&hellip;</td></tr>
   </tbody>
 </table>
 </div>
@@ -504,6 +514,19 @@ async function refreshSystem() {
   const dropsEl = document.getElementById('sys-drops');
   dropsEl.textContent = s.traffic_drops;
   dropsEl.classList.toggle('warn', s.traffic_drops > 0);
+
+  // A link that came up at 10 Mbit or half duplex is flagged the same as one
+  // that is down, because it is just as much a cable fault - it simply fails
+  // by being slow instead of by being absent, which is the harder one to spot.
+  const linkEl = document.getElementById('eth-link');
+  const degraded = s.eth_speed_mbit < 100 || s.eth_duplex !== 'full';
+  linkEl.textContent = s.eth_link
+    ? s.eth_speed_mbit + ' Mbit ' + s.eth_duplex + ' duplex'
+    : 'Down — no cable or no link';
+  linkEl.classList.toggle('warn', !s.eth_link || degraded);
+  document.getElementById('eth-flaps').textContent =
+    s.eth_flaps + ' (' + formatUptime(s.eth_change_s) + ' in this state)';
+
   document.getElementById('fw-version').textContent = s.version ? 'Rev ' + s.version : '';
 }
 

@@ -6,6 +6,7 @@
 #include "client_track.h"
 #include "dhcp_server.h"
 #include "sys_monitor.h"
+#include "eth_link.h"
 #include "log_buf.h"
 #include "esp_console.h"
 #include "argtable3/argtable3.h"
@@ -139,6 +140,9 @@ static int cmd_sysinfo(int argc, char **argv)
     uint32_t rx_pps = 0, tx_pps = 0;
     client_track_get_traffic_pps(&rx_pps, &tx_pps);
 
+    eth_link_status_t eth;
+    eth_link_get_status(&eth);
+
     const esp_app_desc_t *app_desc = esp_app_get_description();
 
     printf("Version:        %s\n", app_desc->version);
@@ -149,6 +153,14 @@ static int cmd_sysinfo(int argc, char **argv)
     printf("CPU freq:       %u MHz\n", (unsigned)sys_monitor_get_cpu_freq_mhz());
     printf("Net traffic:    rx %u B/s (%u pkt/s), tx %u B/s (%u pkt/s)\n",
            (unsigned)rx_total, (unsigned)rx_pps, (unsigned)tx_total, (unsigned)tx_pps);
+    if (eth.up) {
+        printf("Eth port:       up, %u Mbit %s duplex\n",
+               (unsigned)eth.speed_mbit, eth.full_duplex ? "full" : "half");
+    } else {
+        printf("Eth port:       DOWN\n");
+    }
+    printf("Eth link:       %u flap%s, %u s in this state\n",
+           (unsigned)eth.flaps, eth.flaps == 1 ? "" : "s", (unsigned)eth.since_change_s);
     printf("Clients:        %d\n", count);
     printf("Traffic drops:  %u\n", (unsigned)client_track_get_traffic_drops());
     return 0;

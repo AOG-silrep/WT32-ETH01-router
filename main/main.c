@@ -24,6 +24,7 @@
 #include "dhcp_server.h"
 #include "client_track.h"
 #include "sys_monitor.h"
+#include "eth_link.h"
 #include "auth_cfg.h"
 #include "web_server.h"
 #include "serial_console.h"
@@ -239,6 +240,11 @@ void app_main(void)
     esp_eth_handle_t eth_handle;
     eth_init(&eth_netif, &eth_handle);
     ESP_ERROR_CHECK(esp_eth_ioctl(eth_handle, ETH_CMD_S_MAC_ADDR, common_mac));
+
+    // Ethernet port state (link, speed, duplex) for the web UI and console.
+    // Has to be registered before esp_eth_start() below, or the first
+    // link-up is missed and the port reads as down until the cable moves.
+    ESP_ERROR_CHECK(eth_link_init());
 
     // Initialize WiFi AP
     esp_netif_t *wifi_netif;
