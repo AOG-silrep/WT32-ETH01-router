@@ -106,7 +106,7 @@
     <tr><th title="Measured from the CPU cycle counter timed against esp_timer_get_time(), independent of the configured clock setting.">CPU speed</th><td id="sys-cpu-freq" title="Measured from the CPU cycle counter timed against esp_timer_get_time(), independent of the configured clock setting.">&hellip;</td></tr>
     <tr><th>Network (up / down)</th><td id="sys-net">&hellip;</td></tr>
     <tr><th title="Frames/sec, all protocols (TCP, UDP, ARP, etc.) combined.">Packets (up / down)</th><td id="sys-pps" title="Frames/sec, all protocols (TCP, UDP, ARP, etc.) combined.">&hellip;</td></tr>
-    <tr><th title="Missed bandwidth samples since boot — a rising count means traffic accounting is falling behind under load. Does not mean the bridge is actually dropping network packets.">Unreported traffic</th><td id="sys-drops" title="Missed bandwidth samples since boot — a rising count means traffic accounting is falling behind under load. Does not mean the bridge is actually dropping network packets.">&hellip;</td></tr>
+    <tr><th title="Missed bandwidth samples since boot — a rising count means traffic accounting is falling behind under load. Does not mean the bridge is dropping network packets; 'Frames dropped' in the Diagnostics panel is that number.">Unreported traffic</th><td id="sys-drops" title="Missed bandwidth samples since boot — a rising count means traffic accounting is falling behind under load. Does not mean the bridge is dropping network packets; 'Frames dropped' in the Diagnostics panel is that number.">&hellip;</td></tr>
   </tbody>
 </table>
 </div>
@@ -117,6 +117,8 @@
   <tbody>
     <tr><th title="What the Ethernet port negotiated with whatever is plugged into it. 100 Mbit full duplex is normal — a 10 Mbit or half-duplex link still passes traffic, but slowly, and usually means a damaged, miswired, or over-long cable rather than a WiFi problem.">Ethernet port</th><td id="eth-link" title="What the Ethernet port negotiated with whatever is plugged into it. 100 Mbit full duplex is normal — a 10 Mbit or half-duplex link still passes traffic, but slowly, and usually means a damaged, miswired, or over-long cable rather than a WiFi problem.">&hellip;</td></tr>
     <tr><th title="How many times the Ethernet link has dropped since boot, and how long it has held its current state. A count that keeps climbing points at a loose connector or a cable working itself apart under vibration.">Link changes</th><td id="eth-flaps" title="How many times the Ethernet link has dropped since boot, and how long it has held its current state. A count that keeps climbing points at a loose connector or a cable working itself apart under vibration.">&hellip;</td></tr>
+    <tr><th title="Frames this device took in and then could not pass on — either the bridge's input queue was full, or the port it was headed out of had no buffer left. A few under heavy load are normal and cost nothing visible; a count climbing while you watch it means the bridge is shedding traffic. This is the forwarding counter — 'Unreported traffic' in the System panel is not.">Frames dropped</th><td id="fwd-drops" title="Frames this device took in and then could not pass on — either the bridge's input queue was full, or the port it was headed out of had no buffer left. A few under heavy load are normal and cost nothing visible; a count climbing while you watch it means the bridge is shedding traffic. This is the forwarding counter — 'Unreported traffic' in the System panel is not.">&hellip;</td></tr>
+    <tr><th title="Frames handed to the WiFi radio since boot, and how many of those it gave up on after exhausting its 802.11 retries. Those are lost on air, and no other counter can see them — nothing above the driver is told a frame failed. A rising share points at range, interference, or a client that has gone away.">Radio delivery</th><td id="wifi-tx" title="Frames handed to the WiFi radio since boot, and how many of those it gave up on after exhausting its 802.11 retries. Those are lost on air, and no other counter can see them — nothing above the driver is told a frame failed. A rising share points at range, interference, or a client that has gone away.">&hellip;</td></tr>
   </tbody>
 </table>
 </div>
@@ -499,6 +501,27 @@ trafficCanvas.addEventListener('mouseleave', () => {
   drawChart();
 });
 
+// The four forwarding counters answer one question - is this device throwing
+// frames away - so they share a row, and a leg only spends space naming itself
+// once it has something to report. Named by where the frame was going rather
+// than by the in/out the field names use, since that is what a person standing
+// at the machine can act on.
+const fwdDropLegs = [
+  ['fwd_drop_eth_in',   'from Ethernet'],
+  ['fwd_drop_wifi_in',  'from WiFi'],
+  ['fwd_drop_eth_out',  'to Ethernet'],
+  ['fwd_drop_wifi_out', 'to WiFi'],
+];
+
+// Both rows below warn on movement between polls, not on the since-boot total.
+// A total would be wrong twice over: bench/07 recorded 69 forwarding drops
+// during a perfectly healthy 27.9 Mbit/s uplink, which would leave the row red
+// for the rest of the uptime over something nothing noticed, and by the time
+// anyone reads it they cannot tell whether it happened just now or last week.
+// Null until the first sample, so a fresh page never warns on its own baseline.
+let prevFwdDrops = null;
+let prevWifiTxFailed = null;
+
 async function refreshSystem() {
   const res = await fetchWithTimeout('/api/system', {}, 1500);
   const s = await res.json();
@@ -526,6 +549,29 @@ async function refreshSystem() {
   linkEl.classList.toggle('warn', !s.eth_link || degraded);
   document.getElementById('eth-flaps').textContent =
     s.eth_flaps + ' (' + formatUptime(s.eth_change_s) + ' in this state)';
+
+  const fwdTotal = fwdDropLegs.reduce((n, [key]) => n + s[key], 0);
+  const busyLegs = fwdDropLegs.filter(([key]) => s[key] > 0);
+  const fwdEl = document.getElementById('fwd-drops');
+  fwdEl.textContent = busyLegs.length
+    ? busyLegs.map(([key, label]) => s[key] + ' ' + label).join(', ')
+    : 'None';
+  fwdEl.classList.toggle('warn', prevFwdDrops !== null && fwdTotal > prevFwdDrops);
+  prevFwdDrops = fwdTotal;
+
+  // Never the failure count alone - six failures out of ten frames and six out
+  // of a million are different faults, so the denominator always ships with it.
+  // The share is what turns one into the other, so it appears only when there
+  // is a failure for it to size, and only once there are enough frames behind
+  // it for a percentage to mean anything.
+  const txEl = document.getElementById('wifi-tx');
+  let txText = s.wifi_tx_total + ' sent, ' + s.wifi_tx_failed + ' failed';
+  if (s.wifi_tx_failed > 0 && s.wifi_tx_total >= 500) {
+    txText += ' (' + (100 * s.wifi_tx_failed / s.wifi_tx_total).toFixed(2) + '%)';
+  }
+  txEl.textContent = txText;
+  txEl.classList.toggle('warn', prevWifiTxFailed !== null && s.wifi_tx_failed > prevWifiTxFailed);
+  prevWifiTxFailed = s.wifi_tx_failed;
 
   document.getElementById('fw-version').textContent = s.version ? 'Rev ' + s.version : '';
 }
