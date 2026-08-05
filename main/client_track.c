@@ -188,18 +188,34 @@ static client_entry_t *find_or_create_locked(const uint8_t *mac)
 // observed. Ignores 0.0.0.0 (unresolved) so a transient DHCP/ARP lookup
 // miss doesn't clobber a known-good IP or manufacture a spurious "change"
 // on the next successful resolution.
-static void update_client_ip_locked(client_entry_t *e, esp_ip4_addr_t new_ip)
+//
+// The first address learnt for a MAC is logged too. A station's join line says
+// "no address yet" - which is normal, since DHCP only happens once it is
+// associated - and without this nothing ever said otherwise, so the log never
+// showed a client getting an address at all. how names where the address came
+// from, because the four sources are not equally trustworthy: only the sniffed
+// one is the client's own word for what it is using.
+//
+// Returning early when the address is unchanged is load-bearing, not just
+// tidiness: account_traffic() reaches this once per accounted frame, and the
+// formatting below must not run on that path.
+static void update_client_ip_locked(client_entry_t *e, esp_ip4_addr_t new_ip, const char *how)
 {
-    if (new_ip.addr == 0) {
+    if (new_ip.addr == 0 || new_ip.addr == e->ip.addr) {
         return;
     }
-    if (e->ip.addr != 0 && e->ip.addr != new_ip.addr) {
-        char old_str[16], new_str[16];
-        esp_ip4addr_ntoa(&e->ip, old_str, sizeof(old_str));
-        esp_ip4addr_ntoa(&new_ip, new_str, sizeof(new_str));
-        ESP_LOGW(TAG, "client %02x:%02x:%02x:%02x:%02x:%02x changed IP: %s -> %s",
+    char new_str[16];
+    esp_ip4addr_ntoa(&new_ip, new_str, sizeof(new_str));
+    if (e->ip.addr == 0) {
+        ESP_LOGI(TAG, "client %02x:%02x:%02x:%02x:%02x:%02x has address %s (%s)",
                  e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5],
-                 old_str, new_str);
+                 new_str, how);
+    } else {
+        char old_str[16];
+        esp_ip4addr_ntoa(&e->ip, old_str, sizeof(old_str));
+        ESP_LOGW(TAG, "client %02x:%02x:%02x:%02x:%02x:%02x changed IP: %s -> %s (%s)",
+                 e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5],
+                 old_str, new_str, how);
     }
     e->ip = new_ip;
 }
@@ -230,7 +246,7 @@ static void account_traffic(const uint8_t *mac, bool is_wifi, uint16_t bytes, bo
             // the accounting task for nothing. In steady state the address
             // never changes and this costs one comparison.
             bool ip_is_new = (e->ip.addr != observed_ip->addr);
-            update_client_ip_locked(e, *observed_ip);
+            update_client_ip_locked(e, *observed_ip, "seen in its own traffic");
 
             // Tell the DHCP server what this client is really using, so the
             // mapping it keeps in flash is the client's actual address rather
@@ -486,7 +502,7 @@ static void on_client_ip_assigned(void *arg, esp_event_base_t base, int32_t id, 
         // task), which would otherwise re-fire this event with the stale
         // leased address and stomp a correctly observed real IP.
         if (e->ip.addr == 0) {
-            update_client_ip_locked(e, evt->ip);
+            update_client_ip_locked(e, evt->ip, "leased by the DHCP server");
         }
         if (evt->hostname[0] != '\0') {
             strlcpy(e->name, evt->hostname, sizeof(e->name));
@@ -620,16 +636,19 @@ static void client_track_tick(void)
     // it takes priority, since the lease table can go stale for clients
     // that re-address themselves without renewing.
     esp_netif_pair_mac_ip_t pairs[CLIENT_TRACK_MAX_CLIENTS];
+    bool from_lease[CLIENT_TRACK_MAX_CLIENTS];   // which of the two answered, for the log
     for (int i = 0; i < n; i++) {
         memcpy(pairs[i].mac, macs[i], 6);
         pairs[i].ip.addr = 0;
+        from_lease[i] = false;
     }
     if (n > 0) {
         for (int i = 0; i < n; i++) {
             // dhcp_server.c rather than esp_netif_dhcps_get_clients_by_mac():
             // that one only answers for ESP-IDF's own server, which this
             // device no longer runs (see setup_bridge() in main.c).
-            if (!dhcp_server_lookup_ip(pairs[i].mac, &pairs[i].ip)) {
+            from_lease[i] = dhcp_server_lookup_ip(pairs[i].mac, &pairs[i].ip);
+            if (!from_lease[i]) {
                 esp_netif_arp_get_client_by_mac(s_br_netif, &pairs[i]);
             }
         }
@@ -642,7 +661,8 @@ static void client_track_tick(void)
     for (int i = 0; i < n; i++) {
         client_entry_t *e = find_or_create_locked(macs[i]);
         if (e && e->ip.addr == 0) {
-            update_client_ip_locked(e, pairs[i].ip);
+            update_client_ip_locked(e, pairs[i].ip,
+                                    from_lease[i] ? "from the lease table" : "from the ARP cache");
         }
     }
     if (have_sta_list) {
