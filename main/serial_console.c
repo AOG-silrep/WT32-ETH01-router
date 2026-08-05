@@ -159,7 +159,7 @@ static int cmd_sysinfo(int argc, char **argv)
     } else {
         printf("Eth port:       DOWN\n");
     }
-    printf("Eth link:       %u flap%s, %u s in this state\n",
+    printf("Eth link:       %u flap%s, last change %u s ago\n",
            (unsigned)eth.flaps, eth.flaps == 1 ? "" : "s", (unsigned)eth.since_change_s);
     printf("Clients:        %d\n", count);
     printf("Traffic drops:  %u\n", (unsigned)client_track_get_traffic_drops());

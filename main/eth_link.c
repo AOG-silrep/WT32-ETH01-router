@@ -85,7 +85,7 @@ esp_err_t eth_link_init(void)
     if (s_mutex == NULL) {
         return ESP_ERR_NO_MEM;
     }
-    // Seeded now so "time in this state" counts from boot rather than from
+    // Seeded now so the "last change" age counts from boot rather than from
     // the epoch on a device that never sees a cable.
     s_change_us = esp_timer_get_time();
 

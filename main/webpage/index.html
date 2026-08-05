@@ -49,6 +49,9 @@
   #ota-msg.error { color: #b00020; }
   #ota-msg.ok { color: #0a7a2f; }
   td.warn { color: #b00020; font-weight: 600; }
+  /* Short enough to never need the panel's full width, so pinning it to one
+     line cannot push the table wider than the panel on a phone. */
+  #eth-flaps { white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -548,7 +551,7 @@ async function refreshSystem() {
     : 'Down — no cable or no link';
   linkEl.classList.toggle('warn', !s.eth_link || degraded);
   document.getElementById('eth-flaps').textContent =
-    s.eth_flaps + ' (' + formatUptime(s.eth_change_s) + ' in this state)';
+    s.eth_flaps + ' (' + formatUptime(s.eth_change_s) + ' ago)';
 
   const fwdTotal = fwdDropLegs.reduce((n, [key]) => n + s[key], 0);
   const busyLegs = fwdDropLegs.filter(([key]) => s[key] > 0);
