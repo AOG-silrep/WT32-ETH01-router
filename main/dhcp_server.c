@@ -1274,6 +1274,8 @@ int dhcp_server_get_leases(dhcp_lease_info_t *out, int max)
                                   ? (uint32_t)((e->expires_us - now) / 1000000)
                                   : 0;
         out[n].boots_since_seen = seen_this_boot(e) ? 0 : (s_boot_seq - e->last_seen_seq);
+        out[n].saved_ip.addr = e->saved_ip;
+        out[n].saved_observed_ip.addr = e->saved_observed_ip;
         out[n].stored = (e->saved_ip == e->ip &&
                          e->saved_observed_ip == e->observed_ip);
         n++;

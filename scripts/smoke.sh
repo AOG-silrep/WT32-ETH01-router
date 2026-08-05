@@ -43,20 +43,34 @@ code() { curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$@"; }
 echo "smoke: ${HOST} as ${USER}"
 
 # --- pages ------------------------------------------------------------------
-for path in / /admin /logs; do
+for path in / /admin /logs /leases; do
   check "GET ${path}" 200 "$(code "${AUTH[@]}" "http://${HOST}${path}")"
 done
 
 # --- JSON endpoints ---------------------------------------------------------
 # Piped through jq -e, so malformed JSON fails here rather than silently in a
 # browser. This is the check that would catch a response-buffer overflow.
-for path in /api/status /api/clients /api/system "/api/logs?since=0"; do
+for path in /api/status /api/clients /api/system /api/leases "/api/logs?since=0"; do
   if curl -s --max-time 10 "${AUTH[@]}" "http://${HOST}${path}" | jq -e . >/dev/null 2>&1; then
     check "GET ${path} parses" ok ok
   else
     check "GET ${path} parses" ok bad
   fi
 done
+
+# /api/leases is the one list endpoint that returns an object rather than a bare
+# array, and its table can hold twice as many entries as /api/clients - so the
+# shape is checked explicitly. A truncated response would have failed to parse
+# above; this catches a field going missing while the JSON stays valid.
+if curl -s --max-time 10 "${AUTH[@]}" "http://${HOST}/api/leases" \
+     | jq -e '(.max|type=="number") and (.restored|type=="number")
+              and (.leases|type=="array")
+              and (.leases|all(has("mac") and has("saved_ip") and has("stored")))' \
+     >/dev/null 2>&1; then
+  check "GET /api/leases shape" ok ok
+else
+  check "GET /api/leases shape" ok bad
+fi
 
 # /api/client/history needs a real client, so it is driven off whoever the
 # device currently lists rather than a hardcoded MAC.

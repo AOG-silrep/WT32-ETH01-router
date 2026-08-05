@@ -29,6 +29,13 @@ typedef struct {
     // is not measurable here.
     uint32_t boots_since_seen;
     bool stored;            // true once this mapping is committed to NVS
+    // What flash currently holds for this MAC, as of the last successful
+    // commit - not what the live fields above say. While a change is waiting
+    // out the save debounce the two differ, and that difference is the whole
+    // point: a client that just took a new address still has the old one
+    // stored, and would come back to it if the device lost power now.
+    esp_ip4_addr_t saved_ip;           // ip as last committed; 0 if never
+    esp_ip4_addr_t saved_observed_ip;  // observed_ip as last committed
 } dhcp_lease_info_t;
 
 // Starts the DHCP server for the bridge LAN: restores the saved MAC -> IP
@@ -78,7 +85,8 @@ bool dhcp_server_lookup_ip(const uint8_t mac[6], esp_ip4_addr_t *out_ip);
 
 // Copies up to max lease entries into out, including reservations restored
 // from flash that no client has claimed yet (those report expires_in_s 0).
-// Returns the number written. Thread-safe; intended for the serial console.
+// Returns the number written. Thread-safe; intended for the serial console and
+// the web UI's leases page.
 int dhcp_server_get_leases(dhcp_lease_info_t *out, int max);
 
 // Number of reservations read back from NVS at startup, for the boot log.

@@ -10,6 +10,7 @@ An ESP-IDF firmware project that turns a [WT32-ETH01](https://en.wireless-tag.co
 - Web UI (`main/webpage/index.html`) for WiFi configuration and live status
 - Connected-client tracking and per-device traffic graphing
 - System monitor (heap, uptime, etc.) surfaced on the web UI, refreshed every second
+- DHCP lease table viewable in a browser (`/leases`), live state alongside what is in flash
 - Device log viewable in a browser (`/logs`), not just over serial
 - Configurable WiFi channel (1, 6, or 11)
 
@@ -64,6 +65,9 @@ b8:27:eb:9a:1f:04  192.168.5.60            - now           manual (leased 192.16
 `reserved` is a mapping held for a client that isn't currently here. It is still that
 client's address when it returns, and it is only given to someone else if the pool runs
 out. `factory-reset yes` erases the table along with the rest of the saved config.
+
+The same table is on the web UI at `/leases` — see [DHCP leases](#dhcp-leases) below, which
+adds what is actually committed to flash for each MAC.
 
 ### Reservations are not expired on a timer
 
@@ -141,6 +145,22 @@ between bytes/s and packets/s:
 
 ![Connected clients table with a per-client traffic graph](docs/client-traffic.png)
 
+### DHCP leases
+
+"DHCP leases →" in the header opens `/leases`, the same table the `leases` console command
+prints — one row per MAC, with the state wording deliberately identical so the two never
+disagree. It adds a **Saved (NVS)** column: the address currently committed to flash for that
+MAC, which is what the client gets back after a reboot.
+
+That is usually the address it is already on, and the column is greyed out when it is. It
+turns amber when the two differ — a client that has just taken a new address, whose old one
+is still what flash would hand back. Lease writes are batched, so a row can briefly read
+`unsaved` before the two agree again; a row that stays that way means the write is failing.
+
+Staleness is in boots rather than hours for the reason described under
+[Reservations are not expired on a timer](#reservations-are-not-expired-on-a-timer): with no
+clock across a power cycle there is no elapsed time to report, only ordering.
+
 ### Device log
 
 "Device log →" in the header opens `/logs`, a live tail of the same `ESP_LOG` output the
@@ -211,10 +231,11 @@ still the default. `GET`s need nothing else; the four `POST`s need the `Content-
 
 | Route | Method | Body / query | Returns |
 | --- | --- | --- | --- |
-| `/` `/admin` `/logs` | GET | — | the three HTML pages |
+| `/` `/admin` `/logs` `/leases` | GET | — | the four HTML pages |
 | `/api/status` | GET | — | `{ssid, channel}` |
 | `/api/system` | GET | — | see the table below |
 | `/api/clients` | GET | — | array, one object per client |
+| `/api/leases` | GET | — | `{max, restored, leases[]}` — the DHCP table, live and as saved |
 | `/api/client/history?mac=&since=` | GET | `mac` required, `since` optional | fine-grained traffic history |
 | `/api/logs?since=` | GET | `since` optional | log lines newer than the cursor |
 | `/api/logs/level` | POST | `{"level":"info"}` | sets the capture level |

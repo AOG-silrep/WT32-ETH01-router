@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgOpen router &ndash; DHCP leases</title>
+<style>
+  body { font-family: sans-serif; max-width: 1100px; margin: 2em auto; padding: 0 1em; color: #222; }
+  h1 { font-size: 1.3em; }
+  h1 a { font-size: 0.7em; font-weight: normal; color: #2a78d6; text-decoration: none; margin-left: 0.6em; }
+  h1 a:hover { text-decoration: underline; }
+  #banner { display: none; background: #b00020; color: #fff; padding: 0.6em 1em; border-radius: 4px; margin-bottom: 1em; }
+  #banner.show { display: block; }
+  .panel { border: 2px solid #888; border-radius: 4px; padding: 0.8em; margin-top: 1em; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
+  th, td { text-align: left; padding: 0.4em 0.5em; border-bottom: 1px solid #ddd; white-space: nowrap; }
+  th { border-bottom: 1px solid #bbb; }
+  td.mac, td.ip, td.saved { font-family: monospace; }
+  td.num { text-align: right; font-family: monospace; }
+  /* Not seen since the device booted: the same grey the dashboard gives an
+     idle client, for the same reason - the row is still true, just not fresh. */
+  tr.stale { color: #999; }
+  /* The saved address only earns attention when it disagrees with the live
+     one; when they match it is confirmation, not news. */
+  td.saved.same { color: #898781; }
+  td.saved.differs { color: #8a4b00; font-weight: 600; }
+  td.saved.none { color: #898781; font-family: sans-serif; font-style: italic; }
+  td.state .unsaved { color: #8a4b00; }
+  #empty { color: #898781; font-size: 0.9em; padding: 1em 0.5em; }
+  #footer { font-size: 0.85em; color: #898781; margin-top: 0.8em; }
+  #footer .note { display: block; margin-top: 0.3em; }
+</style>
+</head>
+<body>
+
+<div id="banner">Lost connection to bridge &mdash; retrying&hellip;</div>
+
+<h1>DHCP leases <a href="/">&larr; Dashboard</a></h1>
+
+<div class="panel">
+  <table>
+    <thead>
+      <tr><th>Name</th><th>MAC</th><th>IP</th><th>Expires</th><th>Seen</th>
+          <th>State</th>
+          <th title="The address committed to flash for this MAC. It is what the client gets back after a reboot, which is not always the address it is on right now.">Saved (NVS)</th></tr>
+    </thead>
+    <tbody id="lease-body"></tbody>
+  </table>
+  <div id="empty">Loading&hellip;</div>
+  <div id="footer"></div>
+</div>
+
+<script>
+// Same Basic Auth realm as the dashboard, so the browser reuses the credentials
+// it already holds and there's no login code here - see check_admin_auth() in
+// web_server.c.
+
+// Mirrors the dashboard's fetchWithTimeout(): plain fetch() can hang for the
+// OS connect timeout when the bridge stops answering without closing the
+// socket, and a 401/403 needs to stop the loop rather than be retried. The
+// bridge delays a second before rejecting credentials it was actually sent, and
+// serves from a single worker task, so a loop that kept retrying with stale
+// credentials would lock everyone out of the whole UI.
+const AUTH_ERROR = Symbol('unauthorized');
+const SETUP_ERROR = Symbol('setup-required');
+
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    if (res.status === 401) throw AUTH_ERROR;
+    if (res.status === 403) throw SETUP_ERROR;
+    return res;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const body = document.getElementById('lease-body');
+const emptyMsg = document.getElementById('empty');
+const footer = document.getElementById('footer');
+
+// These four mirror cmd_leases() in serial_console.c line for line. The console
+// and this page describe the same table, and a reader comparing the two should
+// never have to work out whether a wording difference means a state difference.
+
+// An address the client set for itself is what it is actually on, so that is
+// the one to lead with; the lease it ignored goes in the state column, where it
+// explains why the two differ.
+function liveIp(l) {
+  return l.observed_ip || l.ip;
+}
+
+function stateText(l) {
+  let state;
+  if (l.observed_ip && l.ip) {
+    state = 'manual (leased ' + l.ip + ')';
+  } else if (l.observed_ip) {
+    state = 'manual';
+  } else if (l.expires_in_s > 0) {
+    state = 'active';
+  } else {
+    // No time left: a reservation held for a client that isn't here - restored
+    // from flash, or released on shutdown. It is still the address that client
+    // gets back when it returns.
+    state = 'reserved';
+  }
+  return state;
+}
+
+function expiresText(l) {
+  // A manual address has no lease clock running against it, so a countdown
+  // there would be about an address the client isn't using.
+  if (!l.observed_ip && l.expires_in_s > 0) return l.expires_in_s + 's';
+  return '–';
+}
+
+// Reclaim order, not a clock: this device cannot measure elapsed time across a
+// power cycle, so staleness is counted in boots that wrote the table rather
+// than in hours. "now" means the client has been heard from since boot, which
+// is what keeps it from being reclaimed.
+function seenText(l) {
+  if (l.boots_since_seen === 0) return 'now';
+  return l.boots_since_seen + ' boot' + (l.boots_since_seen === 1 ? '' : 's') + ' ago';
+}
+
+// Every cell is filled with textContent rather than innerHTML. A hostname is
+// whatever the client claimed it is - the one field here an untrusted device on
+// the network gets to choose - so treating it as markup would let it run script
+// in this authenticated page just by naming itself appropriately.
+function addRow(l) {
+  const row = body.insertRow();
+  if (l.boots_since_seen > 0) row.className = 'stale';
+
+  const name = row.insertCell();
+  name.textContent = l.name || '–';
+
+  const mac = row.insertCell();
+  mac.className = 'mac';
+  mac.textContent = l.mac;
+
+  const ip = row.insertCell();
+  ip.className = 'ip';
+  ip.textContent = liveIp(l) || '–';
+
+  const expires = row.insertCell();
+  expires.className = 'num';
+  expires.textContent = expiresText(l);
+
+  const seen = row.insertCell();
+  seen.textContent = seenText(l);
+
+  const state = row.insertCell();
+  state.className = 'state';
+  state.textContent = stateText(l);
+  if (!l.stored) {
+    // Split out rather than appended to the string so the pending half can be
+    // coloured: the state itself is settled, the saving of it is not.
+    const pending = document.createElement('span');
+    pending.className = 'unsaved';
+    pending.textContent = ', unsaved';
+    pending.title = 'This mapping is not in flash yet. The device batches lease ' +
+                    'writes, so it should land within a few seconds.';
+    state.appendChild(pending);
+  }
+
+  // Same precedence as the live column, applied to what was committed: a saved
+  // self-assigned address supersedes a saved lease.
+  const saved = row.insertCell();
+  const savedIp = l.saved_observed_ip || l.saved_ip;
+  saved.className = 'saved';
+  if (!savedIp) {
+    saved.classList.add('none');
+    saved.textContent = 'not saved';
+  } else {
+    saved.classList.add(savedIp === liveIp(l) ? 'same' : 'differs');
+    saved.textContent = savedIp;
+  }
+}
+
+function render(data) {
+  body.textContent = '';
+  for (const l of data.leases) {
+    addRow(l);
+  }
+
+  emptyMsg.textContent = 'No DHCP leases.';
+  emptyMsg.style.display = data.leases.length ? 'none' : '';
+
+  const n = data.leases.length;
+  footer.textContent = n + ' of ' + data.max + ' slots · ' +
+                       data.restored + ' reservation' + (data.restored === 1 ? '' : 's') +
+                       ' restored from flash at boot.';
+  const note = document.createElement('span');
+  note.className = 'note';
+  note.textContent = 'Staleness is counted in boots, not hours: with no clock ' +
+                     'across a power cycle, the device cannot tell a board ' +
+                     'unplugged for a month from one restarted a second ago. ' +
+                     'Entries are dropped only when the table needs the room, ' +
+                     'oldest generation first.';
+  footer.appendChild(note);
+}
+
+let polling = false;
+let failCount = 0;
+
+async function poll() {
+  if (polling) return;
+  polling = true;
+  try {
+    const res = await fetchWithTimeout('/api/leases', {}, 2000);
+    render(await res.json());
+    failCount = 0;
+    document.getElementById('banner').classList.remove('show');
+  } catch (e) {
+    if (e === SETUP_ERROR) {
+      clearInterval(pollTimer);
+      location.href = '/admin?forced=1';
+      return;
+    }
+    if (e === AUTH_ERROR) {
+      // fetch() replays the same cached credentials and can't raise the
+      // browser's sign-in dialog; only a top-level navigation can, and this
+      // page is served no-store so the reload really hits the network.
+      clearInterval(pollTimer);
+      location.reload();
+      return;
+    }
+    failCount++;
+    if (failCount >= 2) {
+      document.getElementById('banner').classList.add('show');
+    }
+  } finally {
+    polling = false;
+  }
+}
+
+poll();
+// Leases change far more slowly than log lines, and the httpd has a single
+// worker task shared with the dashboard's own polling.
+const pollTimer = setInterval(poll, 3000);
+</script>
+
+</body>
+</html>

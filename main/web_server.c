@@ -7,6 +7,7 @@
 #include "wifi_cfg.h"
 #include "auth_cfg.h"
 #include "client_track.h"
+#include "dhcp_server.h"
 #include "sys_monitor.h"
 #include "log_buf.h"
 #include "esp_wifi.h"
@@ -25,6 +26,8 @@ extern const uint8_t admin_html_start[] asm("_binary_admin_html_start");
 extern const uint8_t admin_html_end[] asm("_binary_admin_html_end");
 extern const uint8_t logs_html_start[] asm("_binary_logs_html_start");
 extern const uint8_t logs_html_end[] asm("_binary_logs_html_end");
+extern const uint8_t leases_html_start[] asm("_binary_leases_html_start");
+extern const uint8_t leases_html_end[] asm("_binary_leases_html_end");
 
 // Pulls a JSON string field's value out of a flat {"key":"value",...}
 // object. Good enough for the small, fixed-shape request bodies this
@@ -979,6 +982,92 @@ static esp_err_t clients_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// Renders an address for JSON, but as an empty string when it is 0. A lease
+// this server never handed out, or a mapping never committed to flash, is an
+// absent address rather than 0.0.0.0 - emitting the sentinel would make the
+// page recognise it, and one missed check would put "0.0.0.0" in front of a
+// reader as if it meant something.
+static const char *ip_or_empty(esp_ip4_addr_t ip, char buf[16])
+{
+    if (ip.addr == 0) {
+        return "";
+    }
+    esp_ip4addr_ntoa(&ip, buf, 16);
+    return buf;
+}
+
+// The DHCP lease table, live state alongside what is committed to flash for the
+// same MAC. Hostnames are not the DHCP server's to keep - it forwards option 12
+// on to client_track.c - so they are joined back on here by MAC, and a lease
+// whose client isn't currently tracked simply has no name.
+static esp_err_t leases_get_handler(httpd_req_t *req)
+{
+    if (!check_admin_auth(req)) {
+        send_auth_error(req);
+        return ESP_OK;
+    }
+    if (auth_cfg_password_is_default()) {
+        send_setup_required(req);
+        return ESP_OK;
+    }
+
+    dhcp_lease_info_t leases[DHCP_SERVER_MAX_LEASES];
+    int count = dhcp_server_get_leases(leases, DHCP_SERVER_MAX_LEASES);
+
+    client_info_t clients[CLIENT_TRACK_MAX_CLIENTS];
+    int client_count = 0;
+    client_track_get_snapshot(clients, CLIENT_TRACK_MAX_CLIENTS, &client_count);
+
+    // 231 bytes is a measured worst-case entry with an empty name - four
+    // 15-character dotted quads, two 10-digit u32s, and the keys - so 240
+    // leaves a little room for a field being added without this being
+    // recalculated. On top of that, the 6x expansion of JSON-escaping a
+    // control character in a hostname: only a currently-tracked client has a
+    // name at all, so that allowance is sized to CLIENT_TRACK_MAX_CLIENTS
+    // rather than to the lease count, which is twice as large.
+    static char resp[DHCP_SERVER_MAX_LEASES * 240 +
+                     CLIENT_TRACK_MAX_CLIENTS * 6 * CLIENT_TRACK_NAME_MAX_LEN + 64];
+    int off = resp_append(resp, sizeof(resp), 0,
+                           "{\"max\":%d,\"restored\":%d,\"leases\":[",
+                           DHCP_SERVER_MAX_LEASES, dhcp_server_get_restored_count());
+    for (int i = 0; i < count && off < sizeof(resp); i++) {
+        dhcp_lease_info_t *l = &leases[i];
+
+        const char *name = "";
+        for (int j = 0; j < client_count; j++) {
+            if (memcmp(clients[j].mac, l->mac, 6) == 0) {
+                name = clients[j].name;
+                break;
+            }
+        }
+
+        char ip_buf[16], observed_buf[16], saved_buf[16], saved_observed_buf[16];
+        off = resp_append(resp, sizeof(resp), off,
+                           "%s{\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"ip\":\"%s\","
+                           "\"observed_ip\":\"%s\",\"expires_in_s\":%u,"
+                           "\"boots_since_seen\":%u,\"stored\":%s,"
+                           "\"saved_ip\":\"%s\",\"saved_observed_ip\":\"%s\",\"name\":\"",
+                           i == 0 ? "" : ",",
+                           l->mac[0], l->mac[1], l->mac[2], l->mac[3], l->mac[4], l->mac[5],
+                           ip_or_empty(l->ip, ip_buf),
+                           ip_or_empty(l->observed_ip, observed_buf),
+                           (unsigned)l->expires_in_s, (unsigned)l->boots_since_seen,
+                           l->stored ? "true" : "false",
+                           ip_or_empty(l->saved_ip, saved_buf),
+                           ip_or_empty(l->saved_observed_ip, saved_observed_buf));
+        // Same untrusted field as in clients_get_handler(): the hostname is
+        // whatever the client called itself in option 12.
+        off = json_append_escaped(resp, sizeof(resp), off, name);
+        off = resp_append(resp, sizeof(resp), off, "\"}");
+    }
+    off = resp_append(resp, sizeof(resp), off, "]}");
+
+    if (!resp_send_json(req, resp, off, sizeof(resp))) {
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
 // Parses "aa:bb:cc:dd:ee:ff" into 6 raw bytes. Uses an unsigned int scratch
 // array rather than scanning directly into mac's uint8_t slots - %hhx support
 // varies across newlib scanf configurations, %x into a wider int does not.
@@ -1139,6 +1228,24 @@ static const char *log_level_name(esp_log_level_t level)
         }
     }
     return "unknown";
+}
+
+static esp_err_t leases_page_get_handler(httpd_req_t *req)
+{
+    if (!check_admin_auth(req)) {
+        send_auth_error(req);
+        return ESP_OK;
+    }
+    if (auth_cfg_password_is_default()) {
+        send_default_creds_redirect(req);
+        return ESP_OK;
+    }
+
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, (const char *)leases_html_start,
+                     leases_html_end - leases_html_start - 1);
+    return ESP_OK;
 }
 
 static esp_err_t logs_page_get_handler(httpd_req_t *req)
@@ -1410,7 +1517,7 @@ httpd_handle_t web_server_start(void)
     // httpd_register_uri_handler()'s return value is not checked - overshooting
     // the cap silently drops whichever routes came last, with no error logged.
     // Keep comfortable headroom over the actual count for that reason.
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 20;
 
     esp_err_t err = httpd_start(&server, &config);
     if (err != ESP_OK) {
@@ -1427,6 +1534,8 @@ httpd_handle_t web_server_start(void)
     const httpd_uri_t history_uri = {.uri = "/api/client/history", .method = HTTP_GET, .handler = client_history_get_handler};
     const httpd_uri_t system_uri = {.uri = "/api/system", .method = HTTP_GET, .handler = system_get_handler};
     const httpd_uri_t ota_uri = {.uri = "/api/ota", .method = HTTP_POST, .handler = ota_post_handler};
+    const httpd_uri_t leases_page_uri = {.uri = "/leases", .method = HTTP_GET, .handler = leases_page_get_handler};
+    const httpd_uri_t leases_uri = {.uri = "/api/leases", .method = HTTP_GET, .handler = leases_get_handler};
     const httpd_uri_t logs_page_uri = {.uri = "/logs", .method = HTTP_GET, .handler = logs_page_get_handler};
     const httpd_uri_t logs_uri = {.uri = "/api/logs", .method = HTTP_GET, .handler = logs_get_handler};
     const httpd_uri_t logs_level_uri = {.uri = "/api/logs/level", .method = HTTP_POST, .handler = logs_level_post_handler};
@@ -1440,6 +1549,8 @@ httpd_handle_t web_server_start(void)
     httpd_register_uri_handler(server, &history_uri);
     httpd_register_uri_handler(server, &system_uri);
     httpd_register_uri_handler(server, &ota_uri);
+    httpd_register_uri_handler(server, &leases_page_uri);
+    httpd_register_uri_handler(server, &leases_uri);
     httpd_register_uri_handler(server, &logs_page_uri);
     httpd_register_uri_handler(server, &logs_uri);
     httpd_register_uri_handler(server, &logs_level_uri);
