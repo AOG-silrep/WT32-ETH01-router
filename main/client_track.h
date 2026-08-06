@@ -127,6 +127,54 @@ esp_err_t client_track_wifi_txdone_init(void);
 // Read as a ratio, never as a bare failure count.
 void client_track_get_wifi_tx(uint32_t *total, uint32_t *failed);
 
+// ---- which port a DHCP client is on ----
+
+// True if the DHCP message this MAC has just sent arrived on the wired port.
+//
+// The DHCP server's socket is bound to the bridge, which is one netif with two
+// ports underneath it, so by the time a request reaches dhcp_server.c there is
+// nothing left in it to say which side of the bridge it came from. The RX
+// wrapper here is the only code that still knows, so it records the port for
+// every DHCP frame it passes on - and only for those, so the ordinary
+// forwarding path pays nothing for this.
+//
+// The obvious objection is that lwIP already knows: bridgeif learns the source
+// MAC of every frame into its forwarding database before delivering it, and
+// bridgeif_fdb_get_dst_ports() is declared in netif/bridgeif.h and would answer
+// this exact question. It was not used, for two reasons, both of which fail
+// silently and both of which fail towards giving a WiFi station a wired address:
+//
+//   - The database pointer is not reachable. It is bridgeif_private_t.fdbd, and
+//     that struct is defined inside bridgeif.c with no header and no accessor -
+//     nothing in ESP-IDF calls that function at all. Reading it means copying
+//     the struct layout into this project and indexing netif->state by offset,
+//     which a field added anywhere above fdbd in an IDF upgrade turns into a
+//     garbage pointer with no warning.
+//   - The port numbers are not ours to predict. Ports are added from
+//     port_action_start() in esp_netif_br_glue.c, a handler for
+//     WIFI_EVENT_AP_START and ETHERNET_EVENT_START, so which index is the cable
+//     depends on which event the default loop dispatches first rather than on
+//     the order setup_bridge() adds them in.
+//
+// Four slots' worth of MAC and a spinlock is a small price for depending on
+// neither.
+//
+// Answered only for a short window after that frame, which is all the DHCP
+// server needs: the wrapper runs on the way in, microseconds before the server
+// reads the same message off its socket. Keeping the window short is what makes
+// the answer trustworthy rather than a guess about where a device usually
+// lives - a record can never outlive the exchange it was taken for, so a device
+// that moves from the cable to the air is never mistaken for a wired one.
+//
+// False for a MAC that has not sent DHCP, or whose record has aged out. Callers
+// must treat that as "not wired" rather than "unknown": it is the answer that
+// costs nothing if it is wrong.
+//
+// Takes no mutex - it must not, since dhcp_server.c calls it holding its own
+// lock while this file calls into dhcp_server.c holding s_mutex - and is safe to
+// call before client_track_init().
+bool client_track_mac_on_wired_port(const uint8_t mac[6]);
+
 // ---- duplicate-address quarantine ----
 //
 // Two devices on one address - almost always a static address configured by

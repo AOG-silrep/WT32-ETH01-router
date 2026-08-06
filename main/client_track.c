@@ -141,6 +141,91 @@ static volatile uint32_t s_fwd_out_drops[2];
 static volatile uint32_t s_wifi_tx_total;
 static volatile uint32_t s_wifi_tx_failed;
 
+// ---- which port a DHCP client is on ----
+//
+// The bridge is one netif over two ports, and the DHCP server's socket is bound
+// to the bridge, so a request that has reached dhcp_server.c no longer says
+// which side it arrived from. The RX wrapper below is the last place that knows,
+// and this is where it leaves the answer.
+//
+// Written only for DHCP frames - the wrapper has already worked out which those
+// are, for its own reasons - so the cost to the forwarding path is nothing at
+// all. A client sends a handful of these an hour.
+//
+// Four slots because the question is only ever asked about a client that is
+// mid-exchange right now, not about every client on the bridge; the oldest slot
+// is reused when a fifth device turns up. Records expire after
+// DHCP_PORT_WINDOW_US, which is long against the milliseconds between the
+// wrapper seeing a message and the server answering it, and short against
+// anything a device might do afterwards - see the header for why that is the
+// point rather than a limitation.
+#define DHCP_PORT_SLOTS 4
+#define DHCP_PORT_WINDOW_US (5LL * 1000000)
+
+typedef struct {
+    uint8_t mac[6];
+    bool is_wifi;
+    int64_t seen_us;   // 0 for a slot that has never been written
+} dhcp_port_t;
+
+// A spinlock rather than the seqlock the quarantine table uses below, because
+// this one has two writers - the eth and the WiFi RX contexts, which run on
+// whichever core the driver task is on - and that scheme is single-writer by
+// construction. It is not a mutex because the wrappers run in the driver's own
+// RX context, where blocking is not allowed; taking a spinlock is not blocking,
+// and at a few frames an hour it is never contended.
+//
+// A leaf lock, deliberately: dhcp_server.c reads this while holding its own
+// mutex, and client_track.c calls into dhcp_server.c while holding s_mutex, so
+// anything taken underneath here would close a cycle. Nothing below takes
+// anything. Statically initialised, so the reader works before
+// client_track_init() has run - dhcp_server_start() is called first.
+static dhcp_port_t s_dhcp_port[DHCP_PORT_SLOTS];
+static portMUX_TYPE s_dhcp_port_lock = portMUX_INITIALIZER_UNLOCKED;
+
+// Records the port a DHCP frame from mac arrived on. Called from the RX wrapper.
+static void note_dhcp_port(const uint8_t *mac, bool is_wifi)
+{
+    int64_t now = esp_timer_get_time();
+
+    portENTER_CRITICAL_SAFE(&s_dhcp_port_lock);
+    int slot = -1;
+    int oldest = 0;
+    for (int i = 0; i < DHCP_PORT_SLOTS; i++) {
+        if (s_dhcp_port[i].seen_us != 0 && memcmp(s_dhcp_port[i].mac, mac, 6) == 0) {
+            slot = i;
+            break;
+        }
+        if (s_dhcp_port[i].seen_us < s_dhcp_port[oldest].seen_us) {
+            oldest = i;
+        }
+    }
+    if (slot < 0) {
+        slot = oldest;
+    }
+    memcpy(s_dhcp_port[slot].mac, mac, 6);
+    s_dhcp_port[slot].is_wifi = is_wifi;
+    s_dhcp_port[slot].seen_us = now;
+    portEXIT_CRITICAL_SAFE(&s_dhcp_port_lock);
+}
+
+bool client_track_mac_on_wired_port(const uint8_t mac[6])
+{
+    int64_t now = esp_timer_get_time();
+    bool wired = false;
+
+    portENTER_CRITICAL_SAFE(&s_dhcp_port_lock);
+    for (int i = 0; i < DHCP_PORT_SLOTS; i++) {
+        if (s_dhcp_port[i].seen_us == 0 || memcmp(s_dhcp_port[i].mac, mac, 6) != 0) {
+            continue;
+        }
+        wired = !s_dhcp_port[i].is_wifi && (now - s_dhcp_port[i].seen_us) <= DHCP_PORT_WINDOW_US;
+        break;
+    }
+    portEXIT_CRITICAL_SAFE(&s_dhcp_port_lock);
+    return wired;
+}
+
 // ---- duplicate-address quarantine, hot-path half ----
 //
 // When two MACs are found on one address (see quarantine_rebuild()), the one
@@ -530,6 +615,12 @@ static err_t traffic_input_wrapper(struct pbuf *p, struct netif *inp, bool is_wi
             if (!is_dhcp) {
                 src_ip.addr = iph->src.addr;
                 src_ip_p = &src_ip;
+            } else {
+                // The one place the port a DHCP message came in on is still
+                // known. Recorded before the quarantine check below, on purpose:
+                // DHCP is the hole a cut-off device escapes through, and it has
+                // to be recognisable as a wired device while it does.
+                note_dhcp_port(hdr->src.addr, is_wifi);
             }
         }
         traffic_event_t ev = {
