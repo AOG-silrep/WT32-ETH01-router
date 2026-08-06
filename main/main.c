@@ -26,6 +26,7 @@
 #include "sys_monitor.h"
 #include "eth_link.h"
 #include "reset_log.h"
+#include "rail_witness.h"
 #include "auth_cfg.h"
 #include "web_server.h"
 #include "serial_console.h"
@@ -239,7 +240,25 @@ void app_main(void)
     // load-bearing for bridging; this one is evidence. Refusing to boot because
     // the crash history could not be written would be a self-inflicted brick on
     // a device installed in a field.
-    esp_err_t reset_log_ret = reset_log_init();
+    //
+    // The one thing allowed in front of it is the rail witness, and only because
+    // it is an input to the record rather than a consumer of it - the PHY
+    // register it reads is cleared by eth_init() a few lines below, so there is
+    // no later point at which the reading still exists. That is also why
+    // rail_witness_probe() is written to be incapable of aborting: it allocates
+    // nothing, bounds every loop, and returns UNKNOWN for anything it cannot
+    // establish.
+    const rail_witness_config_t rail_cfg = {
+        .mdc_gpio   = ETH_MDC_GPIO,
+        .mdio_gpio  = ETH_MDIO_GPIO,
+        .power_gpio = ETH_PHY_POWER_PIN,
+        .phy_addr   = ETH_PHY_ADDR,
+    };
+    rail_witness_t rail = rail_witness_probe(&rail_cfg);
+
+    esp_err_t reset_log_ret = reset_log_init(rail == RAIL_WITNESS_HELD    ? RESET_RAIL_HELD :
+                                             rail == RAIL_WITNESS_DROPPED ? RESET_RAIL_DROPPED :
+                                                                            RESET_RAIL_UNKNOWN);
     if (reset_log_ret != ESP_OK) {
         ESP_LOGW(TAG, "reset history unavailable: %s", esp_err_to_name(reset_log_ret));
     }
@@ -291,6 +310,11 @@ void app_main(void)
 
     ESP_ERROR_CHECK(esp_eth_start(eth_handle));
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    // Leave the witness set for the next boot to find. Not ESP_ERROR_CHECK'd for
+    // the same reason the reset history is not: a PHY that will not hold the
+    // pattern costs a diagnostic, not the bridge.
+    rail_witness_arm(eth_handle);
 
     // On-air transmit accounting. Unlike the port hooks above this one has to
     // come *after* esp_wifi_start(), which is why it is a separate call.

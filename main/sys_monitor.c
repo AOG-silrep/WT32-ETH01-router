@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include "sys_monitor.h"
 #include "reset_log.h"
+#include "rail_witness.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_cpu.h"
@@ -99,6 +100,12 @@ static void sys_monitor_task(void *arg)
         // FOLLOWING tick's CPU-load window, since the sample above is taken
         // before the write rather than after.
         reset_log_checkpoint_tick();
+
+        // Same borrowed loop, for the same reason: a once-a-second call from a
+        // task that is allowed to block, this time on the Ethernet driver's
+        // MDIO lock. Almost every call returns immediately - it only touches
+        // the PHY every thirty seconds.
+        rail_witness_tick();
     }
 }
 

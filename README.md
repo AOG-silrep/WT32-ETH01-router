@@ -346,11 +346,12 @@ and `restarted` when the device rebooted under your cursor.
 | `boot_prev_uptime_approx` | the figure above is the **low end of a window**, recovered from flash after a power event |
 | `boot_prev_uptime_max_s` | the high end of that window, or `null` when the figure is exact |
 | `boot_prev_ready` | whether the previous boot finished starting, or `null` if unrecoverable |
+| `boot_rail_held` | the 3.3 V rail survived the reset, so it was an `EN`-pin reset rather than a power event; `null` if nothing measured it |
 | `boot_rollback` | the bootloader reverted a failed OTA image to reach this boot |
 | `version` | contents of `version.txt` at build time |
 
 The `boot_*` fields summarise the newest entry in the reboot history; `/api/resets` and the
-`resets` console command carry the whole ring, and `/resets` renders it. Six things about it
+`resets` console command carry the whole ring, and `/resets` renders it. Seven things about it
 are easy to get wrong:
 
 - **Nothing is timestamped, and nothing can be.** `esp_timer` restarts at 0 each boot, RTC
@@ -361,7 +362,8 @@ are easy to get wrong:
   catches while the chip is still running reports honestly as `brownout`, with its uptime
   intact. A rail that collapses past the chip's own reset threshold does not. The diagnosis is
   a *pattern*: repeated `power-on` entries with short durations, on a device nobody is
-  switching off, is a supply problem rather than a firmware one.
+  switching off, is a supply problem rather than a firmware one. What `rail_held` *can* take
+  out of that bucket is a reset at the `EN` pin — see the last bullet.
 - **A duration after a power event is a bound, not a reading.** Uptime is counted in RTC
   memory, which a power-on wipes, so the device also copies the counter to flash on a fixed
   schedule of 32 points — 10s, 20s, 30s, 40s, 50s, 1m, 2m, 3m, 4m, 5m, 10m, 15m, 30m, 45m,
@@ -384,6 +386,23 @@ are easy to get wrong:
 - **`factory-reset` deliberately keeps this history.** It is evidence about the device rather
   than configuration of it, and a factory reset is often the first thing tried on a device
   that keeps restarting. Only the NVS-corruption recovery path erases it.
+
+- **`rail_held` is measured off the Ethernet PHY, and is evidence rather than proof.** A reset
+  driven at the `EN` pin — a serial adapter's DTR line, a reset button — is indistinguishable
+  from a power cycle to the chip itself: `EN` low powers down the RTC domain, so both report
+  `power-on` and both lose RTC memory, and `ESP_RST_EXT` is not reachable on the ESP32 at all.
+  What separates them is off-chip. The LAN8720 runs off the 3.3 V rail and is never
+  hardware-reset by this firmware, so the device writes a marker into an unused PHY register
+  (`0x1E`, bits 15 and 0 — measured as writable and holding, where the datasheet's reserved
+  bits 9–14 and the wake-on-LAN bit do not) and reads it back over bit-banged MDIO on the next
+  boot, before the Ethernet driver's own PHY reset clears it. Marker present means the rail
+  never dropped. **What it proves is that the rail stayed above the PHY's retention threshold**
+  — an `EN` reset does that, but so would a sag deep enough to reset the ESP32 (POR around
+  2.4 V) and no deeper. So `rail_held` is never labelled a developer reset anywhere; the
+  surfaces say what was measured. It is `null` on records written before this existed, and on
+  any board whose PHY will not hold the marker. For restarting a board under test, the `reboot`
+  console command and the web UI remain cleaner than pulling `EN`: they tag intent `console`
+  and keep an exact uptime.
 
 `traffic_drops` is the one that misleads. It counts events the per-client accounting queue
 could not keep up with; it never counts forwarded frames, and nothing in that path can drop a

@@ -1139,12 +1139,13 @@ static esp_err_t resets_get_handler(httpd_req_t *req)
     reset_log_entry_t recs[RESET_LOG_MAX_RECORDS];
     int count = reset_log_get(recs, RESET_LOG_MAX_RECORDS);
 
-    // 246 bytes is a measured worst-case entry with an empty version - the
+    // 265 bytes is a measured worst-case entry with an empty version - the
     // longest reason and intent tokens, seq and uptimes at 10 digits, and the
-    // keys - so 288 leaves room for a field being added without this being
-    // recalculated. It was 198 before uptime_approx and 220 before uptime_max_s,
-    // which is what used up the old 240: recheck this rather than assume it when
-    // adding the next one.
+    // keys - so 288 still leaves room, but less than it looks: it was 198 before
+    // uptime_approx, 220 before uptime_max_s (which used up the old 240), and
+    // 246 before rail_held added "rail_held":false and its comma. Recheck this
+    // rather than assume it when adding the next one; the next field but one
+    // will not fit.
     // The measurement caps reason_code at 3 digits because it is a uint8_t. On top
     // of that the 6x
     // expansion of JSON-escaping a version string: that string was written by a
@@ -1186,6 +1187,15 @@ static esp_err_t resets_get_handler(httpd_req_t *req)
             ready_str = (e->flags & RESET_LOG_F_REACHED_READY) ? "true" : "false";
         }
 
+        // Null rather than false when no witness ran, for the same reason
+        // reached_ready is: the two mean "the rail stayed up" and "nothing
+        // measured it", and collapsing them would report every record written
+        // before this existed as a power cut.
+        const char *rail_str = "null";
+        if (e->flags & RESET_LOG_F_RAIL_KNOWN) {
+            rail_str = (e->flags & RESET_LOG_F_RAIL_HELD) ? "true" : "false";
+        }
+
         // reason_code carries the raw esp_reset_reason_t beside the token, so a
         // value this build's switch does not enumerate - a newer IDF, or a record
         // written by a later firmware into the same struct version - is still
@@ -1194,6 +1204,7 @@ static esp_err_t resets_get_handler(httpd_req_t *req)
                            "%s{\"seq\":%u,\"reason\":\"%s\",\"reason_code\":%u,"
                            "\"intent\":\"%s\",\"uptime_s\":%s,\"uptime_approx\":%s,"
                            "\"uptime_max_s\":%s,\"reached_ready\":%s,"
+                           "\"rail_held\":%s,"
                            "\"ota_pending\":%s,\"rollback\":%s,"
                            "\"partition\":\"%s\",\"version\":\"",
                            i == 0 ? "" : ",",
@@ -1201,6 +1212,7 @@ static esp_err_t resets_get_handler(httpd_req_t *req)
                            reset_log_reason_name(e->reason), (unsigned)e->reason,
                            reset_log_intent_name(e->intent),
                            uptime_str, approx ? "true" : "false", uptime_max_str, ready_str,
+                           rail_str,
                            (e->flags & RESET_LOG_F_OTA_PENDING) ? "true" : "false",
                            (e->flags & RESET_LOG_F_ROLLBACK) ? "true" : "false",
                            // A partition-table label, a build artefact of this
@@ -1371,6 +1383,13 @@ static esp_err_t system_get_handler(httpd_req_t *req)
         }
     }
 
+    // What the 3.3V rail did across the reset that started this boot; null when
+    // nothing measured it. See the same field in resets_get_handler().
+    const char *boot_rail_str = "null";
+    if (have_boot && (boot.flags & RESET_LOG_F_RAIL_KNOWN)) {
+        boot_rail_str = (boot.flags & RESET_LOG_F_RAIL_HELD) ? "true" : "false";
+    }
+
     uint32_t q_up = 0, q_down = 0;
     client_track_get_quarantine_drops(&q_up, &q_down);
 
@@ -1379,8 +1398,9 @@ static esp_err_t system_get_handler(httpd_req_t *req)
     // bytes with the boot_* and ip_conflict_* fields and 622 without, so 768 was
     // not merely tight, it was 162 bytes short. The old figure was measured
     // against a short "1.3.0" when esp_app_desc_t.version holds 32 characters.
-    // Overflow is caught (resp_send_json sends a 500, and smoke.sh runs this
-    // endpoint through jq -e) but it shouldn't be run this close.
+    // boot_rail_held took it to 954. Overflow is caught (resp_send_json sends a
+    // 500, and smoke.sh runs this endpoint through jq -e) but it shouldn't be
+    // run this close.
     char resp[1024];
     int len = resp_append(resp, sizeof(resp), 0,
                           "{\"uptime_s\":%llu,\"free_heap\":%u,\"min_free_heap\":%u,"
@@ -1397,7 +1417,7 @@ static esp_err_t system_get_handler(httpd_req_t *req)
                           "\"boot_seq\":%u,\"boot_reason\":\"%s\",\"boot_intent\":\"%s\","
                           "\"boot_prev_uptime_s\":%s,\"boot_prev_uptime_approx\":%s,"
                           "\"boot_prev_uptime_max_s\":%s,\"boot_prev_ready\":%s,"
-                          "\"boot_rollback\":%s,"
+                          "\"boot_rail_held\":%s,\"boot_rollback\":%s,"
                           "\"version\":\"%s\"}",
                           (unsigned long long)(esp_timer_get_time() / 1000000ULL),
                           (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(),
@@ -1425,7 +1445,7 @@ static esp_err_t system_get_handler(httpd_req_t *req)
                           have_boot ? reset_log_reason_name(boot.reason) : "unknown",
                           have_boot ? reset_log_intent_name(boot.intent) : "unknown",
                           boot_uptime_str, boot_uptime_approx ? "true" : "false",
-                          boot_uptime_max_str, boot_ready_str,
+                          boot_uptime_max_str, boot_ready_str, boot_rail_str,
                           (have_boot && (boot.flags & RESET_LOG_F_ROLLBACK)) ? "true" : "false",
                           app_desc->version);
     if (!resp_send_json(req, resp, len, sizeof(resp))) {

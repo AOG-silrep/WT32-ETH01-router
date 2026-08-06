@@ -119,7 +119,7 @@
 <h2>Diagnostics</h2>
 <table>
   <tbody>
-    <tr><th title="Why this device last started up, and how long it had been running before that. A panic, watchdog, or brownout is a fault. A power-on is normal on a device that gets switched off, and is indistinguishable from a hard power loss — the full history shows whether there is a pattern. &quot;during startup&quot; means it never finished booting, which is a boot loop.">Last restart</th><td id="sys-restart" title="Why this device last started up, and how long it had been running before that. A panic, watchdog, or brownout is a fault. A power-on is normal on a device that gets switched off, and is indistinguishable from a hard power loss — the full history shows whether there is a pattern. &quot;during startup&quot; means it never finished booting, which is a boot loop.">&hellip;</td></tr>
+    <tr><th title="Why this device last started up, and how long it had been running before that. A panic, watchdog, or brownout is a fault. A power-on is normal on a device that gets switched off, and is indistinguishable from a hard power loss — the full history shows whether there is a pattern. &quot;Reset without power cycle&quot; means the 3.3 V rail never dropped, so a serial adapter or a reset button did it rather than the power going away; &quot;Cold boot after power loss&quot; means the rail really did drop. &quot;during startup&quot; means it never finished booting, which is a boot loop.">Last restart</th><td id="sys-restart" title="Why this device last started up, and how long it had been running before that. A panic, watchdog, or brownout is a fault. A power-on is normal on a device that gets switched off, and is indistinguishable from a hard power loss — the full history shows whether there is a pattern. &quot;Reset without power cycle&quot; means the 3.3 V rail never dropped, so a serial adapter or a reset button did it rather than the power going away; &quot;Cold boot after power loss&quot; means the rail really did drop. &quot;during startup&quot; means it never finished booting, which is a boot loop.">&hellip;</td></tr>
     <tr><th title="What the Ethernet port negotiated with whatever is plugged into it. 100 Mbit full duplex is normal — a 10 Mbit or half-duplex link still passes traffic, but slowly, and usually means a damaged, miswired, or over-long cable rather than a WiFi problem.">Ethernet port</th><td id="eth-link" title="What the Ethernet port negotiated with whatever is plugged into it. 100 Mbit full duplex is normal — a 10 Mbit or half-duplex link still passes traffic, but slowly, and usually means a damaged, miswired, or over-long cable rather than a WiFi problem.">&hellip;</td></tr>
     <tr><th title="How many times the Ethernet link has dropped since boot, and how long it has held its current state. A count that keeps climbing points at a loose connector or a cable working itself apart under vibration.">Link changes</th><td id="eth-flaps" title="How many times the Ethernet link has dropped since boot, and how long it has held its current state. A count that keeps climbing points at a loose connector or a cable working itself apart under vibration.">&hellip;</td></tr>
     <tr><th title="Frames this device took in and then could not pass on — either the bridge's input queue was full, or the port it was headed out of had no buffer left. A few under heavy load are normal and cost nothing visible; a count climbing while you watch it means the bridge is shedding traffic. This is the forwarding counter — 'Unreported traffic' in the System panel is not.">Frames dropped</th><td id="fwd-drops" title="Frames this device took in and then could not pass on — either the bridge's input queue was full, or the port it was headed out of had no buffer left. A few under heavy load are normal and cost nothing visible; a count climbing while you watch it means the bridge is shedding traffic. This is the forwarding counter — 'Unreported traffic' in the System panel is not.">&hellip;</td></tr>
@@ -583,7 +583,18 @@ function resetText(s) {
   } else if (s.boot_reason === 'brownout') {
     text = 'Brownout'; fault = true;
   } else if (s.boot_reason === 'power-on') {
-    text = 'Power-on'; fault = false;
+    // Worded identically to /resets rather than abbreviated: these two are short
+    // enough to fit the dashboard row as they are, and a reader comparing the
+    // two pages should not have to work out whether different words mean
+    // different findings. null means nothing measured it, and keeps the plain
+    // "Power-on" that every record written before the witness existed carries.
+    if (s.boot_rail_held === true) {
+      text = 'Reset without power cycle'; fault = false;
+    } else if (s.boot_rail_held === false) {
+      text = 'Cold boot after power loss'; fault = false;
+    } else {
+      text = 'Power-on'; fault = false;
+    }
   } else if (s.boot_reason === 'software') {
     text = 'Restarted by software, untagged'; fault = true;
   } else {

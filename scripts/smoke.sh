@@ -80,7 +80,8 @@ if curl -s --max-time 10 "${AUTH[@]}" "http://${HOST}/api/resets" \
               and (.resets|type=="array") and (.resets|length > 0)
               and (.resets|all(has("seq") and has("reason") and has("partition")
                               and has("uptime_s") and has("uptime_approx")
-                              and has("uptime_max_s")))' \
+                              and has("uptime_max_s") and has("rail_held")
+                              and (.rail_held|type=="boolean" or .==null)))' \
      >/dev/null 2>&1; then
   check "GET /api/resets shape" ok ok
 else

@@ -459,7 +459,7 @@ static void describe_for_log(const reset_log_entry_t *e, char *out, size_t n)
     }
 }
 
-esp_err_t reset_log_init(void)
+esp_err_t reset_log_init(reset_rail_t rail)
 {
     s_mutex = xSemaphoreCreateMutex();
     if (s_mutex == NULL) {
@@ -514,6 +514,13 @@ esp_err_t reset_log_init(void)
         if (load_checkpoint(s_next_seq - 1, &ckpt)) {
             rec.flags |= RESET_LOG_F_PREV_UPTIME_MIN;
             rec.prev_uptime_s = ckpt;
+        }
+    }
+
+    if (rail != RESET_RAIL_UNKNOWN) {
+        rec.flags |= RESET_LOG_F_RAIL_KNOWN;
+        if (rail == RESET_RAIL_HELD) {
+            rec.flags |= RESET_LOG_F_RAIL_HELD;
         }
     }
 

@@ -164,11 +164,21 @@ function whatHappened(r) {
   } else if (r.reason === 'brownout') {
     text = 'Brownout — the supply voltage dipped'; fault = true;
   } else if (r.reason === 'power-on') {
-    // Never "power loss". A rail that collapses past the chip's own reset
-    // threshold looks exactly like somebody flipping a switch, so this record
-    // cannot tell them apart and must not pretend to. The pattern across rows
-    // is the diagnosis - see the footer.
-    text = 'Power-on or power loss'; fault = false;
+    // Never "power loss" on its own. A rail that collapses past the chip's own
+    // reset threshold looks exactly like somebody flipping a switch, so this
+    // record cannot tell them apart from the reset reason alone. The pattern
+    // across rows is the diagnosis - see the footer.
+    //
+    // rail_held is the one thing that does split this bucket, and only this
+    // bucket: every other reason kept RTC memory, which already proves the rail
+    // held. null is "nothing measured it" and must not be read as false.
+    if (r.rail_held === true) {
+      text = 'Reset without power cycle'; fault = false;
+    } else if (r.rail_held === false) {
+      text = 'Cold boot after power loss'; fault = false;
+    } else {
+      text = 'Power-on or power loss'; fault = false;
+    }
   } else if (r.reason === 'software') {
     // Nothing on this device restarts itself without tagging it first, so an
     // untagged software reset is a panic that got tidied up on the way out, or
@@ -313,6 +323,18 @@ function addRow(r, older) {
                      'this device: both cut the supply before anything can be ' +
                      'recorded. A dip that the brownout detector catches while ' +
                      'the chip is still running is reported as a brownout instead.';
+    if (r.rail_held === true) {
+      whatCell.title += ' The Ethernet PHY kept a marker written before the ' +
+                        'reset, so the 3.3 V rail never dropped — the chip was ' +
+                        'reset at its EN pin, which is what a serial adapter or ' +
+                        'a reset button does. A sag deep enough to reset the ' +
+                        'chip but not the PHY would look the same, so this is ' +
+                        'strong evidence rather than proof.';
+    } else if (r.rail_held === false) {
+      whatCell.title += ' The Ethernet PHY came up cleared, so the 3.3 V rail ' +
+                        'really did drop — this was a power event and not a ' +
+                        'reset at the EN pin.';
+    }
   }
 
   const ran = row.insertCell();

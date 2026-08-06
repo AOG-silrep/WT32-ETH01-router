@@ -136,6 +136,25 @@ typedef enum {
 // and says nothing about how startup went.
 #define RESET_LOG_F_PREV_UPTIME_MIN 0x10
 
+// What the 3.3V rail did across the reset, from a witness held outside the chip
+// - see rail_witness.h for how it is read and what it costs to believe.
+//
+// A gate bit and a value bit, the same shape as F_PREV_STATE and prev_uptime_s,
+// because absent and false are different answers: F_RAIL_KNOWN clear means
+// nothing was measured, and only under it does F_RAIL_HELD mean the rail stayed
+// up. Recorded on every record regardless of reason, though it only tells the
+// reader anything on a power-on one - every other reset reason preserved RTC
+// memory, which already proves the rail held. Kept on the rest as a check on the
+// witness itself: a panic record claiming the rail dropped means the witness is
+// lying, not that the device lost power and panicked about it.
+//
+// F_RAIL_HELD is not "somebody reset the board". It says the rail stayed above
+// the PHY's retention threshold, which an EN-pin reset does and a power cut does
+// not - but so would a sag deep enough to reset the ESP32 and no deeper. The
+// surfaces have to say what was measured and let the reader draw the rest.
+#define RESET_LOG_F_RAIL_KNOWN 0x20
+#define RESET_LOG_F_RAIL_HELD  0x40
+
 // One reset event, written at the start of the boot that followed it. The two
 // halves describe different boots on purpose: reason, intent and prev_uptime_s
 // are how the PREVIOUS boot ended, version and part are what came up afterwards.
@@ -166,7 +185,18 @@ typedef struct {
 // failed NVS read or write is logged and swallowed - this module is evidence,
 // not infrastructure, and must never be the reason a bridge stops bridging.
 // Call it WITHOUT ESP_ERROR_CHECK, unlike its neighbours in app_main.
-esp_err_t reset_log_init(void);
+//
+// rail_held is what the rail witness made of this reset, and is passed in rather
+// than read here so this module keeps knowing nothing about Ethernet. Pass
+// RESET_RAIL_UNKNOWN and the record simply carries no rail flags, which is what
+// a build without a witness, or a board whose PHY would not hold one, produces.
+typedef enum {
+    RESET_RAIL_UNKNOWN = 0,
+    RESET_RAIL_HELD,
+    RESET_RAIL_DROPPED,
+} reset_rail_t;
+
+esp_err_t reset_log_init(reset_rail_t rail);
 
 // Tags the restart that is about to be requested, so the next boot can say a
 // person asked for it. Call immediately before esp_restart(), ahead of any

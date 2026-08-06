@@ -552,10 +552,23 @@ static void reset_what_happened(const reset_log_entry_t *e, char *out, size_t n)
     } else if (strcmp(reason, "brownout") == 0) {
         strlcpy(out, "brownout - the supply voltage dipped", n);
     } else if (strcmp(reason, "power-on") == 0) {
-        // Never "power loss". A rail that collapses past the chip's own reset
-        // threshold looks exactly like somebody flipping a switch, so the
-        // record cannot tell them apart and should not pretend to.
-        strlcpy(out, "power-on or power loss", n);
+        // Never "power loss" on its own. A rail that collapses past the chip's
+        // own reset threshold looks exactly like somebody flipping a switch, so
+        // the record cannot tell them apart and should not pretend to.
+        //
+        // The rail witness splits this bucket where it can, and only here: every
+        // other reason preserved RTC memory, which already proves the rail held,
+        // so repeating it there would be noise. Held is reported as what was
+        // measured - the rail stayed up, which is what an EN-pin reset does -
+        // rather than as who did it, because a sag that reset the chip and
+        // nothing else reads the same way.
+        if (!(e->flags & RESET_LOG_F_RAIL_KNOWN)) {
+            strlcpy(out, "power-on or power loss", n);
+        } else if (e->flags & RESET_LOG_F_RAIL_HELD) {
+            strlcpy(out, "reset without power cycle", n);
+        } else {
+            strlcpy(out, "cold boot after power loss", n);
+        }
     } else if (strcmp(reason, "software") == 0) {
         // Nothing here restarts itself without tagging it first, so an untagged
         // software reset is a panic that got tidied up, or a path nobody
