@@ -261,6 +261,11 @@ and `restarted` when the device rebooted under your cursor.
 | `net_rx_bps`, `net_tx_bps` | bridge-wide bytes/sec, summed over tracked clients |
 | `net_rx_pps`, `net_tx_pps` | the same as packet rates, all protocols |
 | `traffic_drops` | dropped **accounting events** — see the caveat below |
+| `fwd_drop_eth_in`, `fwd_drop_wifi_in` | frames taken in but not forwarded, because the bridge input queue was full |
+| `fwd_drop_eth_out`, `fwd_drop_wifi_out` | frames not forwarded because the outbound port had no buffer |
+| `wifi_tx_total`, `wifi_tx_failed` | frames handed to the radio, and those it gave up on after exhausting 802.11 retries |
+| `eth_link`, `eth_speed_mbit`, `eth_duplex`, `eth_autoneg` | what the Ethernet PHY negotiated; `eth_duplex` is `""` while down |
+| `eth_flaps`, `eth_change_s` | link-down transitions since boot, and seconds held in the current state |
 | `version` | contents of `version.txt` at build time |
 
 `traffic_drops` is the one that misleads. It counts events the per-client accounting queue
