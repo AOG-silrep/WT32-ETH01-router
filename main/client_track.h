@@ -12,6 +12,13 @@ extern "C" {
 #define CLIENT_TRACK_MAX_CLIENTS 16
 #define CLIENT_TRACK_NAME_MAX_LEN 32
 
+// How many duplicate-address conflicts can be tracked at once. Four is not a
+// capacity estimate - one is already an unusual fault, and a network with five
+// simultaneous address collisions has a problem that this device reporting the
+// fifth would not help with. It is small on purpose: the set is scanned on the
+// packet forwarding path.
+#define CLIENT_TRACK_MAX_CONFLICTS 4
+
 // Fine-grained traffic history, sampled independently of the 1Hz rx_bps/tx_bps
 // figures below, so a client's page-level graph can show bursts shorter than
 // one second without waiting on (or disturbing) the slower IP/hostname tick.
@@ -63,10 +70,12 @@ bool client_track_get_history(const uint8_t mac[6], uint32_t since_seq, client_h
 // Count of traffic events dropped because the hot-path -> accounting-task
 // queue was full (i.e. the accounting task couldn't keep up).
 //
-// This counts *accounting* events, never forwarded frames - nothing here can
-// drop a packet, both wrappers hand every pbuf to the original function
-// whatever happens to the queue. A large number means the per-client byte and
-// packet figures undercount, and nothing worse.
+// This counts *accounting* events, never forwarded frames: a full queue costs
+// the traffic nothing, both wrappers hand the pbuf on regardless. A large
+// number means the per-client byte and packet figures undercount, and nothing
+// worse. (The one thing that does stop a frame is the duplicate-address
+// quarantine further down, which is counted separately by
+// client_track_get_quarantine_drops().)
 //
 // It is normal for it to be large under load, and it tracks packet rate rather
 // than any kind of fault. Measured on this device, with no data lost in any of
@@ -117,6 +126,57 @@ esp_err_t client_track_wifi_txdone_init(void);
 //
 // Read as a ratio, never as a bare failure count.
 void client_track_get_wifi_tx(uint32_t *total, uint32_t *failed);
+
+// ---- duplicate-address quarantine ----
+//
+// Two devices on one address - almost always a static address configured by
+// hand inside the DHCP pool - leaves both of them half-working, because every
+// other host's ARP cache keeps flipping between the two MACs. Neither device
+// reports anything, and the symptom looks like bad wiring.
+//
+// So the bridge picks one and stops carrying the other's traffic: whichever MAC
+// was on the address first keeps it, and the later arrival is cut off until it
+// moves. One dead device is a fault somebody can find; two intermittent ones
+// are not. DHCP is carried in both directions even for a cut-off device, so a
+// device reconfigured to DHCP can always get itself out.
+//
+// The decision is derived state, rebuilt from the lease table once a second and
+// never written to flash.
+
+typedef struct {
+    uint8_t mac[6];        // the device being cut off
+    uint8_t peer_mac[6];   // the device that keeps the address
+    esp_ip4_addr_t ip;     // the contested address
+    bool armed;            // past the confirmation delay, i.e. a real conflict
+    bool dropping;         // armed *and* enforcement is on
+    bool exempt;           // pardoned from the console
+    uint32_t armed_s;      // seconds since it armed, 0 if it hasn't
+} client_track_conflict_t;
+
+// Copies up to max current conflicts into out, including ones still inside the
+// confirmation delay (armed == false). Returns the number written. Thread-safe.
+int client_track_get_conflicts(client_track_conflict_t *out, int max);
+
+// How many conflicts are currently armed - the number worth showing as a fault.
+// Cheaper than taking the whole snapshot when only the count is wanted.
+int client_track_get_armed_conflicts(void);
+
+// Frames not forwarded because their sender or recipient is cut off. Unlike
+// client_track_get_forward_drops(), a climbing count here is not a fault in the
+// bridge - it is the bridge doing what it was told. Approximate by
+// construction, like the other counters and for the same reason.
+void client_track_get_quarantine_drops(uint32_t *uplink, uint32_t *downlink);
+
+// Pardons mac: lifts its quarantine now and stops it being re-armed. Pass NULL
+// to withdraw every pardon. Not persisted - see the note in client_track.c.
+// Returns false only if there is no room to record another pardon.
+bool client_track_quarantine_clear(const uint8_t mac[6]);
+
+// Turns the dropping on or off. Detection, logging and everything reported
+// above carry on either way, so switching it off leaves the diagnosis intact
+// and only stops the enforcement acting on it.
+void client_track_quarantine_enforce(bool on);
+bool client_track_quarantine_enforcing(void);
 
 #ifdef __cplusplus
 }

@@ -125,6 +125,12 @@ typedef struct {
     // into array order. See s_boot_seq.
     uint32_t last_seen_seq;
     int64_t  last_seen_us;
+    // This client is cut off for sitting on an address that was already
+    // somebody else's - see client_track.c, which decides this and pushes the
+    // set in through dhcp_server_set_quarantined(). Never persisted: it is a
+    // judgement about the network as it is now, and the next boot re-derives it
+    // from what it observes rather than inheriting it.
+    bool     quarantined;
 } lease_t;
 
 static lease_t s_leases[DHCP_SERVER_MAX_LEASES];
@@ -417,10 +423,17 @@ static lease_t *find_by_ip_locked(uint32_t net_ip)
 // is one this server never leased, so nothing in the allocation bookkeeping
 // would otherwise know it is spoken for - and handing it to somebody else
 // would put two hosts on it.
+//
+// A quarantined client is the exception: it is on that address precisely
+// because it took one that was already somebody else's, and its traffic is
+// being dropped for it. Letting its claim stand here would reserve the address
+// for the device that lost the argument, and after a reboot - when leases come
+// back expired but observed addresses come back intact - it would be handed
+// back to it outright, reversing the decision every power cycle.
 static lease_t *find_by_any_ip_locked(uint32_t net_ip)
 {
     for (int i = 0; i < DHCP_SERVER_MAX_LEASES; i++) {
-        if (s_leases[i].in_use &&
+        if (s_leases[i].in_use && !s_leases[i].quarantined &&
             (s_leases[i].ip == net_ip || s_leases[i].observed_ip == net_ip)) {
             return &s_leases[i];
         }
@@ -431,12 +444,15 @@ static lease_t *find_by_any_ip_locked(uint32_t net_ip)
 // True if somebody other than except is really on this address: seen using it,
 // or holding an unexpired lease for it. An expired lease is not "in use" - it
 // is exactly what gets recycled - but an observed address always is.
+//
+// A quarantined client holds nothing, for the reason given on
+// find_by_any_ip_locked(): its claim is the one that lost.
 static bool ip_in_use_locked(uint32_t net_ip, const lease_t *except)
 {
     int64_t now = esp_timer_get_time();
     for (int i = 0; i < DHCP_SERVER_MAX_LEASES; i++) {
         lease_t *e = &s_leases[i];
-        if (!e->in_use || e == except) {
+        if (!e->in_use || e == except || e->quarantined) {
             continue;
         }
         if (e->observed_ip == net_ip) {
@@ -567,8 +583,17 @@ static uint32_t select_address_locked(const uint8_t mac[6], uint32_t requested)
     // 1. This MAC's reservation, if it is still a usable address. Held even
     //    while the client is away, which is what survives the reboot. Skipped
     //    if somebody else has since taken the address for real.
+    //
+    //    Also skipped for a quarantined client, and that is how a duplicate
+    //    address gets fixed by itself rather than by hand. The client asks to
+    //    renew the address it is being cut off for, this declines to confirm
+    //    it, step 3 finds it a free one, and the DHCPREQUEST path NAKs the old
+    //    one - which sends the client back to DISCOVER, where it takes the new
+    //    address. Only works on a client that speaks DHCP at all: one that was
+    //    given a static address by hand never asks, so there is nothing to
+    //    answer and it stays cut off until somebody reconfigures it.
     lease_t *mine = find_by_mac_locked(mac);
-    if (mine && ip_in_pool(mine->ip) && !ip_declined(mine->ip) &&
+    if (mine && !mine->quarantined && ip_in_pool(mine->ip) && !ip_declined(mine->ip) &&
         !ip_in_use_locked(mine->ip, mine)) {
         return mine->ip;
     }
@@ -1224,6 +1249,31 @@ void dhcp_server_note_observed_ip(const uint8_t mac[6], esp_ip4_addr_t ip)
 
     if (e->saved_observed_ip != e->observed_ip) {
         mark_dirty_locked();
+    }
+    xSemaphoreGive(s_mutex);
+}
+
+void dhcp_server_set_quarantined(const uint8_t (*macs)[6], int n)
+{
+    if (s_mutex == NULL) {
+        return;
+    }
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < DHCP_SERVER_MAX_LEASES; i++) {
+        lease_t *e = &s_leases[i];
+        if (!e->in_use) {
+            e->quarantined = false;
+            continue;
+        }
+        bool found = false;
+        for (int j = 0; j < n; j++) {
+            if (memcmp(e->mac, macs[j], 6) == 0) {
+                found = true;
+                break;
+            }
+        }
+        e->quarantined = found;
     }
     xSemaphoreGive(s_mutex);
 }

@@ -1029,6 +1029,9 @@ static esp_err_t leases_get_handler(httpd_req_t *req)
     int client_count = 0;
     client_track_get_snapshot(clients, CLIENT_TRACK_MAX_CLIENTS, &client_count);
 
+    client_track_conflict_t conflicts[CLIENT_TRACK_MAX_CONFLICTS];
+    int conflict_count = client_track_get_conflicts(conflicts, CLIENT_TRACK_MAX_CONFLICTS);
+
     // 231 bytes is a measured worst-case entry with an empty name - four
     // 15-character dotted quads, two 10-digit u32s, and the keys - so 240
     // leaves a little room for a field being added without this being
@@ -1036,8 +1039,17 @@ static esp_err_t leases_get_handler(httpd_req_t *req)
     // control character in a hostname: only a currently-tracked client has a
     // name at all, so that allowance is sized to CLIENT_TRACK_MAX_CLIENTS
     // rather than to the lease count, which is twice as large.
+    //
+    // The conflict pair is sized the same way rather than being folded into the
+    // 240: "conflict" and "conflict_with" together run to about 56 bytes, which
+    // would take a worst-case entry to 287 and overrun. But a conflict has two
+    // ends and there are only CLIENT_TRACK_MAX_CONFLICTS of them, so at most
+    // twice that many entries can ever carry the fields - a couple of hundred
+    // bytes, against the 2.5KB of .bss that widening every entry would cost for
+    // a case that cannot happen.
     static char resp[DHCP_SERVER_MAX_LEASES * 240 +
-                     CLIENT_TRACK_MAX_CLIENTS * 6 * CLIENT_TRACK_NAME_MAX_LEN + 64];
+                     CLIENT_TRACK_MAX_CLIENTS * 6 * CLIENT_TRACK_NAME_MAX_LEN +
+                     CLIENT_TRACK_MAX_CONFLICTS * 2 * 64 + 64];
     int off = resp_append(resp, sizeof(resp), 0,
                            "{\"max\":%d,\"restored\":%d,\"leases\":[",
                            DHCP_SERVER_MAX_LEASES, dhcp_server_get_restored_count());
@@ -1069,7 +1081,29 @@ static esp_err_t leases_get_handler(httpd_req_t *req)
         // Same untrusted field as in clients_get_handler(): the hostname is
         // whatever the client called itself in option 12.
         off = json_append_escaped(resp, sizeof(resp), off, name);
-        off = resp_append(resp, sizeof(resp), off, "\"}");
+        off = resp_append(resp, sizeof(resp), off, "\"");
+
+        // Emitted only for the two ends of a live conflict - see the buffer
+        // note above. "blocked" is the device being cut off, "holder" the one
+        // keeping the address; conflict_with names the other end either way.
+        for (int j = 0; j < conflict_count; j++) {
+            if (!conflicts[j].armed) {
+                continue;
+            }
+            bool blocked = memcmp(conflicts[j].mac, l->mac, 6) == 0;
+            bool holder = memcmp(conflicts[j].peer_mac, l->mac, 6) == 0;
+            if (!blocked && !holder) {
+                continue;
+            }
+            const uint8_t *other = blocked ? conflicts[j].peer_mac : conflicts[j].mac;
+            off = resp_append(resp, sizeof(resp), off,
+                               ",\"conflict\":\"%s\","
+                               "\"conflict_with\":\"%02x:%02x:%02x:%02x:%02x:%02x\"",
+                               blocked ? "blocked" : "holder",
+                               other[0], other[1], other[2], other[3], other[4], other[5]);
+            break;
+        }
+        off = resp_append(resp, sizeof(resp), off, "}");
     }
     off = resp_append(resp, sizeof(resp), off, "]}");
 
@@ -1337,13 +1371,16 @@ static esp_err_t system_get_handler(httpd_req_t *req)
         }
     }
 
+    uint32_t q_up = 0, q_down = 0;
+    client_track_get_quarantine_drops(&q_up, &q_down);
+
     // 1024 rather than 768. Measured worst case - every %u at ten digits, the
-    // longest reason and intent tokens, and a full 31-character version - is 844
-    // bytes with the boot_* fields and 622 without, so 768 was not merely tight,
-    // it was 76 bytes short. The old figure was measured against a short "1.3.0"
-    // when esp_app_desc_t.version holds 32 characters. Overflow is caught
-    // (resp_send_json sends a 500, and smoke.sh runs this endpoint through
-    // jq -e) but it shouldn't be run this close.
+    // longest reason and intent tokens, and a full 31-character version - is 930
+    // bytes with the boot_* and ip_conflict_* fields and 622 without, so 768 was
+    // not merely tight, it was 162 bytes short. The old figure was measured
+    // against a short "1.3.0" when esp_app_desc_t.version holds 32 characters.
+    // Overflow is caught (resp_send_json sends a 500, and smoke.sh runs this
+    // endpoint through jq -e) but it shouldn't be run this close.
     char resp[1024];
     int len = resp_append(resp, sizeof(resp), 0,
                           "{\"uptime_s\":%llu,\"free_heap\":%u,\"min_free_heap\":%u,"
@@ -1353,6 +1390,8 @@ static esp_err_t system_get_handler(httpd_req_t *req)
                           "\"fwd_drop_eth_in\":%u,\"fwd_drop_wifi_in\":%u,"
                           "\"fwd_drop_eth_out\":%u,\"fwd_drop_wifi_out\":%u,"
                           "\"wifi_tx_total\":%u,\"wifi_tx_failed\":%u,"
+                          "\"ip_conflicts\":%u,\"ip_conflict_drops\":%u,"
+                          "\"ip_conflict_enforced\":%s,"
                           "\"eth_link\":%s,\"eth_speed_mbit\":%u,\"eth_duplex\":\"%s\","
                           "\"eth_autoneg\":%s,\"eth_flaps\":%u,\"eth_change_s\":%u,"
                           "\"boot_seq\":%u,\"boot_reason\":\"%s\",\"boot_intent\":\"%s\","
@@ -1368,6 +1407,11 @@ static esp_err_t system_get_handler(httpd_req_t *req)
                           (unsigned)fwd.eth_in, (unsigned)fwd.wifi_in,
                           (unsigned)fwd.eth_out, (unsigned)fwd.wifi_out,
                           (unsigned)wifi_tx_total, (unsigned)wifi_tx_failed,
+                          // A count of live conflicts, not a since-boot total:
+                          // this one goes back to zero when the fault is fixed.
+                          (unsigned)client_track_get_armed_conflicts(),
+                          (unsigned)(q_up + q_down),
+                          client_track_quarantine_enforcing() ? "true" : "false",
                           // Fixed internal literals, so no json_append_escaped()
                           // needed - that helper is for device-supplied strings.
                           eth.up ? "true" : "false", (unsigned)eth.speed_mbit,

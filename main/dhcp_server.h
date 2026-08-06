@@ -72,6 +72,21 @@ esp_err_t dhcp_server_start(esp_netif_t *br_netif,
 // established.
 void dhcp_server_note_observed_ip(const uint8_t mac[6], esp_ip4_addr_t ip);
 
+// Replaces the set of MACs currently cut off for holding a duplicate address.
+// The whole set every time, not a delta - anything absent from macs is cleared.
+//
+// Two things follow from an entry being in this set. Its claim on the address
+// stops counting in the allocator, so the device that was there first can still
+// be leased it (without this the decision would reverse at every reboot, since
+// leases come back from flash expired while observed addresses come back
+// intact). And the address is no longer confirmed back to the quarantined
+// client, so a client that speaks DHCP gets NAKed onto a free address instead
+// and the conflict resolves itself.
+//
+// Not persisted. Called from client_track.c, which is where the conflict is
+// detected - see the note there on lock order. Thread-safe.
+void dhcp_server_set_quarantined(const uint8_t (*macs)[6], int n);
+
 // Looks up the address this MAC is believed to be at: what it was last
 // observed using if that differs from its lease, otherwise the leased
 // address. Returns false if this MAC has no lease and nothing observed, which

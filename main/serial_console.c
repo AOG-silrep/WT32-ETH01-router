@@ -231,6 +231,10 @@ static int cmd_leases(int argc, char **argv)
         return 0;
     }
 
+    client_track_conflict_t conflicts[CLIENT_TRACK_MAX_CONFLICTS];
+    int conflict_count = client_track_get_conflicts(conflicts, CLIENT_TRACK_MAX_CONFLICTS);
+    bool any_conflict = false;
+
     printf("%-18s %-15s %9s %-13s %s\n", "MAC", "IP", "EXPIRES", "SEEN", "STATE");
     for (int i = 0; i < count; i++) {
         dhcp_lease_info_t *l = &leases[i];
@@ -250,7 +254,11 @@ static int cmd_leases(int argc, char **argv)
             snprintf(expires_str, sizeof(expires_str), "%us", (unsigned)l->expires_in_s);
         }
 
-        char state[48];
+        // 64, not 48: the longest state is now the duplicate-address one,
+        // "manual (leased 192.168.5.100), duplicate - blocked, unsaved" at 59
+        // characters. strlcat truncates rather than failing, so a buffer left
+        // at 48 would have silently cut the clause off instead of saying so.
+        char state[64];
         if (manual && l->ip.addr != 0) {
             char leased_str[16];
             esp_ip4addr_ntoa(&l->ip, leased_str, sizeof(leased_str));
@@ -264,6 +272,28 @@ static int cmd_leases(int argc, char **argv)
             // restored from flash, or released on shutdown. It is still the
             // address that client gets back when it returns.
             strlcpy(state, "reserved", sizeof(state));
+        }
+        // Before ", unsaved", and worded exactly as leases.html words it: the
+        // two describe one table, and a reader comparing them should never have
+        // to work out whether the difference means anything.
+        //
+        // The other device's MAC is not named here, for the same reason it is
+        // not named on the page - it made the row too wide. There it moved into
+        // the tooltip; a terminal has no tooltips, so it moved to the note
+        // below and to "quarantine", which prints both ends of every conflict.
+        for (int j = 0; j < conflict_count; j++) {
+            if (!conflicts[j].armed) {
+                continue;
+            }
+            bool blocked = memcmp(conflicts[j].mac, l->mac, 6) == 0;
+            bool holder = memcmp(conflicts[j].peer_mac, l->mac, 6) == 0;
+            if (!blocked && !holder) {
+                continue;
+            }
+            strlcat(state, blocked ? ", duplicate - blocked" : ", duplicate - kept",
+                    sizeof(state));
+            any_conflict = true;
+            break;
         }
         if (!l->stored) {
             strlcat(state, ", unsaved", sizeof(state));
@@ -282,6 +312,137 @@ static int cmd_leases(int argc, char **argv)
         }
 
         printf("%-18s %-15s %9s %-13s %s\n", mac_str, ip_str, expires_str, seen_str, state);
+    }
+
+    // Mirrors the note the web page puts under the table when it is showing the
+    // same rows. Only printed when there is something to point at.
+    if (any_conflict) {
+        printf("\nTwo devices are on one address. Run \"quarantine\" to see which "
+               "device is on each,\nand to override the decision.\n");
+    }
+    return 0;
+}
+
+// ---- quarantine ----
+
+static struct {
+    struct arg_str *action;
+    struct arg_str *mac;
+    struct arg_end *end;
+} quarantine_args;
+
+// "aa:bb:cc:dd:ee:ff" in any case, with '-' accepted for ':' since that is how
+// Windows writes them.
+static bool parse_mac(const char *s, uint8_t out[6])
+{
+    unsigned v[6];
+    if (sscanf(s, "%2x:%2x:%2x:%2x:%2x:%2x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6 &&
+        sscanf(s, "%2x-%2x-%2x-%2x-%2x-%2x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) {
+        return false;
+    }
+    for (int i = 0; i < 6; i++) {
+        if (v[i] > 0xff) {
+            return false;
+        }
+        out[i] = (uint8_t)v[i];
+    }
+    return true;
+}
+
+static int cmd_quarantine(int argc, char **argv)
+{
+    int errors = arg_parse(argc, argv, (void **)&quarantine_args);
+    if (errors != 0) {
+        arg_print_errors(stderr, quarantine_args.end, argv[0]);
+        return 1;
+    }
+
+    const char *action = (quarantine_args.action->count > 0)
+                             ? quarantine_args.action->sval[0] : NULL;
+
+    if (action != NULL && (strcmp(action, "on") == 0 || strcmp(action, "off") == 0)) {
+        bool on = (strcmp(action, "on") == 0);
+        client_track_quarantine_enforce(on);
+        printf(on ? "Enforcing: duplicate-address offenders will be cut off again.\n"
+                  : "Enforcement off: conflicts are still detected and reported, "
+                    "but nothing is dropped.\n");
+        return 0;
+    }
+
+    if (action != NULL && strcmp(action, "clear") == 0) {
+        if (quarantine_args.mac->count == 0) {
+            printf("Usage: quarantine clear <mac|all>\n");
+            return 1;
+        }
+        const char *who = quarantine_args.mac->sval[0];
+        if (strcmp(who, "all") == 0) {
+            client_track_quarantine_clear(NULL);
+            printf("All pardons withdrawn. Conflicts still present will re-arm "
+                   "within a few seconds.\n");
+            return 0;
+        }
+        uint8_t mac[6];
+        if (!parse_mac(who, mac)) {
+            printf("Not a MAC address: %s\n", who);
+            return 1;
+        }
+        if (!client_track_quarantine_clear(mac)) {
+            printf("No room to record another pardon (limit %d). Use "
+                   "\"quarantine off\" instead.\n", CLIENT_TRACK_MAX_CONFLICTS);
+            return 1;
+        }
+        printf("Pardoned %s - it is being carried again, and will not be cut off "
+               "again until a reboot.\n", who);
+        return 0;
+    }
+
+    if (action != NULL) {
+        printf("Unknown action \"%s\". Use: quarantine [clear <mac|all> | on | off]\n", action);
+        return 1;
+    }
+
+    client_track_conflict_t conflicts[CLIENT_TRACK_MAX_CONFLICTS];
+    int n = client_track_get_conflicts(conflicts, CLIENT_TRACK_MAX_CONFLICTS);
+
+    uint32_t up = 0, down = 0;
+    client_track_get_quarantine_drops(&up, &down);
+
+    printf("Enforcement: %s\n",
+           client_track_quarantine_enforcing()
+               ? "on - a device on somebody else's address gets cut off"
+               : "OFF - conflicts are reported but nothing is dropped");
+    printf("Frames dropped: %u uplink, %u downlink\n", (unsigned)up, (unsigned)down);
+
+    if (n == 0) {
+        printf("No duplicate addresses.\n");
+        return 0;
+    }
+
+    printf("\n%-15s %-18s %-18s %s\n", "ADDRESS", "CUT OFF", "KEPT BY", "STATE");
+    for (int i = 0; i < n; i++) {
+        client_track_conflict_t *c = &conflicts[i];
+        char ip_str[16];
+        esp_ip4addr_ntoa(&c->ip, ip_str, sizeof(ip_str));
+
+        char blocked[18], holder[18];
+        snprintf(blocked, sizeof(blocked), "%02x:%02x:%02x:%02x:%02x:%02x",
+                 c->mac[0], c->mac[1], c->mac[2], c->mac[3], c->mac[4], c->mac[5]);
+        snprintf(holder, sizeof(holder), "%02x:%02x:%02x:%02x:%02x:%02x",
+                 c->peer_mac[0], c->peer_mac[1], c->peer_mac[2],
+                 c->peer_mac[3], c->peer_mac[4], c->peer_mac[5]);
+
+        char state[64];
+        if (c->exempt) {
+            strlcpy(state, "pardoned", sizeof(state));
+        } else if (!c->armed) {
+            strlcpy(state, "confirming", sizeof(state));
+        } else if (!c->dropping) {
+            strlcpy(state, "confirmed, not enforced", sizeof(state));
+        } else {
+            snprintf(state, sizeof(state), "dropping for %us", (unsigned)c->armed_s);
+        }
+
+        printf("%-15s %-18s %-18s %s\n", ip_str, blocked, holder, state);
     }
     return 0;
 }
@@ -691,6 +852,22 @@ static void register_commands(void)
         .func = &cmd_leases,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&leases_cmd));
+
+    quarantine_args.action = arg_str0(NULL, NULL, "<clear|on|off>",
+                                       "clear pardons a device; on/off switch the dropping");
+    quarantine_args.mac = arg_str0(NULL, NULL, "<mac|all>", "which device to pardon");
+    quarantine_args.end = arg_end(2);
+    const esp_console_cmd_t quarantine_cmd = {
+        .command = "quarantine",
+        .help = "Show devices cut off for using an address that was already somebody else's. "
+                "No args lists them. \"quarantine clear <mac|all>\" puts a device back on the "
+                "network and stops it being cut off again until a reboot. \"quarantine off\" "
+                "stops dropping altogether while still detecting and reporting conflicts.",
+        .hint = NULL,
+        .func = &cmd_quarantine,
+        .argtable = &quarantine_args,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&quarantine_cmd));
 
     const esp_console_cmd_t resets_cmd = {
         .command = "resets",

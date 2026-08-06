@@ -97,7 +97,10 @@ seen on its packets is treated as the truth, and written to flash when it change
 the `manual` row above, showing what the client is really using alongside the lease it
 isn't. Such an address is never handed to another client, even when it falls inside the
 DHCP pool, and the client keeps it in the table across a reboot exactly like a leased one.
-If it later goes back to using its lease, the manual entry clears itself.
+If it later goes back to using its lease, the manual entry clears itself. The one exception
+is a client that took an address somebody else was already on — see
+[Two devices on one address](#two-devices-on-one-address) — whose claim stops counting,
+since honouring it would mean reserving the address for the device that lost the argument.
 
 Only addresses on the bridge's own subnet are recorded. This is a transparent bridge, so
 traffic from other subnets crosses it legitimately, and a client that fails DHCP and
@@ -115,6 +118,68 @@ from a client whose address is not moving. Past 32 remembered clients the least 
 seen mapping is dropped — those clients still get addresses, they just stop being sticky.
 See [Reservations are not expired on a timer](#reservations-are-not-expired-on-a-timer)
 for what "least recently seen" means on a device with no clock.
+
+### Two devices on one address
+
+Setting a device to a static address that falls inside the DHCP range is an easy mistake,
+and it used to be a hard one to find. Both devices half-work: every other host's ARP cache
+keeps flipping between the two MACs, so each of them intermittently answers and
+intermittently does not. Nothing on the network reports it, and the symptom looks like bad
+wiring.
+
+The bridge now watches for it, using the same sniffed source addresses that feed the
+`manual` rows above — there is no ping-before-offer or ARP probing involved. When two MACs
+are seen on one address, **the one that got there first keeps it, and the other has its
+traffic dropped**. One dead device is a fault somebody can find; two intermittent ones are
+not.
+
+```
+> quarantine
+Enforcement: on - a device on somebody else's address gets cut off
+Frames dropped: 4192 uplink, 2277 downlink
+
+ADDRESS         CUT OFF            KEPT BY            STATE
+192.168.5.60    b8:27:eb:9a:1f:04  fc:e8:c0:4d:ab:94  dropping for 214s
+```
+
+The same pair is shown on `/leases` and counted in the dashboard's Diagnostics panel.
+
+A cut-off device is not silenced completely: **DHCP still crosses the bridge in both
+directions**, so a device reconfigured from a static address back to DHCP asks for one,
+gets one, and clears the fault by itself within a few seconds. Its ARP is dropped, which
+is the point rather than an oversight — a gratuitous ARP from the second device is the
+mechanism by which the collision breaks everyone else's cache, and DHCP from a client with
+no address is all broadcast, so recovery never needs it.
+
+If the cut-off device is one that speaks DHCP at all, the server also stops confirming the
+contested address to it and NAKs its next renewal, which moves it to a free address
+without anyone touching it. A device given a static address by hand never asks for
+anything, so there is nothing to answer and it stays cut off until it is reconfigured.
+
+Some care is taken not to act on a phantom. Both devices must have been **seen on the
+contested address by their own traffic**, not merely believed to be on it — a remembered
+address says what the bridge thought last boot, and a device that has quietly moved on, or
+that only ever sends ARP, never corrects it. Both must also have been heard from in the
+last 30 seconds, since a lease with time left on it is no evidence its holder is switched
+on, and the collision has to hold for three consecutive seconds before anything is dropped.
+The decision is then kept for as long as the conflict lasts rather than recomputed, so it
+cannot oscillate between the two devices.
+
+"First" means first seen on the address by this bridge, which is the only ordering it can
+observe. Both timestamps come from the same kind of evidence, so a device whose address had
+to be learned from live traffic is never ranked behind one whose address merely came out of
+flash.
+
+Two commands override it, both on the serial console because a cut-off device loses the
+web UI along with everything else:
+
+```
+quarantine clear <mac|all>   put a device back on the network until reboot
+quarantine off               stop dropping; keep detecting and reporting
+```
+
+None of this is written to flash. It is re-derived from what the bridge observes after
+every restart, and `quarantine off` survives only until the next one.
 
 This server replaces ESP-IDF's, which is why the two limits that used to be documented here
 are gone. IDF's kept its leases in RAM only, capped the pool at 100 addresses

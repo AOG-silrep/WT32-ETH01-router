@@ -50,6 +50,17 @@ typedef struct {
     uint32_t rx_pkts_prev, tx_pkts_prev;   // previous 1Hz tick's cumulative, for rate calc
     uint32_t rx_pps, tx_pps;
     int64_t last_seen_us;
+    // When this client's own traffic first confirmed the address it currently
+    // holds, or 0 if it never has. The ordering key for a duplicate-address
+    // conflict: whoever got to the address first keeps it.
+    //
+    // 0 means "never seen there", not "seen there long ago". An address the
+    // bridge only believes - restored from flash, read out of the ARP cache, or
+    // the one the DHCP server offered - carries no time, because none of those
+    // say the client is on it now, let alone when it got there. A device is
+    // never cut off on that basis; quarantine_rebuild() requires a real time
+    // from both sides before it will act.
+    int64_t ip_since_us;
     char name[CLIENT_TRACK_NAME_MAX_LEN];
 
     // Fine-grained history, sampled every CLIENT_TRACK_HISTORY_PERIOD_MS - kept
@@ -130,6 +141,54 @@ static volatile uint32_t s_fwd_out_drops[2];
 static volatile uint32_t s_wifi_tx_total;
 static volatile uint32_t s_wifi_tx_failed;
 
+// ---- duplicate-address quarantine, hot-path half ----
+//
+// When two MACs are found on one address (see quarantine_rebuild()), the one
+// that got there second is cut off: the wrappers below stop forwarding its
+// frames, so the collision becomes one working device and one plainly dead one
+// instead of two that half-work. This is the table they check.
+//
+// Frames dropped here are counted apart from s_fwd_*_drops on purpose. Those
+// mean the bridge failed to carry something it meant to carry; these are the
+// bridge doing exactly what it was told.
+static volatile uint32_t s_q_drops[2];   // [0] uplink (by source MAC), [1] downlink (by dest)
+
+#define QUARANTINE_MAX CLIENT_TRACK_MAX_CONFLICTS
+
+// A MAC as two aligned words, so every read below is a single l32i that cannot
+// tear. hi's bit 31 marks the slot live, which is why only 16 of its bits carry
+// address.
+typedef struct {
+    uint32_t lo;   // mac[0..3]
+    uint32_t hi;   // mac[4..5] in bits 0..15, bit 31 = slot in use
+} q_slot_t;
+
+#define Q_SLOT_LIVE 0x80000000u
+
+// Read per frame on both cores, written once a second at most by
+// client_track_task and by nobody else. A mutex is not an option - the input
+// wrapper runs in the driver's own RX context, where blocking is not allowed -
+// and neither is _Atomic, for the measured reason on s_traffic_drops above.
+//
+// So: a seqlock over the whole table, checked *after* the compare.
+//
+// Per-slot valid bits would not be enough. A reader can take lo from one
+// version of the table and hi from the next and end up holding a MAC that
+// belongs to neither entry - and with several identical modules from one vendor
+// batch, whose first four octets match, the address it synthesises is very
+// likely a real third device on this bridge rather than a number nobody owns.
+// Validating one generation across the entire scan is what rules that out.
+//
+// A reader that sees the generation move gives up and forwards the frame. That
+// asymmetry is the design: a missed drop costs one forwarded packet, once,
+// while a wrong drop takes a working device off the network.
+static volatile q_slot_t s_q[QUARANTINE_MAX];
+static volatile uint32_t s_q_gen;    // odd while the table is being rewritten
+// Whether anything is quarantined at all. The whole cost of this feature on an
+// uncontended bridge is this one load and branch - cheaper than either memcmp
+// mac_is_client() already does.
+static volatile uint32_t s_q_any;
+
 static uint32_t s_net_rx_pps, s_net_tx_pps; // bridge-wide, summed across clients each 1Hz tick
 
 static esp_netif_t *s_eth_netif;
@@ -157,6 +216,79 @@ static bool mac_is_client(const uint8_t *mac)
         return false;
     }
     return true;
+}
+
+// True if this MAC is currently cut off for holding a duplicate address. Safe
+// to call from either wrapper on either core; see s_q for the scheme.
+//
+// The MAC is assembled from six byte loads rather than by casting the pbuf
+// pointer to uint32_t *. An ethernet header inside an esp_netif pbuf is only
+// 2-byte aligned in the general case - the stack aligns the IP header, not this
+// one - and an unaligned l32i on Xtensa is a LoadStoreAlignmentCause panic, not
+// a slow path.
+static inline bool mac_is_quarantined(const uint8_t *mac)
+{
+    if (s_q_any == 0) {
+        return false;
+    }
+    uint32_t gen = s_q_gen;
+    if (gen & 1u) {
+        return false;   // mid-rewrite; forward it and catch it next frame
+    }
+
+    uint32_t lo = (uint32_t)mac[0] | ((uint32_t)mac[1] << 8) |
+                  ((uint32_t)mac[2] << 16) | ((uint32_t)mac[3] << 24);
+    uint32_t hi = ((uint32_t)mac[4] | ((uint32_t)mac[5] << 8)) | Q_SLOT_LIVE;
+
+    bool hit = false;
+    for (int i = 0; i < QUARANTINE_MAX; i++) {
+        if (s_q[i].lo == lo && s_q[i].hi == hi) {
+            hit = true;
+            break;
+        }
+    }
+    // Only act on a match the whole table held still for. A hit read across a
+    // rewrite may be an address that was never in the table at all.
+    return hit && s_q_gen == gen;
+}
+
+// Publishes the armed set.
+//
+// Caller must hold s_mutex. That is what keeps this single-writer, which the
+// scheme requires: two publishers interleaving their generation sequences would
+// leave the counter even in the middle of a rewrite, and readers would trust a
+// half-written table. The mutex is free here - this runs once a second at most,
+// and never on the forwarding path.
+static void quarantine_publish(const uint8_t (*macs)[6], int n)
+{
+    if (n > QUARANTINE_MAX) {
+        n = QUARANTINE_MAX;
+    }
+
+    // Raised before the rewrite and lowered after it, so the window where the
+    // two disagree always errs towards readers doing the full check.
+    if (n > 0) {
+        s_q_any = 1;
+    }
+
+    s_q_gen++;                              // -> odd: rewrite in progress
+    __asm__ __volatile__("" ::: "memory");
+    for (int i = 0; i < QUARANTINE_MAX; i++) {
+        if (i < n) {
+            s_q[i].lo = (uint32_t)macs[i][0] | ((uint32_t)macs[i][1] << 8) |
+                        ((uint32_t)macs[i][2] << 16) | ((uint32_t)macs[i][3] << 24);
+            s_q[i].hi = ((uint32_t)macs[i][4] | ((uint32_t)macs[i][5] << 8)) | Q_SLOT_LIVE;
+        } else {
+            s_q[i].lo = 0;
+            s_q[i].hi = 0;
+        }
+    }
+    __asm__ __volatile__("" ::: "memory");
+    s_q_gen++;                              // -> even: readable again
+
+    if (n == 0) {
+        s_q_any = 0;
+    }
 }
 
 // Caller must hold s_mutex. Finds an existing entry for mac, or claims a
@@ -218,6 +350,14 @@ static void update_client_ip_locked(client_entry_t *e, esp_ip4_addr_t new_ip, co
                  old_str, new_str, how);
     }
     e->ip = new_ip;
+    // A new address starts unconfirmed whatever it came from, including a
+    // sniffed one - account_traffic() stamps it immediately afterwards, since
+    // that is the one caller holding the client's own word for it. Doing it
+    // here instead would miss the case that matters most: a client bootstrapped
+    // to the right address never reaches this function again, because of the
+    // early return above, so its traffic could confirm the address a thousand
+    // times over and it would still look like it had never been seen on it.
+    e->ip_since_us = 0;
 }
 
 // observed_ip is the client's real source IP as sniffed directly out of an
@@ -247,6 +387,21 @@ static void account_traffic(const uint8_t *mac, bool is_wifi, uint16_t bytes, bo
             // never changes and this costs one comparison.
             bool ip_is_new = (e->ip.addr != observed_ip->addr);
             update_client_ip_locked(e, *observed_ip, "seen in its own traffic");
+
+            // The moment the client's own traffic first vouches for the address
+            // held for it. This is the only place that can say it: every other
+            // source is the bridge repeating what it believes - flash, the ARP
+            // cache, or the address the server offered - and none of those is
+            // evidence the client is really there.
+            //
+            // Deliberately not refreshed afterwards. It records when the client
+            // was first seen on this address, not when it was last seen, and it
+            // is what decides who keeps an address when two devices claim it:
+            // whoever got there first. A value that moved with every packet
+            // would make the answer alternate between them.
+            if (e->ip_since_us == 0 && e->ip.addr == observed_ip->addr) {
+                e->ip_since_us = esp_timer_get_time();
+            }
 
             // Tell the DHCP server what this client is really using, so the
             // mapping it keeps in flash is the client's actual address rather
@@ -368,9 +523,11 @@ static err_t traffic_input_wrapper(struct pbuf *p, struct netif *inp, bool is_wi
         // client_track_tick() polls can go stale while this can't.
         esp_ip4_addr_t src_ip;
         const esp_ip4_addr_t *src_ip_p = NULL;
+        bool is_dhcp = false;
         if (have_ip_hdr && hdr->type == PP_HTONS(ETHTYPE_IP)) {
             struct ip_hdr *iph = (struct ip_hdr *)((uint8_t *)hdr + sizeof(struct eth_hdr));
-            if (!is_dhcp_packet(iph, have_len - sizeof(struct eth_hdr))) {
+            is_dhcp = is_dhcp_packet(iph, have_len - sizeof(struct eth_hdr));
+            if (!is_dhcp) {
                 src_ip.addr = iph->src.addr;
                 src_ip_p = &src_ip;
             }
@@ -391,6 +548,33 @@ static err_t traffic_input_wrapper(struct pbuf *p, struct netif *inp, bool is_wi
         if (xQueueSend(s_traffic_q, &ev, 0) != pdTRUE) {
             s_traffic_drops++;
         }
+
+        // Cut off a client holding somebody else's address - but only after the
+        // event above is queued. Observing it is what lets the quarantine be
+        // lifted again: a device moved back onto an address of its own is
+        // recognised from this same sniffed source IP, and dropping the frame
+        // before recording it would leave nothing able to notice.
+        //
+        // DHCP is the deliberate hole in this. A device reconfigured from a
+        // static address to DHCP has to be able to ask for one, or the
+        // quarantine is a trap it cannot be fixed out of over the network.
+        //
+        // ARP is *not* let through, and that is the point rather than an
+        // oversight: a gratuitous ARP or an ARP reply from the second device is
+        // the actual mechanism by which a duplicate address breaks everyone
+        // else's cache. Recovery does not need it - a client with no address
+        // does DHCP entirely in broadcast.
+        if (!is_dhcp && mac_is_quarantined(hdr->src.addr)) {
+            s_q_drops[0]++;
+            // Both drivers free the pbuf themselves when input returns anything
+            // but ERR_OK (esp_netif/lwip/netif/{ethernetif,wlanif}.c), so this
+            // frees and reports success instead, keeping them on the path they
+            // take for a frame that was delivered. For WiFi the pbuf is a
+            // custom one from esp_pbuf_allocate() whose free callback hands the
+            // driver's L2 buffer back, so this is the complete release.
+            pbuf_free(p);
+            return ERR_OK;
+        }
     }
     return chain_input(orig, p, inp, is_wifi);
 }
@@ -403,6 +587,30 @@ static err_t eth_input_wrapper(struct pbuf *p, struct netif *inp)
 static err_t wifi_input_wrapper(struct pbuf *p, struct netif *inp)
 {
     return traffic_input_wrapper(p, inp, true, s_wifi_orig_input);
+}
+
+// Whether a downlink frame is DHCP, read the long way round because the TX
+// wrapper only pulls a 12-byte header window in the normal case.
+//
+// Only ever called for a frame already known to be headed for a quarantined
+// MAC, so the extra pbuf_copy_partial() is paid on a path that is by definition
+// not carrying real traffic. The ordinary downlink costs nothing.
+static bool frame_is_dhcp(struct pbuf *p)
+{
+    uint8_t buf[sizeof(struct eth_hdr) + IP_HLEN + 4];
+    if (p == NULL || p->tot_len < sizeof(struct eth_hdr) + IP_HLEN) {
+        return false;
+    }
+    size_t len = (p->tot_len < sizeof(buf)) ? p->tot_len : sizeof(buf);
+    if (pbuf_copy_partial(p, buf, len, 0) != len) {
+        return false;
+    }
+    const struct eth_hdr *hdr = (const struct eth_hdr *)buf;
+    if (hdr->type != PP_HTONS(ETHTYPE_IP)) {
+        return false;
+    }
+    return is_dhcp_packet((const struct ip_hdr *)(buf + sizeof(struct eth_hdr)),
+                          len - sizeof(struct eth_hdr));
 }
 
 // TX wrapper (bridge -> client, downlink). Broadcast/multicast frames are
@@ -433,6 +641,19 @@ static err_t traffic_output_wrapper(struct netif *netif, struct pbuf *p, bool is
         // See traffic_input_wrapper() - timeout 0 here for the same reason.
         if (xQueueSend(s_traffic_q, &ev, 0) != pdTRUE) {
             s_traffic_drops++;
+        }
+
+        // The other half of the cut-off. DHCP has to survive in this direction
+        // too, or the unicast ACK to a client that is renewing never lands and
+        // the escape hatch only half works. The MAC test comes first so the
+        // wider header read behind frame_is_dhcp() only ever happens for a
+        // device that is already being dropped.
+        if (mac_is_quarantined(hdr->dest.addr) && !frame_is_dhcp(p)) {
+            s_q_drops[1]++;
+            // No pbuf_free() here, unlike the RX side: linkoutput never owns
+            // what it is handed. bridgeif_input() frees this whatever
+            // bridgeif_send_to_ports() reports - see s_fwd_out_drops above.
+            return ERR_OK;
         }
     }
     return chain_output(orig, netif, p, is_wifi);
@@ -595,6 +816,322 @@ static void on_wifi_sta_disconnected(void *arg, esp_event_base_t base, int32_t i
              (unsigned)evt->aid, why, describe_client(evt->mac, who, sizeof(who)));
 }
 
+// ---- duplicate-address quarantine, decision half ----
+
+#define Q_ARM_TICKS      3   // consecutive 1Hz confirmations before cutting anyone off
+#define Q_DISARM_TICKS  10   // consecutive clean ticks before letting them back
+#define Q_FORGET_TICKS  30   // ...and before the record itself is dropped
+#define Q_LIVENESS_US    (30LL * 1000000)
+#define Q_LOG_REPEAT_US  (5LL * 60 * 1000000)
+
+typedef struct {
+    bool     used;
+    uint8_t  mac[6];    // the one being cut off
+    uint8_t  peer[6];   // the one keeping the address
+    uint32_t ip;        // contested address, network byte order
+    uint8_t  confirm;   // consecutive ticks this has been visible
+    uint8_t  miss;      // consecutive ticks it has not
+    bool     armed;
+    int64_t  armed_us;
+    int64_t  logged_us; // last time this was announced, to cap repeats
+} conflict_t;
+
+static conflict_t s_conflicts[QUARANTINE_MAX];
+// MACs an operator has pardoned from the console. Not persisted: a pardon is a
+// judgement about the network as it is right now, and carrying it across a
+// reboot would silently disable the check for a device nobody remembers
+// excusing.
+static uint8_t s_q_exempt[QUARANTINE_MAX][6];
+static int s_q_exempt_count;
+// The kill switch. Clearing it stops the dropping only - detection, logging and
+// everything the UI reports carry on, so the diagnosis stays available when the
+// enforcement has to be called off.
+static bool s_q_enforce = true;
+
+// The address a lease entry means a device is actually on. Same precedence as
+// dhcp_server_lookup_ip(): what the client was seen using beats what it was
+// leased. An expired lease claims nothing - that address is exactly what gets
+// recycled - so it reports 0.
+static uint32_t lease_effective_ip(const dhcp_lease_info_t *l)
+{
+    if (l->observed_ip.addr != 0) {
+        return l->observed_ip.addr;
+    }
+    if (l->expires_in_s > 0) {
+        return l->ip.addr;
+    }
+    return 0;
+}
+
+// Caller must hold s_mutex.
+static client_entry_t *find_locked(const uint8_t *mac)
+{
+    for (int i = 0; i < CLIENT_TRACK_MAX_CLIENTS; i++) {
+        if (s_clients[i].active && memcmp(s_clients[i].mac, mac, 6) == 0) {
+            return &s_clients[i];
+        }
+    }
+    return NULL;
+}
+
+// Of two MACs found on one address, true if b is the later arrival - the one
+// that loses it. First device on the address keeps it.
+//
+// Both times come from the client's own traffic (see account_traffic), so this
+// compares like with like: two moments this bridge actually watched a device
+// using the address. Nothing is inferred from flash or the ARP cache, because
+// an address from those says only what this device believed on the last boot,
+// and an earlier belief is not an earlier arrival.
+//
+// A 0 therefore means "never seen there", not "seen there long ago", and cannot
+// win: quarantine_rebuild() refuses to arm at all unless both sides have a real
+// time, so the 0 cases here only run while a conflict is still being confirmed.
+// Ordering them at all is just so the record holds a sensible pair in the
+// meantime.
+//
+// The MAC tie-break is unreachable in a confirmed conflict for the same reason
+// - two devices cannot be first-seen in the same microsecond - and exists so
+// the function is total. Lower MAC keeps the address, which is arbitrary but
+// arbitrary in the same direction every time.
+static bool loser_is_b(const client_entry_t *ea, const client_entry_t *eb,
+                        const uint8_t *ma, const uint8_t *mb)
+{
+    int64_t ta = (ea != NULL) ? ea->ip_since_us : 0;
+    int64_t tb = (eb != NULL) ? eb->ip_since_us : 0;
+
+    if (ta != tb) {
+        // Whoever has no confirmed sighting is the one to give way, and when
+        // both have one the later of the two arrived second.
+        if (ta == 0) {
+            return false;
+        }
+        if (tb == 0) {
+            return true;
+        }
+        return tb > ta;
+    }
+    return memcmp(mb, ma, 6) > 0;
+}
+
+// Caller must hold s_mutex.
+static bool mac_is_exempt_locked(const uint8_t *mac)
+{
+    for (int i = 0; i < s_q_exempt_count; i++) {
+        if (memcmp(s_q_exempt[i], mac, 6) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Caller must hold s_mutex. Finds the record for this address and this pair of
+// MACs, in either order.
+static conflict_t *conflict_find_locked(uint32_t ip, const uint8_t *m1, const uint8_t *m2)
+{
+    for (int i = 0; i < QUARANTINE_MAX; i++) {
+        conflict_t *c = &s_conflicts[i];
+        if (!c->used || c->ip != ip) {
+            continue;
+        }
+        if ((memcmp(c->mac, m1, 6) == 0 && memcmp(c->peer, m2, 6) == 0) ||
+            (memcmp(c->mac, m2, 6) == 0 && memcmp(c->peer, m1, 6) == 0)) {
+            return c;
+        }
+    }
+    return NULL;
+}
+
+// Caller must hold s_mutex.
+static conflict_t *conflict_alloc_locked(void)
+{
+    for (int i = 0; i < QUARANTINE_MAX; i++) {
+        if (!s_conflicts[i].used) {
+            return &s_conflicts[i];
+        }
+    }
+    return NULL;
+}
+
+static void log_conflict(const conflict_t *c, bool armed)
+{
+    esp_ip4_addr_t pretty = { .addr = c->ip };
+    char ip_str[16];
+    esp_ip4addr_ntoa(&pretty, ip_str, sizeof(ip_str));
+    if (armed) {
+        ESP_LOGW(TAG, "duplicate address %s: %02x:%02x:%02x:%02x:%02x:%02x was there first, "
+                      "so %02x:%02x:%02x:%02x:%02x:%02x is being cut off until it moves",
+                 ip_str,
+                 c->peer[0], c->peer[1], c->peer[2], c->peer[3], c->peer[4], c->peer[5],
+                 c->mac[0], c->mac[1], c->mac[2], c->mac[3], c->mac[4], c->mac[5]);
+    } else {
+        ESP_LOGW(TAG, "duplicate address %s resolved - %02x:%02x:%02x:%02x:%02x:%02x "
+                      "is being carried again", ip_str,
+                 c->mac[0], c->mac[1], c->mac[2], c->mac[3], c->mac[4], c->mac[5]);
+    }
+}
+
+// Rebuilds the conflict set from scratch once a second and republishes it.
+//
+// Rebuilding wholesale rather than tracking changes is what makes this
+// self-clearing: a conflict ends because a lease expired, because an entry was
+// reclaimed out of the lease table, or because a device moved to another
+// address, and none of those three announce themselves. Recomputing sees all of
+// them for free.
+//
+// Called once per second from client_track_task, and from nowhere else - the
+// hysteresis counters below are all in units of that tick.
+static void quarantine_rebuild(void)
+{
+    // Static rather than on the stack: 32 lease entries runs to well over a
+    // kilobyte, and client_track_task's 4096 bytes already carry pairs[16],
+    // macs[16][6] and a wifi_sta_list_t. Only this task ever touches it.
+    static dhcp_lease_info_t leases[DHCP_SERVER_MAX_LEASES];
+    int n = dhcp_server_get_leases(leases, DHCP_SERVER_MAX_LEASES);
+    int64_t now = esp_timer_get_time();
+
+    // Taking the dhcp_server snapshot above happens outside this lock, but
+    // holding it across the dhcp_server calls further down would be safe too:
+    // this file's mutex before that one is the established order, and
+    // dhcp_server.c never calls back. See account_traffic().
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+
+    bool seen[QUARANTINE_MAX] = { false };
+
+    for (int i = 0; i < n; i++) {
+        uint32_t addr = lease_effective_ip(&leases[i]);
+        if (addr == 0) {
+            continue;
+        }
+        for (int j = i + 1; j < n; j++) {
+            if (lease_effective_ip(&leases[j]) != addr) {
+                continue;
+            }
+
+            conflict_t *c = conflict_find_locked(addr, leases[i].mac, leases[j].mac);
+            if (c == NULL) {
+                c = conflict_alloc_locked();
+                if (c == NULL) {
+                    continue;   // more simultaneous conflicts than there are slots
+                }
+                memset(c, 0, sizeof(*c));
+                c->used = true;
+                c->ip = addr;
+            }
+
+            // Who loses is settled once and then left alone for as long as the
+            // quarantine holds. Re-deciding every tick would let the answer
+            // alternate between the two devices as their timestamps move, which
+            // is precisely the intermittent behaviour this exists to end.
+            if (!c->armed) {
+                client_entry_t *ei = find_locked(leases[i].mac);
+                client_entry_t *ej = find_locked(leases[j].mac);
+                int loser = loser_is_b(ei, ej, leases[i].mac, leases[j].mac) ? j : i;
+                int winner = (loser == j) ? i : j;
+                memcpy(c->mac, leases[loser].mac, 6);
+                memcpy(c->peer, leases[winner].mac, 6);
+            }
+
+            seen[c - s_conflicts] = true;
+            c->miss = 0;
+            if (c->confirm < Q_ARM_TICKS) {
+                c->confirm++;
+            }
+        }
+    }
+
+    uint8_t armed_macs[QUARANTINE_MAX][6];
+    int armed_count = 0;
+
+    for (int i = 0; i < QUARANTINE_MAX; i++) {
+        conflict_t *c = &s_conflicts[i];
+        if (!c->used) {
+            continue;
+        }
+
+        if (!seen[i]) {
+            c->confirm = 0;
+            if (c->miss < 255) {
+                c->miss++;
+            }
+            if (c->armed && c->miss >= Q_DISARM_TICKS) {
+                c->armed = false;
+                log_conflict(c, false);
+            }
+            if (c->miss >= Q_FORGET_TICKS) {
+                c->used = false;
+                continue;
+            }
+        } else if (!c->armed && c->confirm >= Q_ARM_TICKS) {
+            // Liveness gates arming and nothing else. A lease with time left on
+            // it is not evidence that its holder is on the network, and cutting
+            // a device off for colliding with a machine that was switched off an
+            // hour ago is the largest way this could misfire. Both parties have
+            // to have been heard from recently for the collision to be real.
+            //
+            // It also covers a client that rejoins with a new MAC and keeps its
+            // address: the old MAC stops transmitting the moment the new one
+            // starts, so it falls outside the window before this can arm.
+            client_entry_t *loser = find_locked(c->mac);
+            client_entry_t *winner = find_locked(c->peer);
+            bool both_live = loser != NULL && winner != NULL &&
+                             (now - loser->last_seen_us) < Q_LIVENESS_US &&
+                             (now - winner->last_seen_us) < Q_LIVENESS_US;
+            // And both must have been *seen on the contested address by their
+            // own traffic*, not merely believed to be on it. The lease table
+            // remembers a self-assigned address across reboots, so an entry can
+            // name a device that moved away months ago, or one that is present
+            // but sitting on a different address - and a client that only ever
+            // ARPs never corrects the record, because the address is sniffed
+            // from IPv4 headers.
+            //
+            // Without this a device quietly using its own address gets cut off
+            // in favour of a ghost, which is the worst outcome this code can
+            // produce: a working machine taken off the network to protect an
+            // address nobody is using.
+            bool both_confirmed = both_live &&
+                                  loser->ip_since_us != 0 && winner->ip_since_us != 0 &&
+                                  loser->ip.addr == c->ip && winner->ip.addr == c->ip;
+            if (both_confirmed && !mac_is_exempt_locked(c->mac)) {
+                c->armed = true;
+                c->armed_us = now;
+                // Announced on the edge, and at most once every few minutes for
+                // the same pair. The loser's lease entry can be reclaimed and
+                // then rebuilt by dhcp_server_note_observed_ip() the next time
+                // it speaks, which would otherwise turn a single fault into a
+                // repeating log line.
+                if (c->logged_us == 0 || (now - c->logged_us) > Q_LOG_REPEAT_US) {
+                    c->logged_us = now;
+                    log_conflict(c, true);
+                }
+            }
+        }
+
+        if (c->armed && armed_count < QUARANTINE_MAX) {
+            memcpy(armed_macs[armed_count], c->mac, 6);
+            armed_count++;
+        }
+    }
+
+    // With enforcement off both consumers are handed an empty set, so the
+    // switch means one thing: the bridge takes no action at all. Not just no
+    // dropping - the DHCP server also stops discounting the offender's claim
+    // and stops NAKing it onto another address, which is just as much an action
+    // and would be a surprising thing to still be happening after somebody
+    // turned this off. Detection is untouched: everything above still ran, and
+    // s_conflicts is what the console and the UI report from.
+    //
+    // Publishing empty also keeps the hot path free of any notion of the
+    // switch - it still exits on the single s_q_any load.
+    int enforced = s_q_enforce ? armed_count : 0;
+    quarantine_publish(armed_macs, enforced);
+
+    xSemaphoreGive(s_mutex);
+
+    // Outside the lock, and unconditional: the server has to be told when the
+    // set empties as well as when it fills.
+    dhcp_server_set_quarantined(armed_macs, enforced);
+}
+
 static void client_track_tick(void)
 {
     int64_t now = esp_timer_get_time();
@@ -675,6 +1212,10 @@ static void client_track_tick(void)
         }
     }
     xSemaphoreGive(s_mutex);
+
+    // Last, so it works from the addresses this tick just resolved rather than
+    // from last second's. Takes the lock itself.
+    quarantine_rebuild();
 }
 
 // Runs every CLIENT_TRACK_HISTORY_PERIOD_MS (much more often than the 1Hz
@@ -838,6 +1379,127 @@ void client_track_get_traffic_pps(uint32_t *rx_pps, uint32_t *tx_pps)
     *rx_pps = s_net_rx_pps;
     *tx_pps = s_net_tx_pps;
     xSemaphoreGive(s_mutex);
+}
+
+int client_track_get_conflicts(client_track_conflict_t *out, int max)
+{
+    if (s_mutex == NULL) {
+        return 0;
+    }
+    int64_t now = esp_timer_get_time();
+    int n = 0;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < QUARANTINE_MAX && n < max; i++) {
+        conflict_t *c = &s_conflicts[i];
+        if (!c->used) {
+            continue;
+        }
+        memcpy(out[n].mac, c->mac, 6);
+        memcpy(out[n].peer_mac, c->peer, 6);
+        out[n].ip.addr = c->ip;
+        out[n].armed = c->armed;
+        out[n].dropping = c->armed && s_q_enforce;
+        out[n].exempt = mac_is_exempt_locked(c->mac);
+        out[n].armed_s = c->armed ? (uint32_t)((now - c->armed_us) / 1000000) : 0;
+        n++;
+    }
+    xSemaphoreGive(s_mutex);
+    return n;
+}
+
+int client_track_get_armed_conflicts(void)
+{
+    if (s_mutex == NULL) {
+        return 0;
+    }
+    int n = 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < QUARANTINE_MAX; i++) {
+        if (s_conflicts[i].used && s_conflicts[i].armed) {
+            n++;
+        }
+    }
+    xSemaphoreGive(s_mutex);
+    return n;
+}
+
+void client_track_get_quarantine_drops(uint32_t *uplink, uint32_t *downlink)
+{
+    *uplink = s_q_drops[0];
+    *downlink = s_q_drops[1];
+}
+
+bool client_track_quarantine_clear(const uint8_t mac[6])
+{
+    if (s_mutex == NULL) {
+        return false;
+    }
+    bool done = false;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (mac == NULL) {
+        s_q_exempt_count = 0;
+        done = true;
+    } else if (!mac_is_exempt_locked(mac) && s_q_exempt_count < QUARANTINE_MAX) {
+        memcpy(s_q_exempt[s_q_exempt_count], mac, 6);
+        s_q_exempt_count++;
+        done = true;
+    }
+
+    if (done && mac != NULL) {
+        // Disarm right away rather than waiting on the next rebuild. A pardon
+        // is somebody saying this device is wanted back on the network now, and
+        // a second of continued dropping would read as the command not working.
+        for (int i = 0; i < QUARANTINE_MAX; i++) {
+            conflict_t *c = &s_conflicts[i];
+            if (c->used && c->armed && memcmp(c->mac, mac, 6) == 0) {
+                c->armed = false;
+            }
+        }
+        uint8_t armed_macs[QUARANTINE_MAX][6];
+        int armed_count = 0;
+        for (int i = 0; i < QUARANTINE_MAX; i++) {
+            if (s_conflicts[i].used && s_conflicts[i].armed && armed_count < QUARANTINE_MAX) {
+                memcpy(armed_macs[armed_count], s_conflicts[i].mac, 6);
+                armed_count++;
+            }
+        }
+        quarantine_publish(armed_macs, s_q_enforce ? armed_count : 0);
+    }
+    xSemaphoreGive(s_mutex);
+    return done;
+}
+
+void client_track_quarantine_enforce(bool on)
+{
+    if (s_mutex == NULL) {
+        return;
+    }
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_q_enforce = on;
+    if (!on) {
+        // Stop dropping this instant rather than at the next tick. The DHCP
+        // server's half of it catches up within the second, which is soon
+        // enough - it only bears on the next address it is asked for.
+        quarantine_publish(NULL, 0);
+    } else {
+        uint8_t armed_macs[QUARANTINE_MAX][6];
+        int armed_count = 0;
+        for (int i = 0; i < QUARANTINE_MAX; i++) {
+            if (s_conflicts[i].used && s_conflicts[i].armed && armed_count < QUARANTINE_MAX) {
+                memcpy(armed_macs[armed_count], s_conflicts[i].mac, 6);
+                armed_count++;
+            }
+        }
+        quarantine_publish(armed_macs, armed_count);
+    }
+    xSemaphoreGive(s_mutex);
+}
+
+bool client_track_quarantine_enforcing(void)
+{
+    return s_q_enforce;
 }
 
 void client_track_get_snapshot(client_info_t *out, int max, int *count)

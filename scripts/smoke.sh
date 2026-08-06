@@ -103,6 +103,20 @@ else
   check "GET /api/system boot fields" ok bad
 fi
 
+# Same reasoning as the boot fields above: these three drive the Diagnostics
+# panel's duplicate-address row, and a dropped field there would read as "no
+# conflicts" rather than as a fault. ip_conflicts is a count of conflicts live
+# right now, so 0 is the normal answer on a healthy bridge and this only checks
+# the shape.
+if curl -s --max-time 10 "${AUTH[@]}" "http://${HOST}/api/system" \
+     | jq -e '(.ip_conflicts|type=="number") and (.ip_conflict_drops|type=="number")
+              and (.ip_conflict_enforced|type=="boolean")' \
+     >/dev/null 2>&1; then
+  check "GET /api/system conflict fields" ok ok
+else
+  check "GET /api/system conflict fields" ok bad
+fi
+
 # /api/client/history needs a real client, so it is driven off whoever the
 # device currently lists rather than a hardcoded MAC.
 MAC="$(curl -s --max-time 10 "${AUTH[@]}" "http://${HOST}/api/clients" \
