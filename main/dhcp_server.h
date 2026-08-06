@@ -23,9 +23,10 @@ typedef struct {
     uint32_t expires_in_s;  // 0 if the lease has expired or was only restored from flash
     // Boot generations since this client was last heard from: 0 means it has
     // been seen since the device booted, higher means it is that many
-    // table-writing boots stale. This is the reclaim order - entries are never
-    // dropped on a timer, only when something else needs the room, oldest
-    // first. See the note on s_boot_seq in dhcp_server.c for why elapsed time
+    // table-writing boots stale. This is both the reclaim order - oldest first,
+    // when something else needs the room - and the forgetting rule: an entry
+    // that reaches FORGET_AFTER_BOOTS is dropped at the next load. Never a
+    // clock; see the note on s_boot_seq in dhcp_server.c for why elapsed time
     // is not measurable here.
     uint32_t boots_since_seen;
     bool stored;            // true once this mapping is committed to NVS

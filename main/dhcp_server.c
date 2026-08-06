@@ -62,6 +62,21 @@ static const char *TAG = "dhcp_server";
 // burst of clients joining at once costs one write rather than one each.
 #define SAVE_DEBOUNCE_US (10 * 1000 * 1000)
 
+// Forget a reservation whose client has not been heard from for this many boot
+// generations. Counted in generations rather than hours because hours are not
+// measurable here (see s_boot_seq), and applied at load because that is the only
+// moment the count changes.
+//
+// Five is the point at which a mapping has stopped describing the network. A
+// laptop that is away for a weekend, or a tractor parked for the winter, comes
+// back well inside it and gets its address; a device that has missed five
+// separate boots is one that has been unplugged for good, and keeping its
+// address out of circulation forever helps nobody. The address was already
+// reclaimable on demand before this - what this adds is that the table stops
+// carrying entries nobody will ask about again, so /leases reads as a picture of
+// the network rather than of its history.
+#define FORGET_AFTER_BOOTS 5
+
 // How rarely to repeat the warning that the wired range is full and a wired
 // client is being served from the WiFi one. See note_wired_range_full().
 #define WIRED_FULL_LOG_US (5LL * 60 * 1000000)
@@ -323,12 +338,41 @@ static void load_from_nvs(void)
     s_boot_seq = hdr.boot_seq + 1;
 
     int n = 0;
+    int forgotten = 0;
     for (int i = 0; i < hdr.count; i++) {
         // Zeroed, so fields the stored version predates land as 0: no observed
         // address on v1, and generation 0 - maximally stale - on v1 and v2.
         // That self-corrects the moment each client is heard from again.
         stored_lease_t s = { 0 };
         memcpy(&s, buf + hdr_len + i * rec_size, rec_size);
+
+        // Drop a client that has missed FORGET_AFTER_BOOTS generations. This is
+        // the only place staleness is acted on rather than merely ordered by,
+        // and load is the right moment for it: the count only moves at boot.
+        //
+        // Skipped for v1 and v2 records, whose generation field did not exist
+        // and reads as 0 - maximally stale. Applying the cut-off to those would
+        // empty the table on the one upgrade the versioned loader exists to
+        // carry reservations across.
+        //
+        // A stamp from the future - impossible, but flash is flash - reads as
+        // age 0 and is kept, rather than wrapping to a huge age and being
+        // dropped. Anything genuinely stale will be dropped on the next boot
+        // anyway once it has been rewritten with a sane generation.
+        if (hdr.version >= 3) {
+            uint32_t age = (s_boot_seq > s.last_seen_seq) ? (s_boot_seq - s.last_seen_seq) : 0;
+            if (age > FORGET_AFTER_BOOTS) {
+                esp_ip4_addr_t pretty = { .addr = (s.ip != 0) ? s.ip : s.observed_ip };
+                char ip_str[16];
+                esp_ip4addr_ntoa(&pretty, ip_str, sizeof(ip_str));
+                ESP_LOGI(TAG, "forgetting %s for %02x:%02x:%02x:%02x:%02x:%02x - not seen for "
+                              "%u boots", ip_str, s.mac[0], s.mac[1], s.mac[2], s.mac[3],
+                         s.mac[4], s.mac[5], (unsigned)age);
+                forgotten++;
+                continue;
+            }
+        }
+
         // Restored entries start expired: the reservation is honoured when the
         // client comes back for it, but until then the address is available to
         // be evicted rather than held out of the pool forever.
@@ -398,9 +442,17 @@ static void load_from_nvs(void)
         mark_dirty_locked();
     }
 
+    // Entries dropped above are still in the blob, so the table has to be
+    // written back without them. Deliberately only when something was actually
+    // forgotten: a quiet boot must not cost a flash write.
+    if (forgotten > 0) {
+        mark_dirty_locked();
+    }
+
     s_restored_count = n;
-    ESP_LOGI(TAG, "restored %d MAC->IP reservation%s from flash (generation %u)",
-             n, n == 1 ? "" : "s", (unsigned)s_boot_seq);
+    ESP_LOGI(TAG, "restored %d MAC->IP reservation%s from flash (generation %u)%s",
+             n, n == 1 ? "" : "s", (unsigned)s_boot_seq,
+             forgotten > 0 ? ", forgetting clients not seen for five boots" : "");
 }
 
 // Caller must hold s_mutex.
@@ -608,11 +660,12 @@ static uint32_t reclaimable_address(const lease_t *e, uint32_t start, uint32_t e
     return 0;
 }
 
-// Chooses the entry to give up when something else needs the room. Reservations
-// are never dropped on a timer - see s_boot_seq for why that is not measurable
-// here, and note that a lease expiring means the address may go to someone
-// else, not that the client should be forgotten. A laptop closed overnight
-// outlives the 7200s lease and must still get its address back.
+// Chooses the entry to give up when something else needs the room. Nothing here
+// is a timer - see s_boot_seq for why elapsed time is not measurable, and note
+// that a lease expiring means the address may go to someone else, not that the
+// client should be forgotten. A laptop closed overnight outlives the 7200s lease
+// and must still get its address back. The only thing that drops an entry for
+// being old is FORGET_AFTER_BOOTS, counted in boots and applied at load.
 //
 // Two passes, because a client that set its own address is the one most likely
 // to still be sitting on it and the one least able to be told otherwise:

@@ -267,8 +267,9 @@ function render(data) {
   note.textContent = 'Staleness is counted in boots, not hours: with no clock ' +
                      'across a power cycle, the device cannot tell a board ' +
                      'unplugged for a month from one restarted a second ago. ' +
-                     'Entries are dropped only when the table needs the room, ' +
-                     'oldest generation first.';
+                     'An entry is forgotten once its client has missed five ' +
+                     'boots, and may be taken sooner than that if the table or ' +
+                     'a range needs the room, oldest generation first.';
   footer.appendChild(note);
 
   if (data.leases.some(l => l.conflict)) {

@@ -100,32 +100,40 @@ b8:27:eb:9a:1f:04  192.168.5.60            - now           manual (leased 192.16
 ```
 
 `reserved` is a mapping held for a client that isn't currently here. It is still that
-client's address when it returns, and it is only given to someone else if the pool runs
-out. `factory-reset yes` erases the table along with the rest of the saved config.
+client's address when it returns, and it is only given to someone else if the range runs
+out — or dropped altogether once that client has missed five boots.
+`factory-reset yes` erases the table along with the rest of the saved config.
 
 The same table is on the web UI at `/leases` — see [DHCP leases](#dhcp-leases) below, which
 adds what is actually committed to flash for each MAC.
 
-### Reservations are not expired on a timer
+### Reservations are counted out in boots, not hours
 
-They are dropped only when something else needs the room — a new client with the table
-full, or an address request with the pool exhausted — taking whichever entry has gone
-longest without being heard from, and preferring plain leases over manually-addressed
-clients. Nothing is deleted merely because time passed.
+A reservation is dropped when its client has missed five boots, and may be taken sooner
+than that if something else needs the room — a new client with the table full, or an
+address request with a range exhausted — taking whichever entry has gone longest without
+being heard from, and preferring plain leases over manually-addressed clients. Nothing is
+deleted merely because time passed.
 
-That is a deliberate choice on two counts. The lease is two hours, so expiring
-reservations with it would mean a laptop closed overnight loses its address on every
-reboot — precisely what this feature exists to prevent. And the device cannot measure
-elapsed time anyway: `esp_timer_get_time()` restarts at zero each boot, RTC memory is
-wiped by power-on, there is no RTC battery, and a transparent bridge has no uplink it can
-count on for SNTP. A board unplugged for a month is indistinguishable from one
-power-cycled a second ago.
+Five boots is long enough for anything that is coming back: a laptop shut for a weekend,
+or a tractor parked for the winter, is heard from again well inside it. A client that has
+missed five separate boots is one that has gone, and holding its address out of
+circulation forever only makes the table harder to read.
 
-Reclaiming only needs *ordering*, though, and that much does survive. Each save stamps
-the table with a generation number; an entry carries the generation it was last heard
-from in. The `SEEN` column reports the difference — `now` for a client seen since boot,
-which also makes it ineligible for reclaiming, or `N boots ago` for one that has not
-been. Those counts are boots that wrote the table, not hours.
+That it counts boots rather than hours is a deliberate choice on two counts. The lease is
+two hours, so expiring reservations with it would mean a laptop closed overnight loses its
+address on every reboot — precisely what this feature exists to prevent. And the device
+cannot measure elapsed time anyway: `esp_timer_get_time()` restarts at zero each boot,
+RTC memory is wiped by power-on, there is no RTC battery, and a transparent bridge has no
+uplink it can count on for SNTP. A board unplugged for a month is indistinguishable from
+one power-cycled a second ago.
+
+Counting *boots* does survive, though. Each save stamps the table with a generation
+number; an entry carries the generation it was last heard from in. The `SEEN` column
+reports the difference — `now` for a client seen since boot, which also makes it
+ineligible for reclaiming, or `N boots ago` for one that has not been. Those counts are
+boots that wrote the table, so five of them is five boots that changed something, not
+five power cycles.
 
 **Addresses the device set for itself are recorded too.** A client that ignores DHCP — or
 takes a lease and then applies a static address anyway — never tells the server what it is
