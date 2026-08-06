@@ -38,15 +38,52 @@ The addressing is compiled in (`main/main.c`) and not configurable from the UI o
 | | Value | Set by |
 | --- | --- | --- |
 | Bridge address / netmask | `192.168.5.1` / `255.255.255.0` | `BRIDGE_IP`, `BRIDGE_NETMASK` |
-| DHCP pool | `192.168.5.2` – `192.168.5.101` | `DHCP_START`, `DHCP_END` |
-| Concurrent DHCP leases | 100 (the whole pool) | `DHCP_START`, `DHCP_END` |
+| DHCP range, Ethernet port | `192.168.5.2` – `192.168.5.9` | `ETH_DHCP_START`, `ETH_DHCP_END` |
+| DHCP range, WiFi | `192.168.5.10` – `192.168.5.101` | `WIFI_DHCP_START`, `WIFI_DHCP_END` |
+| Concurrent DHCP leases | 100 (8 wired + 92 WiFi) | the four constants above |
 | Addresses remembered across a reboot | 32 | `DHCP_SERVER_MAX_LEASES` |
 | WiFi stations | 6 | `WIFI_CFG_MAX_STA_CONN` |
 | Clients shown in the table | 16 | `CLIENT_TRACK_MAX_CLIENTS` |
 | Bridge forwarding table | 32 MACs | `max_fdb_dyn_entries` |
 | Client forgotten after | 5 minutes of silence | `CLIENT_AGE_OUT_US` |
 
-Static addresses outside the pool work fine and are not subject to any of these limits.
+Static addresses outside both ranges work fine and are not subject to any of these
+limits.
+
+### Each port has its own DHCP range
+
+Anything that asks for an address over the cable is served from `192.168.5.2` – `.9`,
+and anything that asks over the air from `192.168.5.10` – `.101`, so where a device is
+plugged in is readable from its address. The range is chosen by the port the DHCP
+request itself arrived on, not from a remembered list of which device lives where, so it
+is right the first time a device is plugged in.
+
+There is one DHCP server, not two. The bridge is a single flat network with one
+interface and one socket on the DHCP port; a second server could not be given its own
+share of the traffic even in principle, and the two ranges hand out identical settings
+otherwise — same netmask, same gateway, same DNS.
+
+Addresses in both ranges are remembered across a reboot exactly as
+[described below](#clients-keep-their-address-across-a-reboot). Nothing about the wired
+range is special apart from which port it serves.
+
+- **Several devices on the wired port**, through a switch or otherwise, each get their
+  own address out of `.2` – `.9`, and each gets the same one back next time.
+- **Swapping the cable between two machines** — or between two interfaces on one
+  machine, which is two MACs and so two clients — works the same way: each is served
+  from the wired range and each keeps its own address.
+- **A device that changes ports is renumbered once.** A laptop moved from the cable to
+  WiFi is refused its wired address and comes back on a WiFi one, and the other way
+  round. That is the point of the split rather than a wrinkle in it.
+- **If all eight wired addresses are taken**, a further wired device is served from the
+  WiFi range rather than being left without one, and the log says so. It never happens
+  the other way round: a WiFi station is never given an address out of `.2` – `.9`.
+- **Statically-addressed devices** are unaffected. `.102` – `.254` is outside both ranges
+  and is where the AgOpenGPS modules that set their own addresses live.
+
+On the first boot after an upgrade, clients holding an address that is now in the other
+port's range are renumbered once, each on its next renewal, and keep the new address
+from then on.
 
 ### Clients keep their address across a reboot
 
@@ -57,9 +94,9 @@ there is nothing to configure. `leases` on the serial console shows the table:
 
 ```
 MAC                IP                EXPIRES SEEN          STATE
-fc:e8:c0:4d:ab:94  192.168.5.2         7194s now           active
-a4:83:e7:11:22:33  192.168.5.3             - 2 boots ago   reserved
-b8:27:eb:9a:1f:04  192.168.5.60            - now           manual (leased 192.168.5.4)
+fc:e8:c0:4d:ab:94  192.168.5.3         7194s now           active
+a4:83:e7:11:22:33  192.168.5.4             - 2 boots ago   reserved
+b8:27:eb:9a:1f:04  192.168.5.60            - now           manual (leased 192.168.5.5)
 ```
 
 `reserved` is a mapping held for a client that isn't currently here. It is still that

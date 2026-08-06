@@ -38,8 +38,14 @@ static const char *TAG = "AOG-BRIDGE";
 #define BRIDGE_IP      "192.168.5.1"
 #define BRIDGE_NETMASK "255.255.255.0"
 #define BRIDGE_GW      "192.168.5.1"
-#define DHCP_START     "192.168.5.2"
-#define DHCP_END       "192.168.5.101"
+// A range per bridge port, decided by the port each DHCP request arrives on.
+// The wired one is small because the Ethernet port is normally one machine, and
+// the WiFi one stops well short of the end of the subnet to leave .102 - .254
+// clear for the statically-addressed AgOpenGPS modules that live up there.
+#define ETH_DHCP_START  "192.168.5.2"
+#define ETH_DHCP_END    "192.168.5.9"
+#define WIFI_DHCP_START "192.168.5.10"
+#define WIFI_DHCP_END   "192.168.5.101"
 
 // ETH Configuration
 #define ETH_PHY_ADDR        1
@@ -200,11 +206,13 @@ static void setup_bridge(esp_netif_t *eth_netif, esp_netif_t *wifi_netif, const 
 
     ESP_LOGI(TAG, "Bridge started");
 
-    esp_ip4_addr_t pool_start, pool_end;
-    inet_pton(AF_INET, DHCP_START, &pool_start);
-    inet_pton(AF_INET, DHCP_END, &pool_end);
+    esp_ip4_addr_t pool_start, pool_end, wired_start, wired_end;
+    inet_pton(AF_INET, WIFI_DHCP_START, &pool_start);
+    inet_pton(AF_INET, WIFI_DHCP_END, &pool_end);
+    inet_pton(AF_INET, ETH_DHCP_START, &wired_start);
+    inet_pton(AF_INET, ETH_DHCP_END, &wired_end);
     ESP_ERROR_CHECK(dhcp_server_start(br_netif, br_ip_info.ip, br_ip_info.netmask,
-                                       pool_start, pool_end));
+                                       pool_start, pool_end, wired_start, wired_end));
 
     *out_br_netif = br_netif;
 }
@@ -357,7 +365,9 @@ void app_main(void)
     // The requested range is the effective one now that dhcp_server.c serves
     // it - there is no validation step in between that can quietly substitute
     // a different one, as there was when ESP-IDF's server owned the pool.
-    ESP_LOGI(TAG, "DHCP Pool: %s - %s (%d reservation(s) restored from flash)",
-             DHCP_START, DHCP_END, dhcp_server_get_restored_count());
+    ESP_LOGI(TAG, "DHCP Pool (WiFi):     %s - %s", WIFI_DHCP_START, WIFI_DHCP_END);
+    ESP_LOGI(TAG, "DHCP Pool (Ethernet): %s - %s", ETH_DHCP_START, ETH_DHCP_END);
+    ESP_LOGI(TAG, "  %d reservation(s) restored from flash",
+             dhcp_server_get_restored_count());
     ESP_LOGI(TAG, "====================================\n");
 }

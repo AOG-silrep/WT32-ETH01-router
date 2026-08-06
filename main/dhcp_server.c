@@ -36,6 +36,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "dhcp_server.h"
+#include "client_track.h"   // client_track_mac_on_wired_port()
 
 static const char *TAG = "dhcp_server";
 
@@ -60,6 +61,10 @@ static const char *TAG = "dhcp_server";
 // Wait this long after a mapping changes before writing it to flash, so a
 // burst of clients joining at once costs one write rather than one each.
 #define SAVE_DEBOUNCE_US (10 * 1000 * 1000)
+
+// How rarely to repeat the warning that the wired range is full and a wired
+// client is being served from the WiFi one. See note_wired_range_full().
+#define WIRED_FULL_LOG_US (5LL * 60 * 1000000)
 
 // BOOTP/DHCP message. Packed and byte-order-explicit because it goes on the
 // wire exactly as laid out here.
@@ -140,6 +145,18 @@ static SemaphoreHandle_t s_mutex;
 
 static esp_netif_t *s_br_netif;
 static uint32_t s_server_ip, s_netmask, s_pool_start, s_pool_end;
+// The range served to clients that ask over the cable, or 0/0 if the bridge is
+// serving one range to everybody. Kept clear of [s_pool_start, s_pool_end], so
+// which range a client is served from is decided in one place - the two lines at
+// the top of select_address_locked() - rather than by a check that has to be
+// remembered at each of the four steps below it.
+//
+// The point of a range rather than a single reserved address is that the wired
+// port is not one device. A laptop with two Ethernet interfaces swapped on the
+// same cable is two MACs, and a switch on that port is as many as somebody plugs
+// into it; each of them wants an address of its own, and wants the same one back
+// next time.
+static uint32_t s_wired_start, s_wired_end;
 static int s_sock = -1;
 static int s_restored_count;
 
@@ -463,10 +480,10 @@ static uint32_t ip_offset(uint32_t net_ip, uint32_t delta)
     return lwip_htonl(lwip_ntohl(net_ip) + delta);
 }
 
-// Membership of a range passed in, rather than of the one pool read from a
-// global. Every caller below is serving a particular request out of a particular
-// range, and saying which one at the call site is what will let there be more
-// than one of them.
+// Membership of one served range, rather than of "the pool": there are two of
+// them now, one per bridge port, and every caller below means the range the
+// request in hand is being served from. Passing it in rather than reading a
+// global is what keeps that choice made in exactly one place.
 static bool ip_in_range(uint32_t net_ip, uint32_t start, uint32_t end)
 {
     uint32_t v = lwip_ntohl(net_ip);
@@ -575,6 +592,11 @@ static bool older_than(const lease_t *a, const lease_t *b)
 // occupies a table slot but no address the caller can use, so it is no use to a
 // caller that needs an address to hand out - though it is still fair game to a
 // caller that only needs the slot.
+//
+// The range matters now that there are two of them: an entry parked on a WiFi
+// address releases nothing a wired client can be given, and reclaiming it to
+// serve one would cost a working client its address and still leave the wired
+// client without one.
 static uint32_t reclaimable_address(const lease_t *e, uint32_t start, uint32_t end)
 {
     if (ip_in_range(e->ip, start, end)) {
@@ -662,15 +684,55 @@ static void reclaim_locked(lease_t *e, const char *why)
     }
 }
 
+// Says once, and then rarely, that the wired range is full and a client that
+// asked over the cable is being served from the WiFi range instead. Rate-limited
+// because a client that cannot get an address retries every few seconds, and a
+// fault that fills the log ring buries the diagnosis it is trying to deliver -
+// the same reason the quarantine logging in client_track.c caps its repeats.
+static void note_wired_range_full(const uint8_t mac[6])
+{
+    static int64_t last_us;
+    int64_t now = esp_timer_get_time();
+    if (last_us != 0 && (now - last_us) < WIRED_FULL_LOG_US) {
+        return;
+    }
+    last_us = now;
+
+    char start_str[16], end_str[16];
+    esp_ip4_addr_t s = { .addr = s_wired_start }, e = { .addr = s_wired_end };
+    esp_ip4addr_ntoa(&s, start_str, sizeof(start_str));
+    esp_ip4addr_ntoa(&e, end_str, sizeof(end_str));
+    ESP_LOGW(TAG, "the wired range %s - %s is full - %02x:%02x:%02x:%02x:%02x:%02x asked over "
+                  "the cable and is being served from the general pool instead",
+             start_str, end_str, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
 // Picks the address to offer or acknowledge to mac. Returns 0 if there is
 // nothing to give, in which case the caller stays quiet or NAKs.
 //
 // The order of these four steps is the whole feature: the stored reservation
 // is consulted before anything sequential, so which client asks first stops
 // deciding who gets which address.
-static uint32_t select_address_locked(const uint8_t mac[6], uint32_t requested)
+//
+// wired says the DHCP message being answered arrived over the cable rather than
+// over the air - see client_track_mac_on_wired_port(), which is the only thing
+// that can still tell, the bridge having merged the two ports long before this.
+// It chooses which range is served, and nothing below it needs to know: the
+// steps are the same four they always were, run against one range or the other.
+//
+// A client that changes ports is therefore renumbered, and that is the intent
+// rather than a side effect. Step 1 only confirms a stored reservation that
+// belongs to the range now in play, so a laptop moved from the cable to the air
+// is NAKed off its wired address and comes back on a WiFi one.
+static uint32_t select_address_locked(const uint8_t mac[6], uint32_t requested, bool wired)
 {
+    lease_t *mine = find_by_mac_locked(mac);
+
     uint32_t start = s_pool_start, end = s_pool_end;
+    if (wired && s_wired_start != 0) {
+        start = s_wired_start;
+        end = s_wired_end;
+    }
 
     // 1. This MAC's reservation, if it is still a usable address. Held even
     //    while the client is away, which is what survives the reboot. Skipped
@@ -684,7 +746,6 @@ static uint32_t select_address_locked(const uint8_t mac[6], uint32_t requested)
     //    address. Only works on a client that speaks DHCP at all: one that was
     //    given a static address by hand never asks, so there is nothing to
     //    answer and it stays cut off until somebody reconfigures it.
-    lease_t *mine = find_by_mac_locked(mac);
     if (mine && !mine->quarantined && ip_in_range(mine->ip, start, end) &&
         !ip_declined(mine->ip) && !ip_in_use_locked(mine->ip, mine)) {
         return mine->ip;
@@ -701,6 +762,9 @@ static uint32_t select_address_locked(const uint8_t mac[6], uint32_t requested)
     uint32_t span = lwip_ntohl(end) - lwip_ntohl(start);
     for (uint32_t i = 0; i <= span; i++) {
         uint32_t cand = ip_offset(start, i);
+        // The bridge's own address is skipped rather than assumed to be outside
+        // the range: a range widened over it later should cost nothing rather
+        // than hand out an address that is already spoken for.
         if (cand == s_server_ip || ip_declined(cand)) {
             continue;
         }
@@ -716,6 +780,16 @@ static uint32_t select_address_locked(const uint8_t mac[6], uint32_t requested)
     if (victim != NULL) {
         reclaim_locked(victim, "pool exhausted");
         return reclaimed;
+    }
+
+    // Nothing left in the range asked for. A wired client falls back to the
+    // general pool rather than going away empty: eight addresses is a choice
+    // about tidiness, and no address at all is a device that does not work.
+    // Deliberately one-way - the general pool never spills into the wired range,
+    // which would put WiFi stations in it and undo the point of having one.
+    if (wired && start == s_wired_start && s_wired_start != 0) {
+        note_wired_range_full(mac);
+        return select_address_locked(mac, requested, false);
     }
 
     return 0;
@@ -790,7 +864,7 @@ static bool commit_lease_locked(const uint8_t mac[6], uint32_t ip, uint32_t hold
     // in e->ip by the time the REQUEST confirms an OFFER made moments earlier,
     // and comparing the two would make every new client look unchanged and
     // never reach flash.
-    if (persist && e->saved_ip != ip) {
+    if (persist && e->saved_ip != e->ip) {
         mark_dirty_locked();
     }
     return true;
@@ -1015,8 +1089,12 @@ static void handle_message(dhcp_msg_t *m, size_t len)
     switch (type) {
 
     case DHCPDISCOVER: {
+        // Asked before the lock is taken, not because it is slow but because it
+        // reads a table client_track.c writes from the RX path; keeping it
+        // outside means the two modules never hold each other's locks.
+        bool wired = client_track_mac_on_wired_port(mac);
         xSemaphoreTake(s_mutex, portMAX_DELAY);
-        uint32_t ip = select_address_locked(mac, requested);
+        uint32_t ip = select_address_locked(mac, requested, wired);
         if (ip != 0) {
             // Held, not persisted: an offer the client never takes up should
             // not become a reservation in flash.
@@ -1046,13 +1124,32 @@ static void handle_message(dhcp_msg_t *m, size_t len)
             return;
         }
 
+        bool wired = client_track_mac_on_wired_port(mac);
         xSemaphoreTake(s_mutex, portMAX_DELAY);
-        uint32_t ip = select_address_locked(mac, requested);
+        uint32_t ip = select_address_locked(mac, requested, wired);
         bool ok = (ip != 0) && (requested == 0 || requested == ip);
+        // Whether this is the client *taking* an address rather than renewing
+        // the one it already had. Decided under the lock, said outside it.
+        bool moved = false;
         if (ok) {
+            lease_t *before = find_by_mac_locked(mac);
+            moved = (before == NULL || before->ip != ip);
             commit_lease_locked(mac, ip, LEASE_TIME_S, true);
         }
         xSemaphoreGive(s_mutex);
+
+        if (moved) {
+            // Which port a client was served from is otherwise invisible, and it
+            // is the one thing worth knowing when an address is not what somebody
+            // expected. Only on the ACK, and only when the address changed: a
+            // renewal every couple of hours per client says nothing.
+            esp_ip4_addr_t pretty = { .addr = ip };
+            char ip_str[16];
+            esp_ip4addr_ntoa(&pretty, ip_str, sizeof(ip_str));
+            ESP_LOGI(TAG, "%02x:%02x:%02x:%02x:%02x:%02x asked over %s - giving it %s",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                     wired ? "the wired port" : "WiFi", ip_str);
+        }
 
         if (!ok) {
             // The client is asking for an address this server will not give
@@ -1205,7 +1302,8 @@ static void br_netif_status_cb(void *arg, esp_event_base_t base,
 
 esp_err_t dhcp_server_start(esp_netif_t *br_netif,
                             esp_ip4_addr_t ip, esp_ip4_addr_t netmask,
-                            esp_ip4_addr_t pool_start, esp_ip4_addr_t pool_end)
+                            esp_ip4_addr_t pool_start, esp_ip4_addr_t pool_end,
+                            esp_ip4_addr_t wired_start, esp_ip4_addr_t wired_end)
 {
     if (br_netif == NULL || ip.addr == 0 || pool_start.addr == 0 || pool_end.addr == 0) {
         return ESP_ERR_INVALID_ARG;
@@ -1220,6 +1318,35 @@ esp_err_t dhcp_server_start(esp_netif_t *br_netif,
     s_netmask = netmask.addr;
     s_pool_start = pool_start.addr;
     s_pool_end = pool_end.addr;
+
+    // A wired range that runs backwards, overlaps the general pool, swallows the
+    // bridge's own address or sits on another subnet is a mistake in a
+    // compile-time constant. Complained about and switched off rather than
+    // refused: main.c calls this inside ESP_ERROR_CHECK, so returning an error
+    // here would turn a wrong constant into a device that panics on boot and
+    // cannot be reached to be fixed. A bridge that serves one range to everybody
+    // is a far better failure than one that serves nothing.
+    s_wired_start = wired_start.addr;
+    s_wired_end = wired_end.addr;
+    if (s_wired_start != 0) {
+        uint32_t ws = lwip_ntohl(s_wired_start), we = lwip_ntohl(s_wired_end);
+        uint32_t ps = lwip_ntohl(s_pool_start), pe = lwip_ntohl(s_pool_end);
+        bool bad = (s_wired_end == 0) || (ws > we) ||
+                   (ws <= pe && ps <= we) ||                       // overlaps the pool
+                   ip_in_range(s_server_ip, s_wired_start, s_wired_end) ||
+                   ((s_wired_start & s_netmask) != (s_server_ip & s_netmask)) ||
+                   ((s_wired_end & s_netmask) != (s_server_ip & s_netmask));
+        if (bad) {
+            char s_str[16], e_str[16];
+            esp_ip4addr_ntoa(&wired_start, s_str, sizeof(s_str));
+            esp_ip4addr_ntoa(&wired_end, e_str, sizeof(e_str));
+            ESP_LOGE(TAG, "wired range %s - %s overlaps the pool or the bridge, runs backwards, "
+                          "or is off-subnet - ignoring it and serving one range to every port, "
+                          "fix ETH_DHCP_START/ETH_DHCP_END in main.c", s_str, e_str);
+            s_wired_start = 0;
+            s_wired_end = 0;
+        }
+    }
 
     s_mutex = xSemaphoreCreateMutex();
     if (s_mutex == NULL) {
@@ -1283,10 +1410,19 @@ esp_err_t dhcp_server_start(esp_netif_t *br_netif,
     }
 
     char start_str[16], end_str[16];
+    char wired_str[34] = "none";
     esp_ip4addr_ntoa(&pool_start, start_str, sizeof(start_str));
     esp_ip4addr_ntoa(&pool_end, end_str, sizeof(end_str));
-    ESP_LOGI(TAG, "started - pool %s - %s, %d reservation%s restored from flash",
-             start_str, end_str, s_restored_count, s_restored_count == 1 ? "" : "s");
+    if (s_wired_start != 0) {
+        esp_ip4_addr_t ws = { .addr = s_wired_start }, we = { .addr = s_wired_end };
+        char a[16], b[16];
+        esp_ip4addr_ntoa(&ws, a, sizeof(a));
+        esp_ip4addr_ntoa(&we, b, sizeof(b));
+        snprintf(wired_str, sizeof(wired_str), "%s - %s", a, b);
+    }
+    ESP_LOGI(TAG, "started - wifi %s - %s, wired %s, %d reservation%s restored from flash",
+             start_str, end_str, wired_str, s_restored_count,
+             s_restored_count == 1 ? "" : "s");
     return ESP_OK;
 }
 

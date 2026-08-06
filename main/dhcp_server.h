@@ -52,9 +52,26 @@ typedef struct {
 // esp_event_loop_create_default() already called (it registers handlers), and
 // to run before client_track_init(), which depends on this module for address
 // lookups.
+//
+// [pool_start, pool_end] serves clients that ask over WiFi, and
+// [wired_start, wired_end] those that ask over the Ethernet port - which is
+// established per request by client_track.c, since the bridge has merged the two
+// ports long before a DHCP message gets here. One server, not two: the bridge is
+// a single broadcast domain with one netif and one UDP/67 socket, so a second
+// server could not be handed its own traffic even in principle.
+//
+// The wired range must be on the bridge's subnet and must not overlap
+// [pool_start, pool_end] or contain ip. Pass 0/0 to serve one range to
+// everybody; a range that fails those rules is logged and treated as 0/0 rather
+// than refused, since the caller cannot usefully recover from a wrong
+// compile-time constant at boot.
+//
+// A client that changes ports is renumbered into the range for the port it is
+// now on. Both ranges are remembered across a reboot in the ordinary way.
 esp_err_t dhcp_server_start(esp_netif_t *br_netif,
                             esp_ip4_addr_t ip, esp_ip4_addr_t netmask,
-                            esp_ip4_addr_t pool_start, esp_ip4_addr_t pool_end);
+                            esp_ip4_addr_t pool_start, esp_ip4_addr_t pool_end,
+                            esp_ip4_addr_t wired_start, esp_ip4_addr_t wired_end);
 
 // Records that mac was seen using ip, whether or not this server leased it.
 // A client that assigns itself an address never tells the DHCP server about
