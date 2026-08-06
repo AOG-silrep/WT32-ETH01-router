@@ -463,10 +463,14 @@ static uint32_t ip_offset(uint32_t net_ip, uint32_t delta)
     return lwip_htonl(lwip_ntohl(net_ip) + delta);
 }
 
-static bool ip_in_pool(uint32_t net_ip)
+// Membership of a range passed in, rather than of the one pool read from a
+// global. Every caller below is serving a particular request out of a particular
+// range, and saying which one at the call site is what will let there be more
+// than one of them.
+static bool ip_in_range(uint32_t net_ip, uint32_t start, uint32_t end)
 {
     uint32_t v = lwip_ntohl(net_ip);
-    return net_ip != 0 && v >= lwip_ntohl(s_pool_start) && v <= lwip_ntohl(s_pool_end);
+    return net_ip != 0 && start != 0 && v >= lwip_ntohl(start) && v <= lwip_ntohl(end);
 }
 
 static bool ip_declined(uint32_t net_ip)
@@ -566,17 +570,17 @@ static bool older_than(const lease_t *a, const lease_t *b)
     return a->last_seen_us < b->last_seen_us;
 }
 
-// The in-pool address reclaiming this entry would release, or 0 if it holds
-// none. A client sitting on a self-assigned address outside the pool occupies
-// a table slot but no allocatable address, so it is no use to a caller that
-// needs an address to hand out - though it is still fair game to a caller that
-// only needs the slot.
-static uint32_t reclaimable_address(const lease_t *e)
+// The address inside [start, end] that reclaiming this entry would release, or 0
+// if it holds none. A client sitting on a self-assigned address outside the range
+// occupies a table slot but no address the caller can use, so it is no use to a
+// caller that needs an address to hand out - though it is still fair game to a
+// caller that only needs the slot.
+static uint32_t reclaimable_address(const lease_t *e, uint32_t start, uint32_t end)
 {
-    if (ip_in_pool(e->ip)) {
+    if (ip_in_range(e->ip, start, end)) {
         return e->ip;
     }
-    if (ip_in_pool(e->observed_ip)) {
+    if (ip_in_range(e->observed_ip, start, end)) {
         return e->observed_ip;
     }
     return 0;
@@ -596,8 +600,11 @@ static uint32_t reclaimable_address(const lease_t *e)
 //      have not been heard from this boot
 //
 // Anything heard from since boot is never a victim in either pass. Pass a
-// need_address of true to require the victim release a usable pool address.
-static lease_t *pick_victim_locked(bool need_address, uint32_t *out_ip)
+// need_address of true to require the victim release a usable address from
+// [start, end]; a caller that only wants the table slot passes false, and start
+// and end are then ignored.
+static lease_t *pick_victim_locked(bool need_address, uint32_t start, uint32_t end,
+                                    uint32_t *out_ip)
 {
     int64_t now = esp_timer_get_time();
 
@@ -618,7 +625,7 @@ static lease_t *pick_victim_locked(bool need_address, uint32_t *out_ip)
             if (!manual && e->expires_us >= now) {
                 continue;
             }
-            uint32_t ip = reclaimable_address(e);
+            uint32_t ip = reclaimable_address(e, start, end);
             if (need_address && (ip == 0 || ip_declined(ip))) {
                 continue;
             }
@@ -663,6 +670,8 @@ static void reclaim_locked(lease_t *e, const char *why)
 // deciding who gets which address.
 static uint32_t select_address_locked(const uint8_t mac[6], uint32_t requested)
 {
+    uint32_t start = s_pool_start, end = s_pool_end;
+
     // 1. This MAC's reservation, if it is still a usable address. Held even
     //    while the client is away, which is what survives the reboot. Skipped
     //    if somebody else has since taken the address for real.
@@ -676,22 +685,22 @@ static uint32_t select_address_locked(const uint8_t mac[6], uint32_t requested)
     //    given a static address by hand never asks, so there is nothing to
     //    answer and it stays cut off until somebody reconfigures it.
     lease_t *mine = find_by_mac_locked(mac);
-    if (mine && !mine->quarantined && ip_in_pool(mine->ip) && !ip_declined(mine->ip) &&
-        !ip_in_use_locked(mine->ip, mine)) {
+    if (mine && !mine->quarantined && ip_in_range(mine->ip, start, end) &&
+        !ip_declined(mine->ip) && !ip_in_use_locked(mine->ip, mine)) {
         return mine->ip;
     }
 
     // 2. What the client asked for, if nobody else is on it. Covers a client
     //    that remembers its own last address after our flash was cleared.
-    if (ip_in_pool(requested) && !ip_declined(requested) &&
+    if (ip_in_range(requested, start, end) && !ip_declined(requested) &&
         !ip_in_use_locked(requested, mine)) {
         return requested;
     }
 
-    // 3. First address in the pool nobody has an entry for at all.
-    uint32_t span = lwip_ntohl(s_pool_end) - lwip_ntohl(s_pool_start);
+    // 3. First address in the range nobody has an entry for at all.
+    uint32_t span = lwip_ntohl(end) - lwip_ntohl(start);
     for (uint32_t i = 0; i <= span; i++) {
-        uint32_t cand = ip_offset(s_pool_start, i);
+        uint32_t cand = ip_offset(start, i);
         if (cand == s_server_ip || ip_declined(cand)) {
             continue;
         }
@@ -700,10 +709,10 @@ static uint32_t select_address_locked(const uint8_t mac[6], uint32_t requested)
         }
     }
 
-    // 4. Pool exhausted: take the address off whichever entry has gone longest
+    // 4. Range exhausted: take the address off whichever entry has gone longest
     //    without being heard from, oldest generation first.
     uint32_t reclaimed = 0;
-    lease_t *victim = pick_victim_locked(true, &reclaimed);
+    lease_t *victim = pick_victim_locked(true, start, end, &reclaimed);
     if (victim != NULL) {
         reclaim_locked(victim, "pool exhausted");
         return reclaimed;
@@ -727,7 +736,7 @@ static lease_t *take_free_slot_locked(const uint8_t mac[6])
     if (e == NULL) {
         // Only the slot is needed here, not an allocatable address, so a client
         // parked on an address outside the pool is a fair candidate too.
-        e = pick_victim_locked(false, NULL);
+        e = pick_victim_locked(false, 0, 0, NULL);
         if (e == NULL) {
             return NULL;
         }
