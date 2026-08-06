@@ -94,9 +94,10 @@ static void sys_monitor_task(void *arg)
         // flash write, and this is already that, at a priority that yields to the
         // forwarding path. reset_log's own 1 Hz timer cannot host it - the write
         // would stall the timer task that samples the uptime being written. The
-        // cost lands here, on the few ticks a boot that hit a scheduled
-        // checkpoint, as ~20ms of extra elapsed time folded into that tick's
-        // CPU-load window.
+        // cost lands here, on the few ticks per boot that hit a scheduled
+        // checkpoint, as ~20ms of extra elapsed time - folded into the
+        // FOLLOWING tick's CPU-load window, since the sample above is taken
+        // before the write rather than after.
         reset_log_checkpoint_tick();
     }
 }
