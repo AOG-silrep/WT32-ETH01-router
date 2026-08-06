@@ -631,16 +631,12 @@ async function refreshSystem() {
   dropsEl.textContent = s.traffic_drops;
   dropsEl.classList.toggle('warn', s.traffic_drops > 0);
 
-  // Text node plus an appended anchor rather than innerHTML, matching the
-  // "unsaved" span in leases.html - nothing in this row goes through markup.
+  // Plain text, with no link of its own: the header carries the one link to
+  // /resets, and a second one inside the row bought nothing but width.
   const restartEl = document.getElementById('sys-restart');
   const restart = resetText(s);
-  restartEl.textContent = restart.text + ' ';
+  restartEl.textContent = restart.text;
   restartEl.classList.toggle('warn', restart.fault);
-  const histLink = document.createElement('a');
-  histLink.href = '/resets';
-  histLink.textContent = 'history →';
-  restartEl.appendChild(histLink);
 
   // A link that came up at 10 Mbit or half duplex is flagged the same as one
   // that is down, because it is just as much a cable fault - it simply fails
