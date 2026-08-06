@@ -99,8 +99,9 @@ isn't. Such an address is never handed to another client, even when it falls ins
 DHCP pool, and the client keeps it in the table across a reboot exactly like a leased one.
 If it later goes back to using its lease, the manual entry clears itself. The one exception
 is a client that took an address somebody else was already on — see
-[Two devices on one address](#two-devices-on-one-address) — whose claim stops counting,
-since honouring it would mean reserving the address for the device that lost the argument.
+[Two devices on one address](#two-devices-on-one-address) — whose claim stops counting and
+is kept out of flash entirely, since honouring it would mean reserving the address for the
+device that lost the argument.
 
 Only addresses on the bridge's own subnet are recorded. This is a transparent bridge, so
 traffic from other subnets crosses it legitimately, and a client that fails DHCP and
@@ -178,8 +179,14 @@ quarantine clear <mac|all>   put a device back on the network until reboot
 quarantine off               stop dropping; keep detecting and reporting
 ```
 
-None of this is written to flash. It is re-derived from what the bridge observes after
-every restart, and `quarantine off` survives only until the next one.
+**A restart clears any block.** None of this is written to flash — not the decision, not
+the pardons, not `quarantine off` — and the disputed address is deliberately kept out of
+the saved lease table too. That last part matters more than it sounds: a lease comes back
+from flash expired and claiming nothing, while a self-assigned address comes back claiming
+everything, so a remembered claim by the device that *lost* would hand it the address on
+the next boot and renumber the one that had kept it. Instead the server saves only its own
+allocation record, and if the two devices are still on one address the conflict is found
+again from live traffic within a few seconds and decided from scratch.
 
 This server replaces ESP-IDF's, which is why the two limits that used to be documented here
 are gone. IDF's kept its leases in RAM only, capped the pool at 100 addresses

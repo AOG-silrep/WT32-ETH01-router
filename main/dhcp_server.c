@@ -175,6 +175,27 @@ static void mark_dirty_locked(void)
     }
 }
 
+// What this entry's observed address should look like in flash, as opposed to
+// what it looks like in RAM. The two differ for exactly one reason: a client
+// cut off for holding a duplicate address contributes nothing.
+//
+// A restart is the one thing that clears a block, so nothing about one may
+// outlive it - and persisting the disputed address would do worse than outlive
+// it, it would invert it. The block itself is RAM-only and does go, so on the
+// next boot the entry comes back unquarantined with its claim on the contested
+// address intact and fully counted, while the device that *kept* the address
+// comes back with an expired lease that claims nothing. ip_in_use_locked()
+// would then refuse to give the winner its own address back and renumber it in
+// favour of the device that had been cut off.
+//
+// So the disputed address is kept out of flash entirely. If that leaves nothing
+// worth storing, the entry is dropped from the blob; either way the next boot
+// starts with no memory of the argument and re-derives it from live traffic.
+static uint32_t persisted_observed_ip(const lease_t *e)
+{
+    return e->quarantined ? 0 : e->observed_ip;
+}
+
 // ---- NVS ----
 
 #define NVS_NAMESPACE "dhcp_leases"
@@ -305,6 +326,61 @@ static void load_from_nvs(void)
         s_leases[n].last_seen_us = 0;
         n++;
     }
+    // A restored self-assigned address that something else in the table also
+    // claims is the fossil of a duplicate-address argument. It takes two shapes:
+    // the address is another entry's lease, or two entries both remember taking
+    // it for themselves - which is what a duplicate settles into once both
+    // devices have been seen on it and both mappings have reached flash.
+    //
+    // Neither may be inherited. A lease comes back from flash expired and
+    // claiming nothing, while a self-assigned address comes back claiming
+    // everything, so restoring the argument does not merely preserve it - it
+    // hands the address to whichever side had been cut off, and renumbers the
+    // one that kept it. And a claim from flash is only ever hearsay: it says
+    // what this device believed last boot, not where anything is now.
+    //
+    // So the disputed halves go and the server keeps only its own allocation
+    // record, which is the half it can vouch for. Both sides are dropped when
+    // both claimed it, because neither is more authoritative than the other -
+    // decided from the values as they were read, so the first one cleared does
+    // not stop the second being recognised. If the devices really are still on
+    // one address, both re-earn the claim from live traffic within seconds and
+    // the conflict is decided fresh.
+    bool drop_observed[DHCP_SERVER_MAX_LEASES] = { false };
+    for (int i = 0; i < n; i++) {
+        if (s_leases[i].observed_ip == 0) {
+            continue;
+        }
+        for (int j = 0; j < n; j++) {
+            if (j == i) {
+                continue;
+            }
+            if (s_leases[j].ip == s_leases[i].observed_ip ||
+                s_leases[j].observed_ip == s_leases[i].observed_ip) {
+                drop_observed[i] = true;
+                break;
+            }
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (!drop_observed[i]) {
+            continue;
+        }
+        esp_ip4_addr_t pretty = { .addr = s_leases[i].observed_ip };
+        char ip_str[16];
+        esp_ip4addr_ntoa(&pretty, ip_str, sizeof(ip_str));
+        ESP_LOGW(TAG, "%02x:%02x:%02x:%02x:%02x:%02x was saved using %s, which another "
+                      "client claims too - forgetting that, a restart clears a "
+                      "duplicate address",
+                 s_leases[i].mac[0], s_leases[i].mac[1], s_leases[i].mac[2],
+                 s_leases[i].mac[3], s_leases[i].mac[4], s_leases[i].mac[5], ip_str);
+        s_leases[i].observed_ip = 0;
+        // saved_observed_ip deliberately left as what flash still holds, so the
+        // mismatch marks the table dirty and the blob is rewritten without it
+        // rather than carrying the fossil to the boot after.
+        mark_dirty_locked();
+    }
+
     s_restored_count = n;
     ESP_LOGI(TAG, "restored %d MAC->IP reservation%s from flash (generation %u)",
              n, n == 1 ? "" : "s", (unsigned)s_boot_seq);
@@ -329,14 +405,18 @@ static void save_to_nvs_locked(void)
         // An entry with no lease but an observed address is a client that
         // addressed itself and never asked this server for anything. That
         // mapping is exactly the one worth remembering, so it is not skipped.
-        if (!s_leases[i].in_use ||
-            (s_leases[i].ip == 0 && s_leases[i].observed_ip == 0)) {
+        //
+        // Tested against what will actually be written rather than against the
+        // live fields: a cut-off client whose only address is the disputed one
+        // has nothing left to store, so it leaves the blob altogether.
+        uint32_t observed = persisted_observed_ip(&s_leases[i]);
+        if (!s_leases[i].in_use || (s_leases[i].ip == 0 && observed == 0)) {
             continue;
         }
         stored_lease_t s;
         memcpy(s.mac, s_leases[i].mac, 6);
         s.ip = s_leases[i].ip;
-        s.observed_ip = s_leases[i].observed_ip;
+        s.observed_ip = observed;
         s.last_seen_seq = s_leases[i].last_seen_seq;
         memcpy(buf + off, &s, sizeof(s));
         off += sizeof(s);
@@ -362,10 +442,13 @@ static void save_to_nvs_locked(void)
 
     // Only now do the saved_* fields describe flash. Entries that were dropped
     // from the table are gone from the blob too, so nothing needs clearing.
+    // Recording what was written, not what is in RAM - for a cut-off client
+    // those differ, and copying the live value would leave the entry looking
+    // permanently unsaved and re-arming the debounce on every pass.
     for (int i = 0; i < DHCP_SERVER_MAX_LEASES; i++) {
         if (s_leases[i].in_use) {
             s_leases[i].saved_ip = s_leases[i].ip;
-            s_leases[i].saved_observed_ip = s_leases[i].observed_ip;
+            s_leases[i].saved_observed_ip = persisted_observed_ip(&s_leases[i]);
         }
     }
     s_dirty = false;
@@ -1247,7 +1330,7 @@ void dhcp_server_note_observed_ip(const uint8_t mac[6], esp_ip4_addr_t ip)
     e->last_seen_seq = s_boot_seq;
     e->last_seen_us = esp_timer_get_time();
 
-    if (e->saved_observed_ip != e->observed_ip) {
+    if (e->saved_observed_ip != persisted_observed_ip(e)) {
         mark_dirty_locked();
     }
     xSemaphoreGive(s_mutex);
@@ -1274,6 +1357,16 @@ void dhcp_server_set_quarantined(const uint8_t (*macs)[6], int n)
             }
         }
         e->quarantined = found;
+
+        // Arming changes what this entry should look like in flash, and so does
+        // disarming. The disputed address is usually already written by the
+        // time a conflict is confirmed - the save debounce is 10s and arming
+        // takes 3 - so without this the blob would keep the claim until some
+        // unrelated change happened to rewrite it, which is exactly the state
+        // that must not survive a restart.
+        if (e->saved_observed_ip != persisted_observed_ip(e)) {
+            mark_dirty_locked();
+        }
     }
     xSemaphoreGive(s_mutex);
 }
@@ -1326,8 +1419,11 @@ int dhcp_server_get_leases(dhcp_lease_info_t *out, int max)
         out[n].boots_since_seen = seen_this_boot(e) ? 0 : (s_boot_seq - e->last_seen_seq);
         out[n].saved_ip.addr = e->saved_ip;
         out[n].saved_observed_ip.addr = e->saved_observed_ip;
+        // "Is flash up to date", which for a cut-off client means flash
+        // correctly holding *nothing* for the disputed address - not a pending
+        // write that will never come.
         out[n].stored = (e->saved_ip == e->ip &&
-                         e->saved_observed_ip == e->observed_ip);
+                         e->saved_observed_ip == persisted_observed_ip(e));
         n++;
     }
     xSemaphoreGive(s_mutex);
