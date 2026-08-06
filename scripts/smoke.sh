@@ -43,14 +43,14 @@ code() { curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$@"; }
 echo "smoke: ${HOST} as ${USER}"
 
 # --- pages ------------------------------------------------------------------
-for path in / /admin /logs /leases; do
+for path in / /admin /logs /leases /resets; do
   check "GET ${path}" 200 "$(code "${AUTH[@]}" "http://${HOST}${path}")"
 done
 
 # --- JSON endpoints ---------------------------------------------------------
 # Piped through jq -e, so malformed JSON fails here rather than silently in a
 # browser. This is the check that would catch a response-buffer overflow.
-for path in /api/status /api/clients /api/system /api/leases "/api/logs?since=0"; do
+for path in /api/status /api/clients /api/system /api/leases /api/resets "/api/logs?since=0"; do
   if curl -s --max-time 10 "${AUTH[@]}" "http://${HOST}${path}" | jq -e . >/dev/null 2>&1; then
     check "GET ${path} parses" ok ok
   else
@@ -70,6 +70,37 @@ if curl -s --max-time 10 "${AUTH[@]}" "http://${HOST}/api/leases" \
   check "GET /api/leases shape" ok ok
 else
   check "GET /api/leases shape" ok bad
+fi
+
+# The one list endpoint that is never legitimately empty: a device answering this
+# request has by definition booted at least once, so "length > 0" is a stronger
+# assertion here than it would be for leases or clients.
+if curl -s --max-time 10 "${AUTH[@]}" "http://${HOST}/api/resets" \
+     | jq -e '(.max|type=="number") and (.count|type=="number")
+              and (.resets|type=="array") and (.resets|length > 0)
+              and (.resets|all(has("seq") and has("reason") and has("partition")
+                              and has("uptime_s") and has("uptime_approx")
+                              and has("uptime_max_s")))' \
+     >/dev/null 2>&1; then
+  check "GET /api/resets shape" ok ok
+else
+  check "GET /api/resets shape" ok bad
+fi
+
+# jq -e . above passes on JSON that is valid but incomplete, and this is now the
+# only thing standing between a dropped boot_* field and a blank Diagnostics row
+# on the dashboard. has() rather than a type test for the uptime, because null is
+# the correct value there after a power cycle.
+if curl -s --max-time 10 "${AUTH[@]}" "http://${HOST}/api/system" \
+     | jq -e '(.boot_seq|type=="number") and (.boot_reason|type=="string")
+              and (.boot_intent|type=="string") and has("boot_prev_uptime_s")
+              and (.boot_prev_uptime_approx|type=="boolean")
+              and has("boot_prev_uptime_max_s")
+              and has("boot_prev_ready") and (.boot_rollback|type=="boolean")' \
+     >/dev/null 2>&1; then
+  check "GET /api/system boot fields" ok ok
+else
+  check "GET /api/system boot fields" ok bad
 fi
 
 # /api/client/history needs a real client, so it is driven off whoever the

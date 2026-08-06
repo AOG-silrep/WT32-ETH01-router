@@ -1,6 +1,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include "sys_monitor.h"
+#include "reset_log.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_cpu.h"
@@ -87,6 +88,16 @@ static void sys_monitor_task(void *arg)
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(TICK_PERIOD_MS));
         sys_monitor_tick();
+
+        // Borrowing this loop rather than giving reset_log a task of its own: it
+        // needs a once-a-second call from somewhere that is allowed to block on a
+        // flash write, and this is already that, at a priority that yields to the
+        // forwarding path. reset_log's own 1 Hz timer cannot host it - the write
+        // would stall the timer task that samples the uptime being written. The
+        // cost lands here, on the few ticks a boot that hit a scheduled
+        // checkpoint, as ~20ms of extra elapsed time folded into that tick's
+        // CPU-load window.
+        reset_log_checkpoint_tick();
     }
 }
 

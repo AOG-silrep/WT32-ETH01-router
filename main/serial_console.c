@@ -7,6 +7,7 @@
 #include "dhcp_server.h"
 #include "sys_monitor.h"
 #include "eth_link.h"
+#include "reset_log.h"
 #include "log_buf.h"
 #include "esp_console.h"
 #include "argtable3/argtable3.h"
@@ -74,6 +75,11 @@ static int cmd_wifi(int argc, char **argv)
     fflush(stdout);
     // The AP is a live bridge port - same reasoning as wifi_post_handler:
     // a full reboot re-applies cleanly via the normal boot path.
+    //
+    // Same intent as the web form deliberately: the reset history answers "did
+    // somebody mean this", and which interface they used is already in the log
+    // ring alongside it.
+    reset_log_note_intent(RESET_INTENT_WIFI_SAVE);
     vTaskDelay(pdMS_TO_TICKS(200));
     esp_restart();
     return 0;
@@ -124,6 +130,11 @@ static int cmd_admin(int argc, char **argv)
 
 // ---- sysinfo ----
 
+// Defined down in the resets section, where its two helpers live. Declared here
+// so the "Last restart" line below is worded by exactly the same code as the
+// "resets" command, rather than by a second copy that drifts.
+static void describe_reset(const reset_log_entry_t *e, char *out, size_t n);
+
 static int cmd_sysinfo(int argc, char **argv)
 {
     uint8_t cpu_pct[SYS_MONITOR_NUM_CORES];
@@ -147,6 +158,14 @@ static int cmd_sysinfo(int argc, char **argv)
 
     printf("Version:        %s\n", app_desc->version);
     printf("Uptime:         %llu s\n", (unsigned long long)(esp_timer_get_time() / 1000000ULL));
+    // Deliberately adjacent to Uptime: the two read as one thought - "up four
+    // hours, and last time it was a panic".
+    reset_log_entry_t cur;
+    if (reset_log_get_current(&cur)) {
+        char desc[112];
+        describe_reset(&cur, desc, sizeof(desc));
+        printf("Last restart:   %s\n", desc);
+    }
     printf("Free heap:      %u bytes\n", (unsigned)esp_get_free_heap_size());
     printf("Min free heap:  %u bytes\n", (unsigned)esp_get_minimum_free_heap_size());
     printf("CPU load:       core0 %u%%, core1 %u%%\n", (unsigned)cpu_pct[0], (unsigned)cpu_pct[1]);
@@ -267,6 +286,198 @@ static int cmd_leases(int argc, char **argv)
     return 0;
 }
 
+// ---- resets ----
+
+// How long the boot that ended in this reset had been running. Not a clock
+// reading and never presented as one - see reset_log.h.
+//
+// Whether this record's duration came off the flash checkpoint, which makes it
+// a window rather than a reading. Both renderers below branch on it, so neither
+// has to know how the other says it.
+static bool reset_uptime_is_floor(const reset_log_entry_t *e)
+{
+    return !(e->flags & RESET_LOG_F_PREV_STATE) &&
+            (e->flags & RESET_LOG_F_PREV_UPTIME_MIN) != 0;
+}
+
+// One unit, rounded down. The two-unit form below ("4h 12m") is right for an
+// exact figure and wrong for a bound, where the second unit is precision the
+// number does not have. The year is here so the last point on the checkpoint
+// schedule reads "1y" rather than "365d".
+static void fmt_short(uint32_t s, unsigned *val, const char **unit)
+{
+    if (s >= 365 * 86400) { *val = s / (365 * 86400); *unit = "y"; }
+    else if (s >= 86400)  { *val = s / 86400;         *unit = "d"; }
+    else if (s >= 3600)   { *val = s / 3600;          *unit = "h"; }
+    else if (s >= 60)     { *val = s / 60;            *unit = "m"; }
+    else                  { *val = s;                 *unit = "s"; }
+}
+
+// A checkpoint-recovered figure, marked as the bound it is: ">30s", ">5m",
+// ">1y". The schedule is dense enough that printing the far end too would be
+// noise - it stays available in the tooltip on the web page and in the JSON.
+//
+// "<" for the one record with no lower bound worth stating: a boot that wrote
+// only its seed, where ">0s" would say nothing and the useful statement is the
+// upper end.
+static void fmt_bound(uint32_t floor_s, char *out, size_t n)
+{
+    unsigned v;
+    const char *u;
+
+    if (floor_s == 0) {
+        fmt_short(reset_log_uptime_ceiling(0), &v, &u);
+        snprintf(out, n, "<%u%s", v, u);
+        return;
+    }
+    fmt_short(floor_s, &v, &u);
+    snprintf(out, n, ">%u%s", v, u);
+}
+
+static void reset_ran_for(const reset_log_entry_t *e, char *out, size_t n)
+{
+    if (!(e->flags & (RESET_LOG_F_PREV_STATE | RESET_LOG_F_PREV_UPTIME_MIN))) {
+        // No data at all: this record was written by firmware from before the
+        // checkpoint existed, or that boot's one NVS write failed. Not the same
+        // as a short boot, which now has a checkpoint of its own to say so.
+        // Never substitute 0, which would be a claim.
+        strlcpy(out, "unknown", n);
+        return;
+    }
+    if (reset_uptime_is_floor(e)) {
+        fmt_bound(e->prev_uptime_s, out, n);
+        return;
+    }
+    uint32_t s = e->prev_uptime_s;
+    if (s >= 86400) {
+        snprintf(out, n, "%ud %uh", (unsigned)(s / 86400), (unsigned)((s % 86400) / 3600));
+    } else if (s >= 3600) {
+        snprintf(out, n, "%uh %um", (unsigned)(s / 3600), (unsigned)((s % 3600) / 60));
+    } else if (s >= 60) {
+        snprintf(out, n, "%um %us", (unsigned)(s / 60), (unsigned)(s % 60));
+    } else {
+        snprintf(out, n, "%us", (unsigned)s);
+    }
+}
+
+// One sentence saying what happened, in the order the reader cares about rather
+// than the order the fields are stored in. resets.html composes the same
+// sentence from the same tokens - keep the two in step.
+//
+// Dispatches on the token rather than on the raw esp_reset_reason_t, so that
+// reset_log_reason_name() stays the single place that decides what a code means
+// and this file cannot come to a different conclusion than the JSON does. It
+// also makes the branches line up one-for-one with the JavaScript, which only
+// ever sees the tokens.
+static void reset_what_happened(const reset_log_entry_t *e, char *out, size_t n)
+{
+    const char *reason = reset_log_reason_name(e->reason);
+
+    if (e->flags & RESET_LOG_F_ROLLBACK) {
+        strlcpy(out, "rolled back from a failed update", n);
+    } else if (e->intent == RESET_INTENT_OTA) {
+        strlcpy(out, "restart for firmware update", n);
+    } else if (e->intent == RESET_INTENT_WIFI_SAVE) {
+        strlcpy(out, "restart to apply WiFi settings", n);
+    } else if (e->intent == RESET_INTENT_CONSOLE) {
+        strlcpy(out, "console requested restart", n);
+    } else if (e->intent == RESET_INTENT_FACTORY_RESET) {
+        strlcpy(out, "factory reset", n);
+    } else if (strcmp(reason, "panic") == 0) {
+        strlcpy(out, "crashed (panic)", n);
+    } else if (strcmp(reason, "int-wdt") == 0 || strcmp(reason, "task-wdt") == 0 ||
+               strcmp(reason, "other-wdt") == 0) {
+        strlcpy(out, "watchdog reset - something stopped responding", n);
+    } else if (strcmp(reason, "brownout") == 0) {
+        strlcpy(out, "brownout - the supply voltage dipped", n);
+    } else if (strcmp(reason, "power-on") == 0) {
+        // Never "power loss". A rail that collapses past the chip's own reset
+        // threshold looks exactly like somebody flipping a switch, so the
+        // record cannot tell them apart and should not pretend to.
+        strlcpy(out, "power-on or power loss", n);
+    } else if (strcmp(reason, "software") == 0) {
+        // Nothing here restarts itself without tagging it first, so an untagged
+        // software reset is a panic that got tidied up, or a path nobody
+        // accounted for. Either way it is worth looking at.
+        strlcpy(out, "restarted by software, untagged", n);
+    } else {
+        snprintf(out, n, "unknown reason (code %u)", (unsigned)e->reason);
+    }
+
+    // The boot-loop signature, and the whole reason reset_log_note_ready()
+    // exists. Only claimed when the previous boot's state actually survived -
+    // absent state is not evidence of a short boot.
+    if ((e->flags & RESET_LOG_F_PREV_STATE) && !(e->flags & RESET_LOG_F_REACHED_READY)) {
+        strlcat(out, ", during startup", n);
+    }
+}
+
+// Shared with cmd_sysinfo so the two never describe the same boot differently.
+static void describe_reset(const reset_log_entry_t *e, char *out, size_t n)
+{
+    char what[64], ran[24];
+    reset_what_happened(e, what, sizeof(what));
+    reset_ran_for(e, ran, sizeof(ran));
+    if (e->flags & RESET_LOG_F_PREV_STATE) {
+        snprintf(out, n, "%s after %s (boot #%u)", what, ran, (unsigned)e->boot_seq);
+    } else if (reset_uptime_is_floor(e) && e->prev_uptime_s == 0) {
+        // ran is already "<10s"; a sentence has the room to spell it out, and
+        // "after <10s" reads worse than this does.
+        snprintf(out, n, "%s in under %u seconds (boot #%u)", what,
+                 (unsigned)reset_log_uptime_ceiling(0), (unsigned)e->boot_seq);
+    } else if (reset_uptime_is_floor(e)) {
+        // ran is ">5m"; again the mark belongs in the column, not the sentence.
+        snprintf(out, n, "%s after more than %s (boot #%u)", what, ran + 1,
+                 (unsigned)e->boot_seq);
+    } else {
+        snprintf(out, n, "%s (boot #%u)", what, (unsigned)e->boot_seq);
+    }
+}
+
+static int cmd_resets(int argc, char **argv)
+{
+    reset_log_entry_t recs[RESET_LOG_MAX_RECORDS];
+    int count = reset_log_get(recs, RESET_LOG_MAX_RECORDS);
+
+    if (count == 0) {
+        printf("No reset history yet.\n");
+        return 0;
+    }
+
+    printf("%-6s %-46s %9s  %s\n", "BOOT", "WHAT HAPPENED", "RAN FOR", "FIRMWARE");
+    for (int i = 0; i < count; i++) {
+        char seq_str[12];
+        snprintf(seq_str, sizeof(seq_str), "#%u", (unsigned)recs[i].boot_seq);
+
+        char what[64], ran[24];
+        reset_what_happened(&recs[i], what, sizeof(what));
+        reset_ran_for(&recs[i], ran, sizeof(ran));
+
+        char fw[64];
+        snprintf(fw, sizeof(fw), "%s %s%s", recs[i].version, recs[i].part,
+                 (recs[i].flags & RESET_LOG_F_OTA_PENDING) ? " (on trial)" : "");
+
+        printf("%-6s %-46s %9s  %s\n", seq_str, what, ran, fw);
+    }
+
+    // Only explained when there is something on screen to explain, so the
+    // footer of a device that has never lost power stays two lines.
+    bool any_floor = false;
+    for (int i = 0; i < count; i++) {
+        any_floor = any_floor || reset_uptime_is_floor(&recs[i]);
+    }
+    if (any_floor) {
+        printf("\nA marked figure (\">5m\", \"<10s\") is recovered from the uptime checkpoint\n"
+               "in flash after a power event, and is a bound rather than a reading. An\n"
+               "unmarked one came exactly from the counter in RTC memory.\n");
+    }
+
+    printf("\n%d of %d records kept. Ordered, not timestamped - this device has no\n"
+           "clock across a reboot. Kept across factory-reset on purpose.\n",
+           count, RESET_LOG_MAX_RECORDS);
+    return 0;
+}
+
 // ---- loglevel ----
 
 static const struct {
@@ -359,6 +570,7 @@ static int cmd_reboot(int argc, char **argv)
 {
     printf("Rebooting...\n");
     fflush(stdout);
+    reset_log_note_intent(RESET_INTENT_CONSOLE);
     vTaskDelay(pdMS_TO_TICKS(200));
     esp_restart();
     return 0;
@@ -397,7 +609,15 @@ static int cmd_factory_reset(int argc, char **argv)
     if (factory_reset_args.confirm->count == 0 || strcmp(factory_reset_args.confirm->sval[0], "yes") != 0) {
         printf("This erases the saved WiFi and admin credentials and the saved DHCP\n"
                "address reservations, restoring compiled-in defaults, then reboots.\n"
-               "Clients will be given fresh addresses. Run \"factory-reset yes\" to confirm.\n");
+               "Clients will be given fresh addresses.\n"
+               "\n"
+               "The reboot/crash history is kept. It is evidence about the device\n"
+               "rather than configuration of it, and a factory reset is often the\n"
+               "first thing tried on a device that keeps restarting - erasing it\n"
+               "would destroy the record of the very fault being chased. Use\n"
+               "\"resets\" to read it.\n"
+               "\n"
+               "Run \"factory-reset yes\" to confirm.\n");
         return 0;
     }
 
@@ -412,6 +632,7 @@ static int cmd_factory_reset(int argc, char **argv)
 
     printf("Config erased. Rebooting...\n");
     fflush(stdout);
+    reset_log_note_intent(RESET_INTENT_FACTORY_RESET);
     vTaskDelay(pdMS_TO_TICKS(200));
     esp_restart();
     return 0;
@@ -471,6 +692,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&leases_cmd));
 
+    const esp_console_cmd_t resets_cmd = {
+        .command = "resets",
+        .help = "List why this device restarted, most recent first. Kept in flash across "
+                "reboots, and deliberately across factory-reset.",
+        .hint = NULL,
+        .func = &cmd_resets,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&resets_cmd));
+
     loglevel_args.level = arg_str0(NULL, NULL, "<level>", "none|error|warn|info|debug|verbose");
     loglevel_args.end = arg_end(1);
     const esp_console_cmd_t loglevel_cmd = {
@@ -494,7 +724,7 @@ static void register_commands(void)
     factory_reset_args.end = arg_end(1);
     const esp_console_cmd_t factory_reset_cmd = {
         .command = "factory-reset",
-        .help = "Erase saved WiFi/admin config and DHCP reservations back to compiled-in defaults and reboot.",
+        .help = "Erase saved WiFi/admin config and DHCP reservations back to compiled-in defaults and reboot. The reboot/crash history is deliberately kept.",
         .hint = NULL,
         .func = &cmd_factory_reset,
         .argtable = &factory_reset_args,

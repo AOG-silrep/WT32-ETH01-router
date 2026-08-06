@@ -231,11 +231,12 @@ still the default. `GET`s need nothing else; the four `POST`s need the `Content-
 
 | Route | Method | Body / query | Returns |
 | --- | --- | --- | --- |
-| `/` `/admin` `/logs` `/leases` | GET | — | the four HTML pages |
+| `/` `/admin` `/logs` `/leases` `/resets` | GET | — | the five HTML pages |
 | `/api/status` | GET | — | `{ssid, channel}` |
 | `/api/system` | GET | — | see the table below |
 | `/api/clients` | GET | — | array, one object per client |
 | `/api/leases` | GET | — | `{max, restored, leases[]}` — the DHCP table, live and as saved |
+| `/api/resets` | GET | — | `{max, count, resets[]}` — why this device restarted, newest first |
 | `/api/client/history?mac=&since=` | GET | `mac` required, `since` optional | fine-grained traffic history |
 | `/api/logs?since=` | GET | `since` optional | log lines newer than the cursor |
 | `/api/logs/level` | POST | `{"level":"info"}` | sets the capture level |
@@ -266,7 +267,51 @@ and `restarted` when the device rebooted under your cursor.
 | `wifi_tx_total`, `wifi_tx_failed` | frames handed to the radio, and those it gave up on after exhausting 802.11 retries |
 | `eth_link`, `eth_speed_mbit`, `eth_duplex`, `eth_autoneg` | what the Ethernet PHY negotiated; `eth_duplex` is `""` while down |
 | `eth_flaps`, `eth_change_s` | link-down transitions since boot, and seconds held in the current state |
+| `boot_seq` | boots **recorded** (see below), 1-based |
+| `boot_reason` | `power-on`, `panic`, `int-wdt`, `task-wdt`, `brownout`, `software`, … |
+| `boot_intent` | `ota`, `wifi-save`, `console`, `factory-reset`, or `unknown` if nothing tagged it |
+| `boot_prev_uptime_s` | seconds the previous boot lasted, or `null` if unrecoverable |
+| `boot_prev_uptime_approx` | the figure above is the **low end of a window**, recovered from flash after a power event |
+| `boot_prev_uptime_max_s` | the high end of that window, or `null` when the figure is exact |
+| `boot_prev_ready` | whether the previous boot finished starting, or `null` if unrecoverable |
+| `boot_rollback` | the bootloader reverted a failed OTA image to reach this boot |
 | `version` | contents of `version.txt` at build time |
+
+The `boot_*` fields summarise the newest entry in the reboot history; `/api/resets` and the
+`resets` console command carry the whole ring, and `/resets` renders it. Six things about it
+are easy to get wrong:
+
+- **Nothing is timestamped, and nothing can be.** `esp_timer` restarts at 0 each boot, RTC
+  memory is wiped by power-on, there is no RTC battery, and a transparent bridge has no
+  reliable SNTP uplink. Resets can be ordered and each boot's *duration* measured; a board
+  unplugged for a month and one power-cycled a second ago produce identical records.
+- **`power-on` and a hard power loss are the same record.** A dip the brownout detector
+  catches while the chip is still running reports honestly as `brownout`, with its uptime
+  intact. A rail that collapses past the chip's own reset threshold does not. The diagnosis is
+  a *pattern*: repeated `power-on` entries with short durations, on a device nobody is
+  switching off, is a supply problem rather than a firmware one.
+- **A duration after a power event is a bound, not a reading.** Uptime is counted in RTC
+  memory, which a power-on wipes, so the device also copies the counter to flash on a fixed
+  schedule of 32 points — 10s, 20s, 30s, 40s, 50s, 1m, 2m, 3m, 4m, 5m, 10m, 15m, 30m, 45m,
+  1h, 2h, 3h, 4h, 8h, 12h, 18h, 1d, 2d, 3d, 4d, 8d, 16d, 32d, 64d, 128d, 256d, 1y — dense
+  where the diagnosis is and roughly doubling after that. Past a year it stops, so the whole
+  cost is at most 32 writes per boot rather than a rate. What comes back renders as the bound
+  it is (`>30s`, `>5m`, `>1y`), with `<10s` for a boot that only managed its seed. The JSON
+  carries both ends (`uptime_s` / `uptime_max_s`, flagged by `uptime_approx`); `uptime_max_s`
+  is `null` when the figure is exact, and also past a year, where there is no upper end.
+  Where RTC memory survived — a panic, a watchdog, any deliberate restart — the figure is
+  exact and renders unmarked.
+- **`unknown` means no data, not a short boot.** Every boot seeds a checkpoint of zero as it
+  starts, riding the same flash write that appends its record, so a boot that dies in four
+  seconds still reports `<10s`. A record with no checkpoint behind it ran firmware from
+  before this existed, or its one write to flash failed. Keeping those apart is what makes a
+  low figure trustworthy: without the seed, a device serial-flashed from an older build would
+  report a boot that had run for a week as having died immediately.
+- **`boot_seq` counts boots that reached the firmware**, not power-ups. A bootloader-level
+  failure — a rejected signature, a corrupt image — never gets a record and leaves no gap.
+- **`factory-reset` deliberately keeps this history.** It is evidence about the device rather
+  than configuration of it, and a factory reset is often the first thing tried on a device
+  that keeps restarting. Only the NVS-corruption recovery path erases it.
 
 `traffic_drops` is the one that misleads. It counts events the per-client accounting queue
 could not keep up with; it never counts forwarded frames, and nothing in that path can drop a

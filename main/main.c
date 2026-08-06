@@ -25,6 +25,7 @@
 #include "client_track.h"
 #include "sys_monitor.h"
 #include "eth_link.h"
+#include "reset_log.h"
 #include "auth_cfg.h"
 #include "web_server.h"
 #include "serial_console.h"
@@ -226,7 +227,23 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
-    
+
+    // Why this early: the record has to be in flash before this boot can produce
+    // a reset of its own. A boot that dies in eth_init() below must not be the
+    // one that loses the evidence of the last five times it did the same thing,
+    // which is the case this module exists for. It needs NVS, just above, and
+    // nothing else - esp_reset_reason() was latched by the startup code long
+    // before app_main, and the OTA state it reads comes straight off flash.
+    //
+    // Not ESP_ERROR_CHECK'd, unlike every other init in this function. Those are
+    // load-bearing for bridging; this one is evidence. Refusing to boot because
+    // the crash history could not be written would be a self-inflicted brick on
+    // a device installed in a field.
+    esp_err_t reset_log_ret = reset_log_init();
+    if (reset_log_ret != ESP_OK) {
+        ESP_LOGW(TAG, "reset history unavailable: %s", esp_err_to_name(reset_log_ret));
+    }
+
     // Initialize network interface
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -299,6 +316,13 @@ void app_main(void)
         ESP_LOGD(TAG, "OTA rollback: mark-valid not applicable here (%s)",
                  esp_err_to_name(ota_mark_ret));
     }
+
+    // Startup got all the way through - mark-valid above is the last thing in it
+    // that can go wrong. Costs no flash, just a word of RTC memory, unlike the
+    // uptime checkpoint the reset history also keeps. What it buys the next boot:
+    // the difference between a device that crashed after running for ninety
+    // seconds and one that never finished starting.
+    reset_log_note_ready();
 
     ESP_LOGI(TAG, "\n====================================");
     ESP_LOGI(TAG, "Bridge Ready!");

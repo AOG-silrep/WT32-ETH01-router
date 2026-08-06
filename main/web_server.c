@@ -10,6 +10,7 @@
 #include "dhcp_server.h"
 #include "sys_monitor.h"
 #include "eth_link.h"
+#include "reset_log.h"
 #include "log_buf.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
@@ -29,6 +30,8 @@ extern const uint8_t logs_html_start[] asm("_binary_logs_html_start");
 extern const uint8_t logs_html_end[] asm("_binary_logs_html_end");
 extern const uint8_t leases_html_start[] asm("_binary_leases_html_start");
 extern const uint8_t leases_html_end[] asm("_binary_leases_html_end");
+extern const uint8_t resets_html_start[] asm("_binary_resets_html_start");
+extern const uint8_t resets_html_end[] asm("_binary_resets_html_end");
 
 // Pulls a JSON string field's value out of a flat {"key":"value",...}
 // object. Good enough for the small, fixed-shape request bodies this
@@ -759,6 +762,11 @@ static esp_err_t wifi_post_handler(httpd_req_t *req)
     // manual power-cycle. A full restart re-applies the saved config
     // cleanly via the normal boot path (wifi_init_softap()). Delay briefly
     // so the response above actually reaches the client first.
+    //
+    // Tagged before the delay, not after: an untagged software reset is
+    // indistinguishable from a panic that got tidied up on the way out, and
+    // this one has a person behind it.
+    reset_log_note_intent(RESET_INTENT_WIFI_SAVE);
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
 }
@@ -926,7 +934,9 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
 
     // Same pattern as wifi_post_handler: let the response reach the client
-    // before tearing everything down for the reboot into the new image.
+    // before tearing everything down for the reboot into the new image, and
+    // tag the restart ahead of the delay.
+    reset_log_note_intent(RESET_INTENT_OTA);
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
 }
@@ -1069,6 +1079,110 @@ static esp_err_t leases_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// Why this device restarted, newest first. Each record straddles two boots on
+// purpose - reason and uptime_s describe how the previous one ended, version and
+// partition what came up afterwards.
+//
+// reached_ready is null whenever the RTC counter did not survive, which is the
+// normal case after a power cycle; see reset_log.h for why that absence is itself
+// the evidence. uptime_s follows it down only when the flash checkpoint has
+// nothing for that boot either - where it does, uptime_s and uptime_max_s bound
+// the duration from below and above, and uptime_approx says it is a window
+// rather than a reading. A client that ignores the window and reads uptime_s
+// alone will understate a duration, never overstate one, which is why zero is a
+// safe value to send there: it means "under uptime_max_s", not "no time at all".
+static esp_err_t resets_get_handler(httpd_req_t *req)
+{
+    if (!check_admin_auth(req)) {
+        send_auth_error(req);
+        return ESP_OK;
+    }
+    if (auth_cfg_password_is_default()) {
+        send_setup_required(req);
+        return ESP_OK;
+    }
+
+    reset_log_entry_t recs[RESET_LOG_MAX_RECORDS];
+    int count = reset_log_get(recs, RESET_LOG_MAX_RECORDS);
+
+    // 246 bytes is a measured worst-case entry with an empty version - the
+    // longest reason and intent tokens, seq and uptimes at 10 digits, and the
+    // keys - so 288 leaves room for a field being added without this being
+    // recalculated. It was 198 before uptime_approx and 220 before uptime_max_s,
+    // which is what used up the old 240: recheck this rather than assume it when
+    // adding the next one.
+    // The measurement caps reason_code at 3 digits because it is a uint8_t. On top
+    // of that the 6x
+    // expansion of JSON-escaping a version string: that string was written by a
+    // *different* firmware image than the one running, which puts it on the
+    // device-supplied side of json_append_escaped()'s rule even though nothing
+    // on the network chose it. Static because the httpd worker's 8KB stack is
+    // shared with the OTA path, same as the other list endpoints here.
+    static char resp[RESET_LOG_MAX_RECORDS * 288 +
+                     RESET_LOG_MAX_RECORDS * 6 * RESET_LOG_VERSION_MAX + 96];
+    int off = resp_append(resp, sizeof(resp), 0,
+                           "{\"max\":%d,\"count\":%d,\"resets\":[",
+                           RESET_LOG_MAX_RECORDS, count);
+    for (int i = 0; i < count && off < sizeof(resp); i++) {
+        reset_log_entry_t *e = &recs[i];
+        bool have_prev = (e->flags & RESET_LOG_F_PREV_STATE) != 0;
+        // The checkpoint path carries a duration and nothing else, so it fills in
+        // uptime_s and leaves reached_ready null - a figure written an hour into a
+        // boot is no evidence about how that boot started.
+        bool approx = !have_prev && (e->flags & RESET_LOG_F_PREV_UPTIME_MIN) != 0;
+
+        char uptime_str[12] = "null";
+        char uptime_max_str[12] = "null";
+        const char *ready_str = "null";
+        if (have_prev || approx) {
+            snprintf(uptime_str, sizeof(uptime_str), "%u", (unsigned)e->prev_uptime_s);
+        }
+        if (approx) {
+            // Only meaningful on the checkpoint path: an exact figure has no
+            // upper end to give, and sending one would invite a range around a
+            // number that does not need one. Zero back from the ceiling means the
+            // schedule has run out - a boot up more than a year - and stays null
+            // rather than being sent as a bound of zero.
+            uint32_t ceil_s = reset_log_uptime_ceiling(e->prev_uptime_s);
+            if (ceil_s != 0) {
+                snprintf(uptime_max_str, sizeof(uptime_max_str), "%u", (unsigned)ceil_s);
+            }
+        }
+        if (have_prev) {
+            ready_str = (e->flags & RESET_LOG_F_REACHED_READY) ? "true" : "false";
+        }
+
+        // reason_code carries the raw esp_reset_reason_t beside the token, so a
+        // value this build's switch does not enumerate - a newer IDF, or a record
+        // written by a later firmware into the same struct version - is still
+        // readable by whoever is debugging.
+        off = resp_append(resp, sizeof(resp), off,
+                           "%s{\"seq\":%u,\"reason\":\"%s\",\"reason_code\":%u,"
+                           "\"intent\":\"%s\",\"uptime_s\":%s,\"uptime_approx\":%s,"
+                           "\"uptime_max_s\":%s,\"reached_ready\":%s,"
+                           "\"ota_pending\":%s,\"rollback\":%s,"
+                           "\"partition\":\"%s\",\"version\":\"",
+                           i == 0 ? "" : ",",
+                           (unsigned)e->boot_seq,
+                           reset_log_reason_name(e->reason), (unsigned)e->reason,
+                           reset_log_intent_name(e->intent),
+                           uptime_str, approx ? "true" : "false", uptime_max_str, ready_str,
+                           (e->flags & RESET_LOG_F_OTA_PENDING) ? "true" : "false",
+                           (e->flags & RESET_LOG_F_ROLLBACK) ? "true" : "false",
+                           // A partition-table label, a build artefact of this
+                           // image rather than of the one that wrote the record.
+                           e->part);
+        off = json_append_escaped(resp, sizeof(resp), off, e->version);
+        off = resp_append(resp, sizeof(resp), off, "\"}");
+    }
+    off = resp_append(resp, sizeof(resp), off, "]}");
+
+    if (!resp_send_json(req, resp, off, sizeof(resp))) {
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
 // Parses "aa:bb:cc:dd:ee:ff" into 6 raw bytes. Uses an unsigned int scratch
 // array rather than scanning directly into mac's uint8_t slots - %hhx support
 // varies across newlib scanf configurations, %x into a wider int does not.
@@ -1189,11 +1303,48 @@ static esp_err_t system_get_handler(httpd_req_t *req)
 
     const esp_app_desc_t *app_desc = esp_app_get_description();
 
-    // 768 rather than 640: the eth_* fields below add ~130 bytes to a worst
-    // case that was already around 450, which left too little headroom to
-    // trust. Overflow is caught (resp_send_json sends a 500, and smoke.sh
-    // runs this endpoint through jq -e) but it shouldn't be run this close.
-    char resp[768];
+    // Why this boot happened. The two unknowable values go out as JSON null
+    // rather than as a zero with a companion boolean - same shape clients_get_handler
+    // already uses for rssi, and for the same reason: 0 and false would be
+    // claims, and after a power cycle the honest answer is that the device
+    // cannot know. See reset_log.h.
+    // Zeroed rather than left to the have_boot guards below: every read of it is
+    // guarded, but a future field added to the format string should not have to
+    // rediscover that.
+    reset_log_entry_t boot = { 0 };
+    bool have_boot = reset_log_get_current(&boot);
+    char boot_uptime_str[12] = "null";
+    const char *boot_ready_str = "null";
+    // Recovered from the flash checkpoint rather than read off the RTC counter,
+    // which makes the number the low end of a window and not a reading. Sent as
+    // its own boolean rather than folded into the value, so a client that does
+    // not know about it still gets a duration it can render - just an
+    // understated one.
+    char boot_uptime_max_str[12] = "null";
+    bool boot_uptime_approx = have_boot && !(boot.flags & RESET_LOG_F_PREV_STATE) &&
+                              (boot.flags & RESET_LOG_F_PREV_UPTIME_MIN) != 0;
+    if (have_boot && (boot.flags & RESET_LOG_F_PREV_STATE)) {
+        snprintf(boot_uptime_str, sizeof(boot_uptime_str), "%u", (unsigned)boot.prev_uptime_s);
+        boot_ready_str = (boot.flags & RESET_LOG_F_REACHED_READY) ? "true" : "false";
+    } else if (boot_uptime_approx) {
+        snprintf(boot_uptime_str, sizeof(boot_uptime_str), "%u", (unsigned)boot.prev_uptime_s);
+        // Null rather than 0 once the schedule has run out; see the same case in
+        // resets_get_handler().
+        uint32_t boot_ceil_s = reset_log_uptime_ceiling(boot.prev_uptime_s);
+        if (boot_ceil_s != 0) {
+            snprintf(boot_uptime_max_str, sizeof(boot_uptime_max_str), "%u",
+                     (unsigned)boot_ceil_s);
+        }
+    }
+
+    // 1024 rather than 768. Measured worst case - every %u at ten digits, the
+    // longest reason and intent tokens, and a full 31-character version - is 844
+    // bytes with the boot_* fields and 622 without, so 768 was not merely tight,
+    // it was 76 bytes short. The old figure was measured against a short "1.3.0"
+    // when esp_app_desc_t.version holds 32 characters. Overflow is caught
+    // (resp_send_json sends a 500, and smoke.sh runs this endpoint through
+    // jq -e) but it shouldn't be run this close.
+    char resp[1024];
     int len = resp_append(resp, sizeof(resp), 0,
                           "{\"uptime_s\":%llu,\"free_heap\":%u,\"min_free_heap\":%u,"
                           "\"cpu_pct\":[%u,%u],\"cpu_freq_mhz\":%u,\"net_rx_bps\":%u,\"net_tx_bps\":%u,"
@@ -1204,6 +1355,10 @@ static esp_err_t system_get_handler(httpd_req_t *req)
                           "\"wifi_tx_total\":%u,\"wifi_tx_failed\":%u,"
                           "\"eth_link\":%s,\"eth_speed_mbit\":%u,\"eth_duplex\":\"%s\","
                           "\"eth_autoneg\":%s,\"eth_flaps\":%u,\"eth_change_s\":%u,"
+                          "\"boot_seq\":%u,\"boot_reason\":\"%s\",\"boot_intent\":\"%s\","
+                          "\"boot_prev_uptime_s\":%s,\"boot_prev_uptime_approx\":%s,"
+                          "\"boot_prev_uptime_max_s\":%s,\"boot_prev_ready\":%s,"
+                          "\"boot_rollback\":%s,"
                           "\"version\":\"%s\"}",
                           (unsigned long long)(esp_timer_get_time() / 1000000ULL),
                           (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(),
@@ -1219,6 +1374,15 @@ static esp_err_t system_get_handler(httpd_req_t *req)
                           eth.up ? (eth.full_duplex ? "full" : "half") : "",
                           eth.autoneg ? "true" : "false",
                           (unsigned)eth.flaps, (unsigned)eth.since_change_s,
+                          // Also fixed internal literals - reset_log_reason_name()
+                          // and its intent counterpart return from a closed set,
+                          // never a device-supplied string.
+                          have_boot ? (unsigned)boot.boot_seq : 0u,
+                          have_boot ? reset_log_reason_name(boot.reason) : "unknown",
+                          have_boot ? reset_log_intent_name(boot.intent) : "unknown",
+                          boot_uptime_str, boot_uptime_approx ? "true" : "false",
+                          boot_uptime_max_str, boot_ready_str,
+                          (have_boot && (boot.flags & RESET_LOG_F_ROLLBACK)) ? "true" : "false",
                           app_desc->version);
     if (!resp_send_json(req, resp, len, sizeof(resp))) {
         return ESP_FAIL;
@@ -1261,6 +1425,24 @@ static esp_err_t leases_page_get_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, (const char *)leases_html_start,
                      leases_html_end - leases_html_start - 1);
+    return ESP_OK;
+}
+
+static esp_err_t resets_page_get_handler(httpd_req_t *req)
+{
+    if (!check_admin_auth(req)) {
+        send_auth_error(req);
+        return ESP_OK;
+    }
+    if (auth_cfg_password_is_default()) {
+        send_default_creds_redirect(req);
+        return ESP_OK;
+    }
+
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, (const char *)resets_html_start,
+                     resets_html_end - resets_html_start - 1);
     return ESP_OK;
 }
 
@@ -1573,6 +1755,8 @@ httpd_handle_t web_server_start(void)
     const httpd_uri_t ota_uri = {.uri = "/api/ota", .method = HTTP_POST, .handler = ota_post_handler};
     const httpd_uri_t leases_page_uri = {.uri = "/leases", .method = HTTP_GET, .handler = leases_page_get_handler};
     const httpd_uri_t leases_uri = {.uri = "/api/leases", .method = HTTP_GET, .handler = leases_get_handler};
+    const httpd_uri_t resets_page_uri = {.uri = "/resets", .method = HTTP_GET, .handler = resets_page_get_handler};
+    const httpd_uri_t resets_uri = {.uri = "/api/resets", .method = HTTP_GET, .handler = resets_get_handler};
     const httpd_uri_t logs_page_uri = {.uri = "/logs", .method = HTTP_GET, .handler = logs_page_get_handler};
     const httpd_uri_t logs_uri = {.uri = "/api/logs", .method = HTTP_GET, .handler = logs_get_handler};
     const httpd_uri_t logs_level_uri = {.uri = "/api/logs/level", .method = HTTP_POST, .handler = logs_level_post_handler};
@@ -1588,6 +1772,8 @@ httpd_handle_t web_server_start(void)
     httpd_register_uri_handler(server, &ota_uri);
     httpd_register_uri_handler(server, &leases_page_uri);
     httpd_register_uri_handler(server, &leases_uri);
+    httpd_register_uri_handler(server, &resets_page_uri);
+    httpd_register_uri_handler(server, &resets_uri);
     httpd_register_uri_handler(server, &logs_page_uri);
     httpd_register_uri_handler(server, &logs_uri);
     httpd_register_uri_handler(server, &logs_level_uri);

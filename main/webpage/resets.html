@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgOpen router &ndash; Reboot history</title>
+<style>
+  body { font-family: sans-serif; max-width: 1100px; margin: 2em auto; padding: 0 1em; color: #222; }
+  h1 { font-size: 1.3em; }
+  h1 a { font-size: 0.7em; font-weight: normal; color: #2a78d6; text-decoration: none; margin-left: 0.6em; }
+  h1 a:hover { text-decoration: underline; }
+  #banner { display: none; background: #b00020; color: #fff; padding: 0.6em 1em; border-radius: 4px; margin-bottom: 1em; }
+  #banner.show { display: block; }
+  .panel { border: 2px solid #888; border-radius: 4px; padding: 0.8em; margin-top: 1em; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
+  th, td { text-align: left; padding: 0.4em 0.5em; border-bottom: 1px solid #ddd; white-space: nowrap; }
+  th { border-bottom: 1px solid #bbb; }
+  td.num { text-align: right; font-family: monospace; }
+  td.fw { font-family: monospace; }
+  /* The duration column is a bar chart, so it is left-aligned rather than
+     centred: the bars need a shared baseline. The width that matters is on
+     .bar-track below, not here - under table-layout:auto a width on a cell is
+     only a hint the browser may widen, and the label arithmetic needs an exact
+     figure. */
+  th.dur, td.dur { text-align: left; }
+
+  /* One series, one colour - the bar encodes length and nothing else. Shading it
+     by magnitude would say the same thing twice and spend the only free channel.
+     Fault, firmware and reason all have their own columns already.
+
+     Scale is logarithmic over a fixed 0..1y domain (see barFraction). Fixed
+     rather than fitted to the visible rows, so a bar of a given length always
+     means the same duration - a scale that renormalised every poll would make
+     two screenshots of the same device disagree. */
+  .bar-track {
+    position: relative;
+    width: 150px;              /* must match BAR_TRACK_PX */
+    height: 14px;              /* well under the 24px cap; the rest is row air */
+    background: #f0efec;       /* recessive: 1.15:1 on white */
+    border-radius: 2px;
+  }
+  .bar-fill {
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    min-width: 2px;            /* the seed row still shows it started */
+    background: #256abf;       /* 5.39:1 against the white label inside it */
+    border-radius: 2px 4px 4px 2px;   /* 4px data-end, square at the baseline */
+  }
+  /* A bound ("at least this long") frays out instead of ending. The mark says
+     "continues"; the ">" in the label is what actually carries the meaning, so
+     this is not colour or shape alone. */
+  .bar-fill.bound {
+    border-radius: 2px 0 0 2px;
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 12px), transparent);
+    mask-image: linear-gradient(to right, #000 calc(100% - 12px), transparent);
+  }
+  /* Inside the fill when it fits with padding, otherwise just past its end in
+     ink. Never clipped - see labelFits(). A sibling of the fill rather than a
+     child of it, so the bound mask above frays the bar without also fading the
+     text; addRow() sets the one offset that anchors it to the fill's edge. */
+  .bar-label {
+    position: absolute;
+    top: 0; bottom: 0;
+    display: flex; align-items: center;
+    font-family: monospace;   /* the figures, not the heading above them */
+    font-size: 0.8em;
+    white-space: nowrap;
+    pointer-events: none;
+  }
+  .bar-label.inside  { color: #fff; }
+  .bar-label.outside { color: #52514e; }        /* 7.94:1 on white */
+  /* A fault, as opposed to somebody restarting the device on purpose. Same red
+     the dashboard uses for a counter that is climbing. */
+  td.fault { color: #b00020; font-weight: 600; }
+  /* Not a failure, and now genuinely rare: a record with no checkpoint behind it
+     at all. Styled as absent data rather than as a zero, because zero would be a
+     claim - and on the checkpoint path zero is a real value meaning "under ten
+     seconds", which is why the two must not look alike. Back to
+     sans-serif, as leases.html does for its own "not saved" - prose in a
+     monospace column reads as a value that happens to spell a word. */
+  td.unknown { color: #898781; font-style: italic; font-family: sans-serif; }
+  /* A firmware change is the single most useful adjacency on this page when it
+     sits directly above a run of crashes, so it gets its own colour. */
+  td.fw .changed { color: #8a4b00; font-weight: 600; }
+  td.fw .trial { color: #8a4b00; }
+  #empty { color: #898781; font-size: 0.9em; padding: 1em 0.5em; }
+  #footer { font-size: 0.85em; color: #898781; margin-top: 0.8em; }
+  #footer .note { display: block; margin-top: 0.3em; }
+</style>
+</head>
+<body>
+
+<div id="banner">Lost connection to bridge &mdash; retrying&hellip;</div>
+
+<h1>Reboot history <a href="/">&larr; Dashboard</a></h1>
+
+<div class="panel">
+  <table>
+    <thead>
+      <tr><th title="Counts boots that got as far as starting the firmware. A boot the bootloader rejected outright never gets a record, so the numbers are consecutive but do not count every power-up.">Boot</th>
+          <th>What happened</th>
+          <th class="dur" title="How long the device had been running before this reset. Not a clock reading - this device cannot date past events, only measure how long each boot lasted. A &gt; or &lt; means the figure was recovered from the periodic checkpoint in flash after a power event, and is a bound rather than a reading; hover a row for both ends of it. The bars are on a logarithmic scale from ten seconds to a year, so they are comparable at a glance but their lengths are not in proportion to the durations - read the figures for that. A frayed end means the bar is a bound and the real run was longer.">Ran for</th>
+          <th title="The firmware that came up after this reset, and which of the two OTA slots it booted from.">Firmware</th></tr>
+    </thead>
+    <tbody id="reset-body"></tbody>
+  </table>
+  <div id="empty">Loading&hellip;</div>
+  <div id="footer"></div>
+</div>
+
+<script>
+// Same Basic Auth realm as the dashboard, so the browser reuses the credentials
+// it already holds and there's no login code here - see check_admin_auth() in
+// web_server.c.
+
+// Mirrors the dashboard's fetchWithTimeout(): plain fetch() can hang for the
+// OS connect timeout when the bridge stops answering without closing the
+// socket, and a 401/403 needs to stop the loop rather than be retried.
+const AUTH_ERROR = Symbol('unauthorized');
+const SETUP_ERROR = Symbol('setup-required');
+
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    if (res.status === 401) throw AUTH_ERROR;
+    if (res.status === 403) throw SETUP_ERROR;
+    return res;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const body = document.getElementById('reset-body');
+const emptyMsg = document.getElementById('empty');
+const footer = document.getElementById('footer');
+
+// These two mirror reset_what_happened() and reset_ran_for() in
+// serial_console.c line for line. The console and this page describe the same
+// records, and a reader comparing the two should never have to work out whether
+// a wording difference means a difference in what happened.
+
+// Precedence matters more than the field order here. A rollback outranks
+// everything because it explains the reset *and* the firmware change; a tagged
+// intent outranks the raw reason because "somebody restarted it" is the answer,
+// and the software reset underneath is just how.
+function whatHappened(r) {
+  let text, fault;
+  if (r.rollback) {
+    text = 'Rolled back from a failed update'; fault = true;
+  } else if (r.intent === 'ota') {
+    text = 'Restarted for a firmware update'; fault = false;
+  } else if (r.intent === 'wifi-save') {
+    text = 'Restarted to apply WiFi settings'; fault = false;
+  } else if (r.intent === 'console') {
+    text = 'Console requested restart'; fault = false;
+  } else if (r.intent === 'factory-reset') {
+    text = 'Factory reset'; fault = false;
+  } else if (r.reason === 'panic') {
+    text = 'Crashed (panic)'; fault = true;
+  } else if (r.reason === 'int-wdt' || r.reason === 'task-wdt' || r.reason === 'other-wdt') {
+    text = 'Watchdog reset — something stopped responding'; fault = true;
+  } else if (r.reason === 'brownout') {
+    text = 'Brownout — the supply voltage dipped'; fault = true;
+  } else if (r.reason === 'power-on') {
+    // Never "power loss". A rail that collapses past the chip's own reset
+    // threshold looks exactly like somebody flipping a switch, so this record
+    // cannot tell them apart and must not pretend to. The pattern across rows
+    // is the diagnosis - see the footer.
+    text = 'Power-on or power loss'; fault = false;
+  } else if (r.reason === 'software') {
+    // Nothing on this device restarts itself without tagging it first, so an
+    // untagged software reset is a panic that got tidied up on the way out, or
+    // a path nobody accounted for.
+    text = 'Restarted by software, untagged'; fault = true;
+  } else {
+    text = 'Reset for an unknown reason (code ' + r.reason_code + ')'; fault = true;
+  }
+
+  // The boot-loop signature. Only claimed when the previous boot's state
+  // actually survived: reached_ready === null means the device cannot say, and
+  // absent state is not evidence of a short boot.
+  if (r.reached_ready === false) text += ' during startup';
+
+  return { text, fault };
+}
+
+function formatUptime(s) {
+  if (s >= 86400) return Math.floor(s / 86400) + 'd ' + Math.floor((s % 86400) / 3600) + 'h';
+  if (s >= 3600) return Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
+  if (s >= 60) return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+  return s + 's';
+}
+
+// One unit, rounded down. The two-unit form above is right for an exact figure
+// and wrong for a bound, where the second unit is precision the number does not
+// have. The year is here so the last point on the checkpoint schedule reads "1y"
+// rather than "365d". Mirrors fmt_short() in serial_console.c.
+function formatShort(s) {
+  if (s >= 365 * 86400) return Math.floor(s / (365 * 86400)) + 'y';
+  if (s >= 86400) return Math.floor(s / 86400) + 'd';
+  if (s >= 3600) return Math.floor(s / 3600) + 'h';
+  if (s >= 60) return Math.floor(s / 60) + 'm';
+  return s + 's';
+}
+
+// A checkpoint-recovered figure, marked as the bound it is. Mirrors fmt_bound()
+// in serial_console.c: ">5m", ">1y", and "<" for the one record with no lower
+// bound worth stating - a boot that wrote only its seed, where ">0s" would say
+// nothing. The far end stays in the tooltip rather than the cell.
+function formatBound(floor, ceil) {
+  if (floor === 0) return '<' + formatShort(ceil);
+  return '>' + formatShort(floor);
+}
+
+// How much of the track a duration fills, 0..1.
+//
+// Logarithmic, because the column spans six orders of magnitude and a linear
+// scale spends all of them on the longest row: measured on this 150px track, an
+// hour is 0.02px and a day is 0.41px against a 30-day run. That erases the run of
+// short boots which is the whole reason to look at this page.
+//
+// The domain is fixed at 0..1y rather than fitted to the visible rows, so the
+// same bar length always means the same duration - a scale that renormalised on
+// every poll would make two readings of the same device disagree. log1p keeps 0
+// (the seed row, "<10s") at zero instead of negative infinity.
+const BAR_MAX_S = 365 * 86400;
+function barFraction(s) {
+  if (!(s > 0)) return 0;
+  return Math.min(1, Math.log1p(s) / Math.log1p(BAR_MAX_S));
+}
+
+// Whether the label fits inside the bar with breathing room on both sides. A
+// label that does not fit is moved out past the end, never clipped - cropping
+// the first or last character is worse than no label at all.
+//
+// Measured rather than guessed: the cell is monospace at 0.8em of the table's
+// 0.9em, which is ~6.6px per character at the default 16px root.
+const BAR_TRACK_PX = 150;    // must match .bar-track's width
+const BAR_CHAR_PX = 6.6;
+const BAR_FADE_PX = 12;      // must match the .bar-fill.bound mask
+function labelFits(text, usablePx) {
+  return usablePx >= text.length * BAR_CHAR_PX + 12;
+}
+
+// Builds the bar into a cell: a track, a fill sized by barFraction, and the
+// figure itself either inside the fill or just past its end.
+//
+// The label is a sibling of the fill rather than a child, so the frayed tip of a
+// bound bar does not fade the text with it, which means addRow() has to anchor
+// the label to the fill's edge by hand: an inset from the right for the inside
+// case, from the left for the outside one.
+//
+// Elements and textContent rather than innerHTML, matching the rest of this file.
+function drawBar(cell, text, seconds, bound) {
+  const frac = barFraction(seconds);
+  const fillPx = frac * BAR_TRACK_PX;
+
+  const track = document.createElement('div');
+  track.className = 'bar-track';
+
+  // The fade extends PAST the value rather than eating into it: a bound bar is
+  // drawn solid to its floor and then frays for another BAR_FADE_PX. Masking the
+  // end of a bar of the same width instead would make the solid part shorter than
+  // the figure it represents, and a bound bar could then look shorter than an
+  // exact one of a smaller value - ">5m" reading as less than "3m 34s".
+  //
+  // Clamped at the track, which only bites for a bar already at full length; there
+  // the fray has to come out of the end, and that record is the unbounded ">1y"
+  // where nothing further is being claimed anyway.
+  const barPx = bound ? Math.min(BAR_TRACK_PX, fillPx + BAR_FADE_PX) : fillPx;
+  const solidPx = bound ? barPx - BAR_FADE_PX : barPx;
+
+  const fill = document.createElement('div');
+  fill.className = bound ? 'bar-fill bound' : 'bar-fill';
+  fill.style.width = barPx.toFixed(1) + 'px';
+  track.appendChild(fill);
+
+  // Measured against the solid part, never the fray: a white label sitting in the
+  // faded tip would be white on white.
+  const label = document.createElement('span');
+  label.className = 'bar-label';
+  label.textContent = text;
+  if (labelFits(text, solidPx)) {
+    label.classList.add('inside');
+    label.style.right = (BAR_TRACK_PX - solidPx + 6) + 'px';
+  } else {
+    label.classList.add('outside');
+    label.style.left = (barPx + 6) + 'px';
+  }
+  track.appendChild(label);
+
+  cell.appendChild(track);
+}
+
+// Every cell is filled with textContent rather than innerHTML. The version
+// string is the one field here written by a different firmware image than the
+// one running, so it is treated as data, not markup.
+function addRow(r, older) {
+  const row = body.insertRow();
+
+  const seq = row.insertCell();
+  seq.className = 'num';
+  seq.textContent = '#' + r.seq;
+
+  const what = whatHappened(r);
+  const whatCell = row.insertCell();
+  if (what.fault) whatCell.className = 'fault';
+  whatCell.textContent = what.text;
+  if (r.reason === 'power-on') {
+    whatCell.title = 'A power-on and a hard power loss are indistinguishable on ' +
+                     'this device: both cut the supply before anything can be ' +
+                     'recorded. A dip that the brownout detector catches while ' +
+                     'the chip is still running is reported as a brownout instead.';
+  }
+
+  const ran = row.insertCell();
+  ran.className = 'dur';
+  if (r.uptime_s === null) {
+    ran.classList.add('unknown');
+    ran.textContent = 'unknown';
+    ran.title = 'No record of how long this boot ran. Every boot saves a ' +
+                'checkpoint to flash as it starts, so this one either ran ' +
+                'firmware from before that existed, or its one write to flash ' +
+                'failed. It does not mean the boot was short — a boot that ends ' +
+                'quickly has a checkpoint of its own that says so.';
+  } else if (r.uptime_approx) {
+    // Rendered as the window it is, never as a reading. The device saved this
+    // figure to flash during the boot and then lost power without another
+    // chance to update it, so the truth sits between it and the next write
+    // that was due.
+    drawBar(ran, formatBound(r.uptime_s, r.uptime_max_s), r.uptime_s, true);
+    // The cell shows one end; the full window lives here. uptime_max_s is null
+    // once the schedule has run out, which is a boot that had been up over a
+    // year — there genuinely is no upper end to give.
+    ran.title = (r.uptime_s === 0
+                  ? 'Under ' + formatUptime(r.uptime_max_s) + '. '
+                  : r.uptime_max_s === null
+                    ? 'At least ' + formatUptime(r.uptime_s) + ', with no upper ' +
+                      'bound — the device stops checkpointing after a year. '
+                    : 'Between ' + formatUptime(r.uptime_s) + ' and ' +
+                      formatUptime(r.uptime_max_s) + '. ') +
+                'A power-on wipes the memory this device counts uptime in, so ' +
+                'this comes from the copy it saves to flash on a fixed schedule ' +
+                '— ten seconds, twenty, thirty, out to a year, roughly doubling ' +
+                'along the way — and the boot ended before the next save was due.';
+  } else {
+    drawBar(ran, formatUptime(r.uptime_s), r.uptime_s, false);
+  }
+
+  const fw = row.insertCell();
+  fw.className = 'fw';
+  fw.textContent = r.version + ' (' + r.partition + ')';
+  if (r.ota_pending) {
+    const trial = document.createElement('span');
+    trial.className = 'trial';
+    trial.textContent = ' on trial';
+    trial.title = 'This image had not yet been marked valid when this record was ' +
+                  'written. If it had failed to finish starting, the bootloader ' +
+                  'would have reverted to the other slot.';
+    fw.appendChild(trial);
+  }
+  // Split out rather than folded into the string so it can be coloured: a
+  // version change sitting directly above a run of crashes is what the reader
+  // is looking for, and should not have to be found by scanning.
+  if (older && older.version !== r.version) {
+    const changed = document.createElement('span');
+    changed.className = 'changed';
+    changed.textContent = ', updated from ' + older.version;
+    fw.appendChild(changed);
+  }
+}
+
+function render(data) {
+  body.textContent = '';
+  // Newest first from the server; each row is handed the record below it so it
+  // can spot a firmware change across the boundary.
+  data.resets.forEach((r, i) => addRow(r, data.resets[i + 1]));
+
+  emptyMsg.textContent = 'No reset history yet — this is the first boot since ' +
+                         'this firmware was installed.';
+  emptyMsg.style.display = data.resets.length ? 'none' : '';
+
+  const newest = data.resets[0];
+  footer.textContent = data.count + ' of ' + data.max + ' records kept' +
+                       (newest ? ' · boot #' + newest.seq : '') + '.';
+
+  const note = document.createElement('span');
+  note.className = 'note';
+  note.textContent = 'These are ordered, not timestamped. With no battery-backed ' +
+                     'clock and no time source on a transparent bridge, the device ' +
+                     'can say one reset happened before another and how long the ' +
+                     'boot before it lasted, but never on what date. Only the most ' +
+                     'recent ' + data.max + ' are kept.';
+  footer.appendChild(note);
+
+  const scale = document.createElement('span');
+  scale.className = 'note';
+  scale.textContent = 'The "ran for" bars use a logarithmic scale, ten seconds to ' +
+                      'a year, because these durations span six orders of magnitude ' +
+                      'and a proportional bar would leave every short boot invisible. ' +
+                      'Compare them by eye; read the figures for the actual lengths.';
+  footer.appendChild(scale);
+
+  const diag = document.createElement('span');
+  diag.className = 'note';
+  diag.textContent = 'A run of "Power-on or power loss" rows with short "ran for" ' +
+                     'values, on a device nobody is switching off, is a supply ' +
+                     'problem rather than a firmware one. This history is ' +
+                     'deliberately kept across a factory reset.';
+  footer.appendChild(diag);
+}
+
+let polling = false;
+let failCount = 0;
+
+async function poll() {
+  if (polling) return;
+  polling = true;
+  try {
+    const res = await fetchWithTimeout('/api/resets', {}, 2000);
+    render(await res.json());
+    failCount = 0;
+    document.getElementById('banner').classList.remove('show');
+  } catch (e) {
+    if (e === SETUP_ERROR) {
+      clearInterval(pollTimer);
+      location.href = '/admin?forced=1';
+      return;
+    }
+    if (e === AUTH_ERROR) {
+      // fetch() replays the same cached credentials and can't raise the
+      // browser's sign-in dialog; only a top-level navigation can, and this
+      // page is served no-store so the reload really hits the network.
+      clearInterval(pollTimer);
+      location.reload();
+      return;
+    }
+    failCount++;
+    if (failCount >= 2) {
+      document.getElementById('banner').classList.add('show');
+    }
+  } finally {
+    polling = false;
+  }
+}
+
+poll();
+// This content only changes when the device reboots, and the httpd has a single
+// worker task shared with the dashboard's own 1 Hz polling. A reboot underneath
+// the page shows up as the banner appearing and then a new top row, which is
+// the feature demonstrating itself.
+const pollTimer = setInterval(poll, 10000);
+</script>
+
+</body>
+</html>
