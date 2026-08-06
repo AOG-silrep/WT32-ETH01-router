@@ -210,6 +210,15 @@ function formatUptime(seconds) {
   return m + 'm ' + (seconds % 60) + 's';
 }
 
+// An exact duration inside the restart sentence. Mirrors the exact branch of
+// reset_ran_for() in serial_console.c, which differs from formatUptime() only
+// under a minute - "after 3s", not "after 0m 3s". That is the range a boot that
+// died during startup lands in, so it is not a corner case here.
+function formatRan(s) {
+  if (s < 60) return s + 's';
+  return formatUptime(s);
+}
+
 // One unit, rounded down, for a bound. Mirrors formatShort() in resets.html and
 // fmt_short() in serial_console.c - the two-unit form above is right for an exact
 // figure and carries precision a bound does not have. The year is here so the
@@ -541,10 +550,18 @@ let prevWifiTxFailed = null;
 
 // Mirrors whatHappened() in resets.html and reset_what_happened() in
 // serial_console.c - one sentence, in the order the reader cares about rather
-// than the order the fields arrive in. Returns whether it is a fault as well as
-// the text, because a deliberate restart must never be red: a device switched
-// off every night would otherwise show a permanently red row for behaving
-// exactly as intended.
+// than the order the fields arrive in.
+//
+// The C side splits this sentence in two: reset_what_happened() ends at "during
+// startup" and describe_reset() adds the duration. resets.html carries only the
+// first half, because its duration is a column rather than a clause - which is
+// why the comma below is right here and wrong there. Both halves live in this
+// one function, so keep them independent: folding them into a single chain is
+// what let this row drift out of step with the console once already.
+//
+// Returns whether it is a fault as well as the text, because a deliberate
+// restart must never be red: a device switched off every night would otherwise
+// show a permanently red row for behaving exactly as intended.
 function resetText(s) {
   let text, fault;
   if (s.boot_rollback) {
@@ -572,16 +589,22 @@ function resetText(s) {
     text = 'Unknown reason'; fault = true;
   }
 
+  // The boot-loop signature, and mirrors the same clause in
+  // reset_what_happened(). Its own statement rather than a branch of the chain
+  // below: this is the one case where the duration is always known and exact,
+  // and how far into startup it got is the whole diagnosis.
+  if (s.boot_prev_ready === false) {
+    text += ', during startup';
+  }
+
   // Only when there is something real to say: null means the device cannot say,
   // and no clause is better than a wrong one. The approximate figure comes off
   // the flash checkpoint after a power event and is a window, so it is rendered
   // as one rather than dressed up as the exact reading beside it.
-  if (s.boot_prev_ready === false) {
-    text += ' during startup';
-  } else if (s.boot_prev_uptime_s === null) {
+  if (s.boot_prev_uptime_s === null) {
     // nothing to add
   } else if (!s.boot_prev_uptime_approx) {
-    text += ' after ' + formatUptime(s.boot_prev_uptime_s);
+    text += ' after ' + formatRan(s.boot_prev_uptime_s);
   } else if (s.boot_prev_uptime_s === 0) {
     // A sentence has room to spell the mark out, and "after <10s" reads worse.
     text += ' in under ' + formatShort(s.boot_prev_uptime_max_s);
