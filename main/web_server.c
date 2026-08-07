@@ -12,11 +12,14 @@
 #include "eth_link.h"
 #include "reset_log.h"
 #include "log_buf.h"
+#include "syslog.h"
+#include "syslog_cfg.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_ota_ops.h"
+#include "lwip/sockets.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -1530,9 +1533,11 @@ static esp_err_t logs_page_get_handler(httpd_req_t *req)
 
 // Longest possible trailer appended after the packing loop in
 // logs_get_handler(), with every %u at 10 digits and all three level names at
-// their longest ("verbose"): 153 bytes, plus the NUL vsnprintf writes. Rounded
-// up so the two stay decoupled - the reservation only has to be an upper bound.
-#define LOGS_TRAILER_MAX 192
+// their longest ("verbose"): 153 bytes for the log fields, plus 133 for the six
+// syslog_* ones (syslog_errno is signed, so eleven characters), plus the NUL
+// vsnprintf writes. Rounded up past the 287-byte measurement so the two stay
+// decoupled - the reservation only has to be an upper bound.
+#define LOGS_TRAILER_MAX 320
 
 // Longest gap entry the packing loop can emit: ",{\"gap\":4294967295}" is 20
 // bytes, plus the NUL. Rounded up for the same reason as the trailer.
@@ -1577,6 +1582,12 @@ static esp_err_t logs_get_handler(httpd_req_t *req)
 
     uint32_t oldest = 0, newest = 0, missed = 0;
     log_buf_get_range(&oldest, &newest, &missed);
+
+    // Read here, before the packing loop, so the handler never calls into
+    // another module while it is iterating the ring - the same discipline the
+    // loop below follows about not appending under log_buf's lock.
+    syslog_status_t syslog_st;
+    syslog_get_status(&syslog_st);
 
     // A cursor ahead of the newest line means the device rebooted under this
     // reader (sequence numbers restart at 1), so start it over from the top.
@@ -1687,7 +1698,7 @@ static esp_err_t logs_get_handler(httpd_req_t *req)
     off = resp_append(resp, sizeof(resp), off,
                        "],\"seq\":%u,\"lost\":%u,\"missed\":%u,\"more\":%s,"
                        "\"restarted\":%s,\"level\":\"%s\",\"serial_level\":\"%s\","
-                       "\"max_level\":\"%s\"}",
+                       "\"max_level\":\"%s\"",
                        (unsigned)(seq - 1), (unsigned)lost, (unsigned)missed,
                        seq <= newest ? "true" : "false",
                        restarted ? "true" : "false",
@@ -1699,6 +1710,20 @@ static esp_err_t logs_get_handler(httpd_req_t *req)
                        // page needs it to say so instead of leaving the reader
                        // staring at an unchanged log.
                        log_level_name((esp_log_level_t)CONFIG_LOG_MAXIMUM_LEVEL));
+
+    // The syslog sender's state rides along on this poll rather than getting a
+    // route of its own: the log page already asks for this once a second, so the
+    // status line below the log gets live shipping state for no extra request.
+    // It is also why these are not on /api/system, whose 1KB buffer is already
+    // within 70 bytes of its measured worst case.
+    off = resp_append(resp, sizeof(resp), off,
+                       ",\"syslog_enabled\":%s,\"syslog_sent\":%u,\"syslog_aged\":%u,"
+                       "\"syslog_failed\":%u,\"syslog_errno\":%d,\"syslog_backlog\":%u",
+                       syslog_st.enabled ? "true" : "false",
+                       (unsigned)syslog_st.sent, (unsigned)syslog_st.aged_out,
+                       (unsigned)syslog_st.send_fail, syslog_st.last_errno,
+                       (unsigned)syslog_st.backlog);
+    off = resp_append(resp, sizeof(resp), off, "}");
 
     if (!resp_send_json(req, resp, off, sizeof(resp))) {
         return ESP_FAIL;
@@ -1767,6 +1792,387 @@ static esp_err_t logs_level_post_handler(httpd_req_t *req)
     return ESP_FAIL;
 }
 
+// Configuration and live state in one object, so the log page needs a single
+// fetch to render the syslog panel. "subnet" is included so the form can say
+// what "on this bridge's network" actually means before anything is submitted,
+// rather than only in the rejection that comes back if it is wrong.
+static esp_err_t syslog_get_handler(httpd_req_t *req)
+{
+    if (!check_admin_auth(req)) {
+        send_auth_error(req);
+        return ESP_OK;
+    }
+    if (auth_cfg_password_is_default()) {
+        send_setup_required(req);
+        return ESP_OK;
+    }
+
+    syslog_cfg_t cfg;
+    syslog_cfg_get(&cfg);
+
+    syslog_status_t st;
+    syslog_get_status(&st);
+
+    uint32_t subnet_ip = 0, subnet_mask = 0;
+    syslog_get_subnet(&subnet_ip, &subnet_mask);
+
+    char server[16], subnet[32];
+    esp_ip4_addr_t server_addr = { .addr = cfg.server_ip };
+    esp_ip4addr_ntoa(&server_addr, server, sizeof(server));
+
+    if (subnet_mask == 0) {
+        strlcpy(subnet, "unknown", sizeof(subnet));
+    } else {
+        esp_ip4_addr_t net = { .addr = subnet_ip & subnet_mask };
+        char net_str[16];
+        esp_ip4addr_ntoa(&net, net_str, sizeof(net_str));
+        // Prefix length from the mask's population count. The mask is
+        // contiguous by construction, so counting bits is the whole conversion.
+        int bits = 0;
+        for (uint32_t m = lwip_ntohl(subnet_mask); m & 0x80000000u; m <<= 1) {
+            bits++;
+        }
+        snprintf(subnet, sizeof(subnet), "%s/%d", net_str, bits);
+    }
+
+    // 512 against a measured worst case of ~420: the hostname is user-supplied
+    // and goes through json_append_escaped(), which can expand any byte to
+    // \uXXXX, so 32 characters can reach 192; the rest is ~200 of fixed JSON
+    // with every %u at ten digits, plus two dotted-quad strings.
+    char resp[512];
+    int off = resp_append(resp, sizeof(resp), 0,
+                          "{\"enabled\":%s,\"server\":\"%s\",\"port\":%u,\"facility\":%u,"
+                          "\"min_severity\":%u,\"subnet\":\"%s\",\"hostname\":\"",
+                          cfg.enabled ? "true" : "false",
+                          cfg.server_ip == 0 ? "" : server,
+                          (unsigned)cfg.port, (unsigned)cfg.facility,
+                          (unsigned)cfg.min_severity, subnet);
+    off = json_append_escaped(resp, sizeof(resp), off, cfg.hostname);
+    off = resp_append(resp, sizeof(resp), off,
+                      "\",\"bound\":%s,\"sent\":%u,\"filtered\":%u,\"aged_out\":%u,"
+                      "\"send_fail\":%u,\"errno\":%d,\"backlog\":%u}",
+                      st.bound ? "true" : "false",
+                      (unsigned)st.sent, (unsigned)st.filtered, (unsigned)st.aged_out,
+                      (unsigned)st.send_fail, st.last_errno, (unsigned)st.backlog);
+
+    if (!resp_send_json(req, resp, off, sizeof(resp))) {
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t syslog_post_handler(httpd_req_t *req)
+{
+    if (!check_admin_auth(req)) {
+        send_auth_error(req);
+        return ESP_OK;
+    }
+    if (auth_cfg_password_is_default()) {
+        send_setup_required(req);
+        return ESP_OK;
+    }
+    if (!csrf_check(req, "application/json")) {
+        return ESP_OK;
+    }
+
+    char buf[256];
+    if (recv_body(req, buf, sizeof(buf)) < 0) {
+        return ESP_FAIL;
+    }
+
+    // Starts from what is saved, so any field the caller leaves out keeps its
+    // current value - the same contract wifi_post_handler() follows.
+    syslog_cfg_t cfg;
+    syslog_cfg_get(&cfg);
+
+    long val = 0;
+    // Sent as 1/0 rather than true/false: json_get_int() reads numbers, and
+    // teaching that deliberately-minimal helper about JSON booleans for one
+    // field is not the trade to make.
+    if (json_get_int(buf, "enabled", &val)) {
+        cfg.enabled = (val != 0);
+    }
+    if (json_get_int(buf, "port", &val)) {
+        if (val < 1 || val > 65535) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                 "Port must be 1-65535 (514 is the syslog default)");
+            return ESP_FAIL;
+        }
+        cfg.port = (uint16_t)val;
+    }
+    if (json_get_int(buf, "facility", &val)) {
+        if (val < 0 || val > 23) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                 "Facility must be 0-23 (23 is local7)");
+            return ESP_FAIL;
+        }
+        cfg.facility = (uint8_t)val;
+    }
+    if (json_get_int(buf, "min_severity", &val)) {
+        if (val < 0 || val > 7) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Minimum severity must be 0-7");
+            return ESP_FAIL;
+        }
+        cfg.min_severity = (uint8_t)val;
+    }
+
+    char server[16] = {0};
+    if (json_get_string(buf, "server", server, sizeof(server))) {
+        if (server[0] == '\0') {
+            cfg.server_ip = 0;
+        } else {
+            esp_ip4_addr_t addr;
+            addr.addr = esp_ip4addr_aton(server);
+            if (addr.addr == 0) {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "That is not an IPv4 address");
+                return ESP_FAIL;
+            }
+            cfg.server_ip = addr.addr;
+        }
+    }
+
+    char hostname[SYSLOG_CFG_HOSTNAME_MAX_LEN] = {0};
+    if (json_get_string(buf, "hostname", hostname, sizeof(hostname))) {
+        // An explicitly blank name means "go back to the MAC-derived default",
+        // which is what the form's empty field with its placeholder shows.
+        if (hostname[0] == '\0') {
+            syslog_cfg_default_hostname(cfg.hostname, sizeof(cfg.hostname));
+        } else {
+            strlcpy(cfg.hostname, hostname, sizeof(cfg.hostname));
+        }
+    }
+
+    uint32_t subnet_ip = 0, subnet_mask = 0;
+    syslog_get_subnet(&subnet_ip, &subnet_mask);
+
+    const char *err_msg = NULL;
+    if (!syslog_cfg_validate(&cfg, subnet_ip, subnet_mask, &err_msg)) {
+        // The static reason verbatim: the whole point of the on-subnet message
+        // is that the person who typed the address reads it.
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, err_msg);
+        return ESP_FAIL;
+    }
+
+    if (syslog_cfg_save(&cfg) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save syslog config");
+        return ESP_FAIL;
+    }
+    syslog_config_changed();
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Chunk buffer for the download below. 1024 holds at least five lines at the
+// ~193-byte worst case (6 + 2 + 8 + 2 + 1 + 2 + 24 + 2 + 143 + newline), and is
+// static for the same reason logs_get_handler()'s response buffer is: the 8KB
+// worker stack is shared with the OTA handler's call chain.
+#define LOGS_DL_CHUNK 1024
+
+// Flushed whenever this much space is no longer free, so a partial line is never
+// sent. It has to be a true upper bound on one line rather than a hope:
+// resp_append() logs on truncation, and logging from inside this loop would
+// re-enter the capture hook while the ring is being read.
+#define LOGS_DL_LINE_MAX 200
+
+// %6u sequence, %8u milliseconds, level letter, %-24s tag, message. Fixed
+// columns so the file is greppable and sorts by hand.
+//
+// 24 rather than LOG_BUF_TAG_MAX: the tag that motivated the 32-byte field
+// ("esp_eth.netif.netif_glue", 24 characters) is also the longest that exists,
+// so padding to 32 would push every message eight columns right for one tag's
+// sake. A longer tag simply widens its own row.
+#define LOGS_DL_LINE_FMT "%6u  %8u  %c  %-24s  %s\n"
+
+static int dl_flush(httpd_req_t *req, char *chunk, int off, bool *failed)
+{
+    if (*failed || off <= 0) {
+        return 0;
+    }
+    if (httpd_resp_send_chunk(req, chunk, off) != ESP_OK) {
+        *failed = true;
+    }
+    return 0;
+}
+
+// The log ring as a text file.
+//
+// Chunked rather than one buffer: 128 lines at up to ~193 characters is ~24KB,
+// six times the largest response this server builds, and logs_get_handler()'s
+// 4096-byte static is already the ceiling this stack tolerates alongside OTA.
+//
+// Every decision that can fail happens before the first chunk goes out. Once
+// httpd_resp_send_chunk() has written a byte the status line is gone, and a 500
+// raised halfway through becomes a truncated file that the browser saves without
+// complaint - so from that point on a send failure can only be abandoned, not
+// reported.
+static esp_err_t logs_download_get_handler(httpd_req_t *req)
+{
+    if (!check_admin_auth(req)) {
+        send_auth_error(req);
+        return ESP_OK;
+    }
+    if (auth_cfg_password_is_default()) {
+        send_setup_required(req);
+        return ESP_OK;
+    }
+
+    reset_log_entry_t boot;
+    bool have_boot = reset_log_get_current(&boot);
+
+    eth_link_status_t eth;
+    eth_link_get_status(&eth);
+
+    syslog_cfg_t sys_cfg;
+    syslog_cfg_get(&sys_cfg);
+    syslog_status_t sys_st;
+    syslog_get_status(&sys_st);
+
+    uint32_t oldest = 0, newest = 0, missed = 0;
+    log_buf_get_range(&oldest, &newest, &missed);
+
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    uint64_t uptime_s = (uint64_t)(esp_timer_get_time() / 1000000);
+
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+    // No date in the filename, because this device has no clock and will not
+    // guess at one. The boot number and the uptime are what it does know: two
+    // downloads from one boot sort correctly and never collide, and the name
+    // says what the file is relative to without claiming when it was taken.
+    char disp[96];
+    snprintf(disp, sizeof(disp),
+             "attachment; filename=\"wt32-bridge-log-boot%u-%llus.txt\"",
+             have_boot ? (unsigned)boot.boot_seq : 0u,
+             (unsigned long long)uptime_s);
+    httpd_resp_set_hdr(req, "Content-Disposition", disp);
+
+    static char chunk[LOGS_DL_CHUNK];
+    bool failed = false;
+    int off = 0;
+
+    // The header block. A downloaded file is read somewhere the device is not,
+    // so everything needed to interpret the lines below travels with them - and
+    // the wording is deliberately the same the /resets page and the console use,
+    // so the three never disagree about one boot.
+    off = resp_append(chunk, sizeof(chunk), off,
+                      "wt32-bridge device log\n\n"
+                      "version         %s\n", app_desc->version);
+    if (have_boot) {
+        off = resp_append(chunk, sizeof(chunk), off,
+                          "boot            %u (%s, intent %s)\n",
+                          (unsigned)boot.boot_seq,
+                          reset_log_reason_name(boot.reason),
+                          reset_log_intent_name(boot.intent));
+    } else {
+        off = resp_append(chunk, sizeof(chunk), off, "boot            unknown\n");
+    }
+    off = resp_append(chunk, sizeof(chunk), off,
+                      "uptime          %llu s\n"
+                      "ethernet        %s%s\n",
+                      (unsigned long long)uptime_s,
+                      eth.up ? "up" : "down",
+                      eth.up ? "" : " (no link)");
+    if (eth.up) {
+        off = resp_append(chunk, sizeof(chunk), off,
+                          "                %u Mbit, %s duplex, %u flap(s), %u s in this state\n",
+                          (unsigned)eth.speed_mbit, eth.full_duplex ? "full" : "half",
+                          (unsigned)eth.flaps, (unsigned)eth.since_change_s);
+    }
+    off = dl_flush(req, chunk, off, &failed);
+
+    off = resp_append(chunk, sizeof(chunk), 0,
+                      "log ring        %u lines, holding %u..%u\n"
+                      "lines lost      %u the capture hook could not store\n"
+                      "capture level   %s (build maximum: %s)\n",
+                      (unsigned)LOG_BUF_LINES, (unsigned)oldest, (unsigned)newest,
+                      (unsigned)missed,
+                      log_level_name(esp_log_level_get("*")),
+                      log_level_name((esp_log_level_t)CONFIG_LOG_MAXIMUM_LEVEL));
+    if (sys_cfg.enabled) {
+        char server[16];
+        esp_ip4_addr_t addr = { .addr = sys_cfg.server_ip };
+        esp_ip4addr_ntoa(&addr, server, sizeof(server));
+        off = resp_append(chunk, sizeof(chunk), off,
+                          "syslog          enabled, %s:%u, %u sent, %u aged out, %u failed\n",
+                          server, (unsigned)sys_cfg.port, (unsigned)sys_st.sent,
+                          (unsigned)sys_st.aged_out, (unsigned)sys_st.send_fail);
+    } else {
+        off = resp_append(chunk, sizeof(chunk), off, "syslog          disabled\n");
+    }
+    off = resp_append(chunk, sizeof(chunk), off,
+                      "timestamps      milliseconds since this boot started. This device has no\n"
+                      "                clock: no RTC battery, no SNTP uplink, and a transparent\n"
+                      "                bridge has no reliable time source. Nothing here can be\n"
+                      "                dated.\n"
+                      "\n");
+    // Built from the same field widths as LOGS_DL_LINE_FMT rather than written
+    // out as a literal, so the two cannot drift apart - the first attempt was a
+    // literal and put "tag" two columns right of the tags underneath it. The
+    // level column is one character wide, so its heading has to be too.
+    off = resp_append(chunk, sizeof(chunk), off, "%6s  %8s  %c  %-24s  %s\n",
+                      "seq", "ms", 'L', "tag", "message");
+    off = dl_flush(req, chunk, off, &failed);
+
+    // Lines that aged out before the first one this file carries. Reported the
+    // same way logs_get_handler() reports "lost", and for the same reason: a
+    // hole spliced over silently is worse than a hole named.
+    uint32_t gap = 0;
+
+    for (uint32_t seq = oldest; seq <= newest && !failed; seq++) {
+        char level = '?';
+        uint32_t ts_ms = 0;
+        char tag[LOG_BUF_TAG_MAX];
+        char msg[LOG_BUF_MSG_MAX];
+
+        // Copied out before formatting, and never while holding the ring's
+        // lock - httpd_resp_send_chunk() blocks on a socket, and resp_append()
+        // logs on truncation. Either one under that lock is a deadlock against
+        // this same handler.
+        if (!log_buf_get_line(seq, &level, &ts_ms, tag, sizeof(tag), msg, sizeof(msg))) {
+            gap++;
+            continue;
+        }
+
+        if ((size_t)off + LOGS_DL_LINE_MAX >= sizeof(chunk)) {
+            off = dl_flush(req, chunk, off, &failed);
+            if (failed) {
+                break;
+            }
+        }
+
+        if (gap > 0) {
+            // Deliberately unlike a data row, so nothing parsing this file by
+            // column mistakes it for one.
+            off = resp_append(chunk, sizeof(chunk), off,
+                              "*** %u line(s) were overwritten while this file was being written ***\n",
+                              (unsigned)gap);
+            gap = 0;
+        }
+
+        off = resp_append(chunk, sizeof(chunk), off, LOGS_DL_LINE_FMT,
+                          (unsigned)seq, (unsigned)ts_ms, level,
+                          tag[0] != '\0' ? tag : "-", msg);
+    }
+
+    if (gap > 0 && !failed) {
+        if ((size_t)off + LOGS_DL_LINE_MAX >= sizeof(chunk)) {
+            off = dl_flush(req, chunk, off, &failed);
+        }
+        off = resp_append(chunk, sizeof(chunk), off,
+                          "*** %u line(s) were overwritten while this file was being written ***\n",
+                          (unsigned)gap);
+    }
+    off = dl_flush(req, chunk, off, &failed);
+
+    // The empty chunk that terminates the response. Sent even after a failure:
+    // it is what closes the transfer, and there is nothing else left to say.
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
 httpd_handle_t web_server_start(void)
 {
     httpd_handle_t server = NULL;
@@ -1779,7 +2185,11 @@ httpd_handle_t web_server_start(void)
     // httpd_register_uri_handler()'s return value is not checked - overshooting
     // the cap silently drops whichever routes came last, with no error logged.
     // Keep comfortable headroom over the actual count for that reason.
-    config.max_uri_handlers = 20;
+    //
+    // 24 rather than 20: the three syslog/download routes took the count to 19,
+    // which is not the headroom this comment asks for - one more route and the
+    // failure is silent. Each slot is a pointer.
+    config.max_uri_handlers = 24;
 
     // Without this the server stops listening the moment every session slot is
     // taken: httpd_server() only adds listen_fd to the select set when a slot is
@@ -1798,8 +2208,18 @@ httpd_handle_t web_server_start(void)
     // Purging still costs a connection, so leave enough slots that an ordinary
     // one or two tabs never trigger it. The cap is CONFIG_LWIP_MAX_SOCKETS - 3
     // (httpd_main.c reserves three for the listener, the control socket pair,
-    // and accept headroom), so this and the sdkconfig bump to 16 go together -
+    // and accept headroom), so this and the sdkconfig bump go together -
     // raising this alone makes httpd_start() fail with ESP_ERR_INVALID_ARG.
+    //
+    // That cap is a floor, not a budget: it says httpd *can* start, not that
+    // anything is left over. At 13 this server alone can hold all 16 descriptors
+    // the pool used to have, and dhcp_server.c has held one of them since before
+    // this comment - so the pool was already oversubscribed, silently, because
+    // 13 concurrent sessions is rare. lru_purge_enable above does not cover it:
+    // it fires when the *session table* fills, not when lwIP has no descriptor
+    // left to accept with, so the symptom is the same "server goes deaf" this
+    // file already fixed once by another route. CONFIG_LWIP_MAX_SOCKETS is 18
+    // for that reason - 16 for httpd, one for the DHCP server, one for syslog.c.
     config.max_open_sockets = 13;
 
     esp_err_t err = httpd_start(&server, &config);
@@ -1824,6 +2244,9 @@ httpd_handle_t web_server_start(void)
     const httpd_uri_t logs_page_uri = {.uri = "/logs", .method = HTTP_GET, .handler = logs_page_get_handler};
     const httpd_uri_t logs_uri = {.uri = "/api/logs", .method = HTTP_GET, .handler = logs_get_handler};
     const httpd_uri_t logs_level_uri = {.uri = "/api/logs/level", .method = HTTP_POST, .handler = logs_level_post_handler};
+    const httpd_uri_t logs_dl_uri = {.uri = "/api/logs/download", .method = HTTP_GET, .handler = logs_download_get_handler};
+    const httpd_uri_t syslog_get_uri = {.uri = "/api/syslog", .method = HTTP_GET, .handler = syslog_get_handler};
+    const httpd_uri_t syslog_post_uri = {.uri = "/api/syslog", .method = HTTP_POST, .handler = syslog_post_handler};
 
     httpd_register_uri_handler(server, &index_uri);
     httpd_register_uri_handler(server, &admin_page_uri);
@@ -1841,6 +2264,11 @@ httpd_handle_t web_server_start(void)
     httpd_register_uri_handler(server, &logs_page_uri);
     httpd_register_uri_handler(server, &logs_uri);
     httpd_register_uri_handler(server, &logs_level_uri);
+    // Registered before the wildcard-free /api/syslog pair only for readability;
+    // /api/logs/download is a distinct literal, so no ordering is load-bearing.
+    httpd_register_uri_handler(server, &logs_dl_uri);
+    httpd_register_uri_handler(server, &syslog_get_uri);
+    httpd_register_uri_handler(server, &syslog_post_uri);
 
     ESP_LOGI(TAG, "Web server started");
     return server;

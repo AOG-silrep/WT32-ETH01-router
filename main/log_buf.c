@@ -81,6 +81,14 @@ static esp_log_level_t s_pending_level = ESP_LOG_ERROR;
 
 static vprintf_like_t s_orig_vprintf;
 
+// Woken whenever a line is committed - see log_buf_set_notify(). Read without
+// the lock on the capture path: a task handle is a single aligned word, and the
+// worst a torn read could cost is one missed wake-up on the pass that attached
+// or detached a reader. The syslog sender treats every notification as advisory
+// and re-derives what to do from the ring's own range, so a missed one costs
+// latency, not lines.
+static TaskHandle_t s_notify_task;
+
 // Starts at the compiled-in default rather than at the WARN the console
 // eventually asks for. This hook is installed at the top of app_main(), long
 // before serial_console_init() runs, and starting at WARN here would silently
@@ -249,6 +257,14 @@ static esp_log_level_t capture(const char *fmt, va_list ap)
         return ESP_LOG_ERROR;
     }
 
+    // Snapshotted here and compared after the walk below, rather than having
+    // commit_pending() raise a flag. It is called from two places - the newline
+    // walk and pending_putc()'s overflow path - so a flag would have to be
+    // threaded through both or risk one notification per call; comparing the
+    // counter across the whole hook call is one read that covers both, and one
+    // wake-up per call is what a reader wants anyway.
+    uint32_t total_before = s_total;
+
     vsnprintf(s_staging, sizeof(s_staging), fmt, ap);
     strip_ansi(s_staging);
 
@@ -291,7 +307,18 @@ static esp_log_level_t capture(const char *fmt, va_list ap)
         pending_putc((*r == '\n' || *r == '\r') ? ' ' : *r);
     }
 
+    // Read under the lock, acted on outside it. Notifying while still holding
+    // s_mutex would hand a waiting reader a wake-up for a ring it then has to
+    // block on - its first act is log_buf_get_range(), which takes this same
+    // mutex - so a higher-priority reader would preempt straight into a wait on
+    // the task that just woke it.
+    bool grew = (s_total != total_before);
     xSemaphoreGive(s_mutex);
+
+    TaskHandle_t reader = s_notify_task;
+    if (grew && reader != NULL) {
+        xTaskNotifyGive(reader);
+    }
     return level;
 }
 
@@ -325,6 +352,11 @@ void log_buf_init(void)
                  // mutex means the whole module stays inert either way.
     }
     s_orig_vprintf = esp_log_set_vprintf(log_vprintf);
+}
+
+void log_buf_set_notify(TaskHandle_t task)
+{
+    s_notify_task = task;
 }
 
 void log_buf_set_serial_level(esp_log_level_t level)

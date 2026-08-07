@@ -12,6 +12,7 @@ An ESP-IDF firmware project that turns a [WT32-ETH01](https://en.wireless-tag.co
 - System monitor (heap, uptime, etc.) surfaced on the web UI, refreshed every second
 - DHCP lease table viewable in a browser (`/leases`), live state alongside what is in flash
 - Device log viewable in a browser (`/logs`), not just over serial
+- Remote syslog (RFC 5424 over UDP) and a downloadable log file, so the log outlives the device's 128-line buffer
 - Configurable WiFi channel (1, 6, or 11)
 
 ## First boot
@@ -46,9 +47,23 @@ The addressing is compiled in (`main/main.c`) and not configurable from the UI o
 | Clients shown in the table | 16 | `CLIENT_TRACK_MAX_CLIENTS` |
 | Bridge forwarding table | 32 MACs | `max_fdb_dyn_entries` |
 | Client forgotten after | 5 minutes of silence | `CLIENT_AGE_OUT_US` |
+| lwIP socket descriptors | 18 | `CONFIG_LWIP_MAX_SOCKETS` |
 
 Static addresses outside both ranges work fine and are not subject to any of these
 limits.
+
+### The socket descriptors are accounted for, not spare
+
+`CONFIG_LWIP_MAX_SOCKETS` is the whole supply for the device, and all 18 are spoken for:
+16 to the web server (13 sessions plus a listener and a control socket pair — `esp_http_server`
+requires `max_open_sockets + 3`), one to the DHCP server, one to the syslog sender. Adding
+anything that opens a socket means raising this number in the same change.
+
+Getting it wrong does not fail at startup, which is what makes it worth writing down. The
+new socket opens fine — there are only four in use while the device is booting — and the
+shortage appears later as `accept()` failing under load, which reads from a browser as
+"Lost connection to bridge". `lru_purge_enable` does not cover it: that fires when the
+server's *session table* fills, not when lwIP has no descriptor left to accept with.
 
 ### Each port has its own DHCP range
 
@@ -309,6 +324,120 @@ Levels above `info` are compiled out (`CONFIG_LOG_MAXIMUM_LEVEL`), so `debug` an
 currently have nothing to show. Both the page and `loglevel` still accept them, and both say
 so when the level you asked for can't produce anything.
 
+#### Sending the log to a syslog server
+
+128 lines of RAM is a live tail, not a record. It starts empty at every boot, so whatever
+explained the last one is already gone by the time anyone looks — which is why the reboot
+history at `/resets` exists at all. The syslog client gives those lines somewhere to go that
+outlives the device.
+
+Turn it on from the panel below the log on `/logs`, or with the `syslog` console command:
+
+```sh
+syslog -s 192.168.5.20 on
+```
+
+It takes effect immediately; unlike `wifi`, nothing here needs a reboot. Any collector that
+speaks RFC 5424 works. To watch it directly:
+
+```sh
+sudo socat -u UDP-RECV:514 STDOUT
+```
+
+`sudo` because 514 is privileged. Note that this prints the datagrams **run together with no
+separator** — a syslog datagram carries no trailing newline, since one datagram is one record
+and the framing is the collector's job. For one record per line:
+
+```sh
+sudo python3 -c 'import socket
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(("",514))
+while True: print(s.recvfrom(2048)[0].decode("utf-8","replace"),flush=True)'
+```
+
+A real collector (rsyslog, syslog-ng) handles this without help, and is also where the
+**facility** starts to matter. It has no effect on what the device sends — `min_severity`
+alone decides that — it is a label the collector sorts on. `local0`–`local7` are the range
+the RFC reserves for local use, so nothing on a standard system claims them and one rule
+gives the bridge its own file:
+
+```
+local7.*    /var/log/wt32-bridge.log
+& stop
+```
+
+Picking `user` or `daemon` instead puts the bridge's lines in a bucket the collector host
+already writes to, so they arrive mixed in with its own and have to be separated by hostname.
+
+**The collector has to be on `192.168.5.0/24`.** The bridge's gateway is set to its own
+address (`BRIDGE_GW` in `main/main.c`), so it has no route off its own subnet — an
+off-subnet collector is not merely unreachable, it is unreachable in a way nothing reports.
+Both the form and the console reject one, and say why.
+
+**Timestamps are the RFC 5424 NILVALUE (`-`), and the collector stamps on receipt.** This is
+the same missing clock that makes the DHCP reservations count
+[boots rather than hours](#reservations-are-counted-out-in-boots-not-hours): no RTC battery,
+no SNTP uplink, and `esp_timer` restarts at zero every boot. The device will not write a
+timestamp it invented. What it does know rides along in the structured data instead:
+
+```
+<190>1 - wt32-bridge-4dab94 wifi 12 - [timeQuality tzKnown="0" isSynced="0"][aog@32473 up_ms="12481" seq="417" boot="12"] station 3c:71:bf:aa:bb:cc joined, AID 1
+```
+
+`up_ms` is milliseconds since this boot started, `seq` is the position in the ring, and
+`boot` is the boot counter — together they order every line the collector ever receives from
+this device, across reboots, with no clock anywhere. `timeQuality` is the RFC's own reserved
+field for saying "unsynchronised clock, timezone unknown". `PROCID` carries the boot number
+too, which is what RFC 5424 §6.2.6 means by a value for detecting discontinuities.
+
+**The whole boot backlog ships on link-up.** While the bridge network is down the sender
+holds its cursor rather than advancing it, so the banner, the reset history and the Ethernet
+and WiFi bring-up are all still queued when the link comes up and go out in order. That is
+most of the point: those are the lines nobody can otherwise see. If the link stays down long
+enough for the 128-line ring to wrap, what was lost is counted as `aged_out` rather than
+quietly skipped.
+
+**Nothing can confirm delivery.** UDP has no acknowledgement, and this device has no route to
+anywhere that could tell it. `sent` means handed to the network; only a capture at the
+collector proves receipt. A collector that is switched off looks exactly like one that is
+working.
+
+**Syslog is cleartext and unauthenticated.** The stream carries SSIDs, MAC addresses, DHCP
+hostnames, and the auth-failure lines that name probed URLs. It goes to one configured
+address on a local `/24` and nowhere else, but that is a property of the network it is on,
+not of the protocol.
+
+The ring can never be more verbose than the capture level above, so a minimum severity below
+that changes nothing — and with `debug` and `verbose` compiled out, asking for them produces
+no extra lines. The page says so rather than leaving you staring at an unchanged stream.
+
+`factory-reset` erases these settings along with the rest: a device sent away for repair
+should not carry on shipping its log to somebody's old collector.
+
+#### Downloading the log
+
+The **Download** button on `/logs` saves the ring as a text file, for the case where no
+collector is set up — a bug report, or a device you have in front of you once. It is a plain
+`GET`, so `curl` works too:
+
+```sh
+curl -u admin:<password> -OJ http://192.168.5.1/api/logs/download
+```
+
+The file leads with a header block, because a downloaded log is read somewhere the device is
+not: firmware version, boot number and reset reason, uptime, Ethernet link state, which
+sequence numbers the ring is holding, how many lines were lost, the capture level, and the
+syslog counters. The wording is deliberately the same the `/resets` page and the console use,
+so the three never disagree about one boot. Lines follow in fixed columns:
+
+```
+   seq        ms  lvl  tag                       message
+   289     12481  I    wifi                      station 3c:71:bf:aa:bb:cc joined, AID 1
+   290     12490  W    dhcp_server               192.168.5.7 already answered for by another MAC
+```
+
+The filename carries the boot number and uptime (`wt32-bridge-log-boot12-12041s.txt`) rather
+than a date, for the same reason the timestamps are what they are.
+
 ## Web UI login
 
 The web UI (`/`) and settings page (`/admin`) are behind HTTP Basic Auth. Until changed, the
@@ -329,8 +458,9 @@ or with the serial console's `admin` command (see below). The console applies th
 
 Because a browser attaches those credentials to *any* request it makes to the bridge — including
 one started by a page on some other site — the routes that change something (`/api/wifi`,
-`/api/admin`, `/api/logs/level`, `/api/ota`) additionally require the right `Content-Type`, and
-refuse a request whose `Origin` names somewhere other than the bridge. A script sends no `Origin`
+`/api/admin`, `/api/logs/level`, `/api/syslog`, `/api/ota`) additionally require the right
+`Content-Type`, and refuse a request whose `Origin` names somewhere other than the bridge. A
+script sends no `Origin`
 and is unaffected by the second rule, but it does have to set the header:
 
 ```sh
@@ -338,13 +468,15 @@ curl -u admin:<password> -H 'Content-Type: application/json' \
      -d '{"level":"warn"}' http://192.168.5.1/api/logs/level
 ```
 
-Without it the answer is `415`. `/api/ota` wants `application/octet-stream`; the other three want
+Without it the answer is `415`. `/api/ota` wants `application/octet-stream`; the other four want
 `application/json`.
 
 ## HTTP API
 
 Every route is behind Basic Auth, and every one answers `403` while the admin password is
-still the default. `GET`s need nothing else; the four `POST`s need the `Content-Type` above.
+still the default. `GET`s need nothing else; the five `POST`s need the `Content-Type` above.
+
+Every route returns JSON except `/api/logs/download`, which returns `text/plain`.
 
 | Route | Method | Body / query | Returns |
 | --- | --- | --- | --- |
@@ -355,8 +487,11 @@ still the default. `GET`s need nothing else; the four `POST`s need the `Content-
 | `/api/leases` | GET | — | `{max, restored, leases[]}` — the DHCP table, live and as saved |
 | `/api/resets` | GET | — | `{max, count, resets[]}` — why this device restarted, newest first |
 | `/api/client/history?mac=&since=` | GET | `mac` required, `since` optional | fine-grained traffic history |
-| `/api/logs?since=` | GET | `since` optional | log lines newer than the cursor |
+| `/api/logs?since=` | GET | `since` optional | log lines newer than the cursor, plus the `syslog_*` counters |
+| `/api/logs/download` | GET | — | the whole ring as `text/plain`, with a diagnostics header |
 | `/api/logs/level` | POST | `{"level":"info"}` | sets the capture level |
+| `/api/syslog` | GET | — | syslog settings and counters, plus `subnet` |
+| `/api/syslog` | POST | `{"enabled":1,"server":…,"port":…,"facility":…,"min_severity":…,"hostname":…}` | saves; omitted fields keep their value. `enabled` is `1`/`0`, not `true`/`false` |
 | `/api/wifi` | POST | `{"ssid":…,"password":…,"channel":…}` | saves and **reboots** |
 | `/api/admin` | POST | `{"new_admin_user":…,"new_admin_password":…}` | saves, no reboot |
 | `/api/ota` | POST | raw firmware image | flashes and **reboots** |
@@ -583,8 +718,9 @@ list; the main ones:
 | `clients` | List active bridge clients (WiFi + Ethernet). |
 | `leases` | List DHCP leases and the MAC → IP reservations kept in flash — see [Clients keep their address across a reboot](#clients-keep-their-address-across-a-reboot). |
 | `loglevel [none\|error\|warn\|info\|debug\|verbose]` | Show or set how much log output reaches this serial console. Raises the web log page's capture level too, if that is what's holding the output back — see [Device log](#device-log). |
+| `syslog [on\|off] [-s <ip>] [-p <port>] [-f <facility>] [-l <severity>] [-n <name>]` | Show or set the remote syslog client. No args shows the settings and counters. The collector must be on the bridge's own subnet. Takes effect immediately — no reboot. See [Sending the log to a syslog server](#sending-the-log-to-a-syslog-server). |
 | `reboot` | Restart the device. |
-| `factory-reset yes` | Erase saved WiFi and admin credentials and the saved DHCP reservations, restoring compiled-in defaults (WiFi `AOG hub`/`password`; admin `admin`/`admin`), then reboot. Clients are given fresh addresses. Bare `factory-reset` (no `yes`) just prints this warning and changes nothing. |
+| `factory-reset yes` | Erase saved WiFi and admin credentials, the saved DHCP reservations, and the remote syslog settings, restoring compiled-in defaults (WiFi `AOG hub`/`password`; admin `admin`/`admin`), then reboot. Clients are given fresh addresses and the device stops shipping its log anywhere. Bare `factory-reset` (no `yes`) just prints this warning and changes nothing. |
 
 **Locked out of the web UI?** Connect over serial and run `factory-reset yes`. The device
 reboots with the default WiFi AP and `admin`/`admin` web login restored.
@@ -600,9 +736,16 @@ reboots with the default WiFi AP and `admin`/`admin` web login restored.
 - `main/serial_console.c` / `.h` — interactive UART console for recovery/diagnostics
 - `main/auth_cfg.c` / `.h` — admin username/password storage (NVS) with compiled-in defaults
 - `main/log_buf.c` / `.h` — in-memory log ring behind `/logs`, and the serial/capture level split
+- `main/syslog.c` / `.h` — RFC 5424 sender that ships that ring to a collector over UDP
+- `main/syslog_cfg.c` / `.h` — syslog settings (NVS), including the on-subnet validation
+- `main/eth_link.c` / `.h` — Ethernet port state (link, speed, duplex, flap count)
+- `main/reset_log.c` / `.h` — why the device restarted, kept in flash across reboots
+- `main/rail_witness.c` / `.h` — PHY-register marker distinguishing a reset from a power cycle
 - `main/webpage/index.html` — the web UI itself
 - `main/webpage/admin.html` — the `/admin` settings page
-- `main/webpage/logs.html` — the `/logs` device log page
+- `main/webpage/logs.html` — the `/logs` device log page, with the syslog settings panel
+- `main/webpage/leases.html` — the `/leases` DHCP table page
+- `main/webpage/resets.html` — the `/resets` reboot history page
 - `scripts/` — measurement gate, smoke tests, OTA helper (see [Diagnostics harness](#diagnostics-harness))
 - `bench/` — recorded gate runs; `00-baseline` is the reference
 

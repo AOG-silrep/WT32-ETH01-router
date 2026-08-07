@@ -9,6 +9,8 @@
 #include "eth_link.h"
 #include "reset_log.h"
 #include "log_buf.h"
+#include "syslog.h"
+#include "syslog_cfg.h"
 #include "esp_console.h"
 #include "argtable3/argtable3.h"
 #include "esp_wifi.h"
@@ -738,6 +740,143 @@ static int cmd_loglevel(int argc, char **argv)
     return 1;
 }
 
+// ---- syslog ----
+
+static struct {
+    struct arg_str *state;
+    struct arg_str *server;
+    struct arg_int *port;
+    struct arg_int *facility;
+    struct arg_str *severity;
+    struct arg_str *hostname;
+    struct arg_end *end;
+} syslog_args;
+
+static void print_syslog_status(const syslog_cfg_t *cfg)
+{
+    syslog_status_t st;
+    syslog_get_status(&st);
+
+    char server[16];
+    esp_ip4_addr_t addr = { .addr = cfg->server_ip };
+    esp_ip4addr_ntoa(&addr, server, sizeof(server));
+
+    printf("Syslog:     %s\n", cfg->enabled ? "enabled" : "disabled");
+    if (cfg->server_ip == 0) {
+        printf("Collector:  not set\n");
+    } else {
+        printf("Collector:  %s:%u   (facility %u %s, minimum severity %s)\n",
+               server, (unsigned)cfg->port, (unsigned)cfg->facility,
+               syslog_cfg_facility_name(cfg->facility),
+               syslog_cfg_severity_name(cfg->min_severity));
+    }
+    printf("Hostname:   %s\n", cfg->hostname);
+    printf("Socket:     %s\n", st.bound ? "bound to the bridge"
+                                        : "not bound - waiting for the bridge network");
+    printf("Sent:       %u    Waiting: %u    Filtered: %u    Aged out: %u    Failed: %u (last errno %d)\n",
+           (unsigned)st.sent, (unsigned)st.backlog, (unsigned)st.filtered,
+           (unsigned)st.aged_out, (unsigned)st.send_fail, st.last_errno);
+    printf("\n"
+           "Nothing here can tell whether the collector received any of it - UDP has\n"
+           "no acknowledgement, and this device has no route to anywhere that could\n"
+           "say. \"Sent\" means handed to the network.\n");
+}
+
+static int cmd_syslog(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **)&syslog_args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, syslog_args.end, argv[0]);
+        return 1;
+    }
+
+    syslog_cfg_t cfg;
+    syslog_cfg_get(&cfg);
+
+    bool any_given = syslog_args.state->count > 0 || syslog_args.server->count > 0 ||
+                     syslog_args.port->count > 0 || syslog_args.facility->count > 0 ||
+                     syslog_args.severity->count > 0 || syslog_args.hostname->count > 0;
+    if (!any_given) {
+        print_syslog_status(&cfg);
+        return 0;
+    }
+
+    // Any field not explicitly given keeps its current saved value, the same
+    // contract "wifi" and the web form follow.
+    if (syslog_args.state->count > 0) {
+        const char *state = syslog_args.state->sval[0];
+        if (strcmp(state, "on") == 0) {
+            cfg.enabled = true;
+        } else if (strcmp(state, "off") == 0) {
+            cfg.enabled = false;
+        } else {
+            printf("Error: expected \"on\" or \"off\", got \"%s\"\n", state);
+            return 1;
+        }
+    }
+    if (syslog_args.server->count > 0) {
+        esp_ip4_addr_t addr;
+        addr.addr = esp_ip4addr_aton(syslog_args.server->sval[0]);
+        if (addr.addr == 0) {
+            printf("Error: \"%s\" is not an IPv4 address\n", syslog_args.server->sval[0]);
+            return 1;
+        }
+        cfg.server_ip = addr.addr;
+    }
+    if (syslog_args.port->count > 0) {
+        int port = syslog_args.port->ival[0];
+        if (port < 1 || port > 65535) {
+            printf("Error: port must be 1-65535 (514 is the syslog default)\n");
+            return 1;
+        }
+        cfg.port = (uint16_t)port;
+    }
+    if (syslog_args.facility->count > 0) {
+        int facility = syslog_args.facility->ival[0];
+        if (facility < 0 || facility > 23) {
+            printf("Error: facility must be 0-23 (23 is local7)\n");
+            return 1;
+        }
+        cfg.facility = (uint8_t)facility;
+    }
+    if (syslog_args.severity->count > 0) {
+        uint8_t severity;
+        if (!syslog_cfg_severity_from_name(syslog_args.severity->sval[0], &severity)) {
+            printf("Error: unknown severity \"%s\" (want emergency|alert|critical|error|"
+                   "warning|notice|info|debug)\n", syslog_args.severity->sval[0]);
+            return 1;
+        }
+        cfg.min_severity = severity;
+    }
+    if (syslog_args.hostname->count > 0) {
+        strlcpy(cfg.hostname, syslog_args.hostname->sval[0], sizeof(cfg.hostname));
+        // An explicitly blank name means "go back to the default", resolved by
+        // syslog_cfg_save()/_get() rather than here.
+        if (cfg.hostname[0] == '\0') {
+            syslog_cfg_default_hostname(cfg.hostname, sizeof(cfg.hostname));
+        }
+    }
+
+    uint32_t subnet_ip = 0, subnet_mask = 0;
+    syslog_get_subnet(&subnet_ip, &subnet_mask);
+
+    const char *err_msg = NULL;
+    if (!syslog_cfg_validate(&cfg, subnet_ip, subnet_mask, &err_msg)) {
+        printf("Error: %s\n", err_msg);
+        return 1;
+    }
+
+    if (syslog_cfg_save(&cfg) != ESP_OK) {
+        printf("Error: failed to save syslog config\n");
+        return 1;
+    }
+    syslog_config_changed();
+
+    printf("Saved. In effect now; no reboot needed.\n\n");
+    print_syslog_status(&cfg);
+    return 0;
+}
+
 // ---- reboot ----
 
 static int cmd_reboot(int argc, char **argv)
@@ -781,9 +920,10 @@ static int cmd_factory_reset(int argc, char **argv)
     }
 
     if (factory_reset_args.confirm->count == 0 || strcmp(factory_reset_args.confirm->sval[0], "yes") != 0) {
-        printf("This erases the saved WiFi and admin credentials and the saved DHCP\n"
-               "address reservations, restoring compiled-in defaults, then reboots.\n"
-               "Clients will be given fresh addresses.\n"
+        printf("This erases the saved WiFi and admin credentials, the saved DHCP\n"
+               "address reservations, and the remote syslog settings, restoring\n"
+               "compiled-in defaults, then reboots. Clients will be given fresh\n"
+               "addresses, and the device will stop shipping its log anywhere.\n"
                "\n"
                "The reboot/crash history is kept. It is evidence about the device\n"
                "rather than configuration of it, and a factory reset is often the\n"
@@ -795,12 +935,17 @@ static int cmd_factory_reset(int argc, char **argv)
         return 0;
     }
 
+    // The syslog settings are erased along with the rest, deliberately: a device
+    // sent away for repair or handed on should not carry on shipping its log to
+    // somebody's old collector.
     esp_err_t err1 = erase_nvs_namespace("wifi_config");
     esp_err_t err2 = erase_nvs_namespace("auth_cfg");
     esp_err_t err3 = erase_nvs_namespace("dhcp_leases");
-    if (err1 != ESP_OK || err2 != ESP_OK || err3 != ESP_OK) {
-        printf("Error: failed to erase config (wifi: %s, admin: %s, leases: %s)\n",
-               esp_err_to_name(err1), esp_err_to_name(err2), esp_err_to_name(err3));
+    esp_err_t err4 = erase_nvs_namespace("syslog_cfg");
+    if (err1 != ESP_OK || err2 != ESP_OK || err3 != ESP_OK || err4 != ESP_OK) {
+        printf("Error: failed to erase config (wifi: %s, admin: %s, leases: %s, syslog: %s)\n",
+               esp_err_to_name(err1), esp_err_to_name(err2), esp_err_to_name(err3),
+               esp_err_to_name(err4));
         return 1;
     }
 
@@ -902,6 +1047,25 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&loglevel_cmd));
 
+    syslog_args.state = arg_str0(NULL, NULL, "<on|off>", "turn log shipping on or off");
+    syslog_args.server = arg_str0("s", "server", "<ip>", "collector address, on 192.168.5.0/24");
+    syslog_args.port = arg_int0("p", "port", "<1-65535>", "UDP port; 514 is the syslog default");
+    syslog_args.facility = arg_int0("f", "facility", "<0-23>", "syslog facility; 23 is local7");
+    syslog_args.severity = arg_str0("l", "level", "<severity>", "lowest severity to send");
+    syslog_args.hostname = arg_str0("n", "hostname", "<name>", "HOSTNAME field; blank restores the MAC-derived default");
+    syslog_args.end = arg_end(6);
+    const esp_console_cmd_t syslog_cmd = {
+        .command = "syslog",
+        .help = "Show or set the remote syslog client, which ships the device log to a "
+                "collector as RFC 5424 datagrams. No args shows the settings and counters. "
+                "The collector must be on this bridge's own subnet - it has no gateway. "
+                "Takes effect immediately: unlike \"wifi\", nothing here needs a reboot.",
+        .hint = NULL,
+        .func = &cmd_syslog,
+        .argtable = &syslog_args,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&syslog_cmd));
+
     const esp_console_cmd_t reboot_cmd = {
         .command = "reboot",
         .help = "Restart the device.",
@@ -914,7 +1078,7 @@ static void register_commands(void)
     factory_reset_args.end = arg_end(1);
     const esp_console_cmd_t factory_reset_cmd = {
         .command = "factory-reset",
-        .help = "Erase saved WiFi/admin config and DHCP reservations back to compiled-in defaults and reboot. The reboot/crash history is deliberately kept.",
+        .help = "Erase saved WiFi/admin config, DHCP reservations and syslog settings back to compiled-in defaults and reboot. The reboot/crash history is deliberately kept.",
         .hint = NULL,
         .func = &cmd_factory_reset,
         .argtable = &factory_reset_args,

@@ -12,6 +12,12 @@
   button { padding: 0.4em 1em; font-size: 0.9em; }
   select { padding: 0.3em; font-size: 0.9em; }
   label { font-size: 0.9em; }
+  input[type=text], input[type=number] { padding: 0.3em; font-size: 0.9em; }
+  /* The download control is an anchor, not a button - see the comment on it -
+     so it needs the button's own metrics to stop reading as a link. */
+  a.btn { padding: 0.4em 1em; font-size: 0.9em; border: 1px solid #767676; border-radius: 3px;
+          background: #efefef; color: #222; text-decoration: none; display: inline-block; }
+  a.btn:hover { background: #e5e5e5; }
   #banner { display: none; background: #b00020; color: #fff; padding: 0.6em 1em; border-radius: 4px; margin-bottom: 1em; }
   #banner.show { display: block; }
   .panel { border: 2px solid #888; border-radius: 4px; padding: 0.8em; margin-top: 1em; }
@@ -37,6 +43,14 @@
   tr.note td { background: #fbf3e0; color: #8a4b00; font-style: italic; text-align: center; }
   #empty { color: #898781; font-size: 0.9em; padding: 1em 0.5em; }
   #status { font-size: 0.85em; color: #898781; margin-top: 0.6em; }
+  .panel h2 { font-size: 1em; margin: 0 0 0.6em 0; }
+  .fields { display: flex; flex-wrap: wrap; gap: 1.2em; align-items: flex-end; }
+  .fields label { display: block; margin-bottom: 0.2em; color: #555; }
+  .hint { font-size: 0.85em; color: #898781; margin-top: 0.6em; }
+  #syslog-msg { font-size: 0.9em; margin-top: 0.6em; }
+  #syslog-msg.ok { color: #0a7a2f; }
+  #syslog-msg.error { color: #b00020; }
+  #syslog-state { font-size: 0.85em; color: #898781; margin-top: 0.6em; }
 </style>
 </head>
 <body>
@@ -67,6 +81,12 @@
       </select>
     </span>
     <span class="spacer"></span>
+    <!-- An anchor with `download`, not a fetch(): the browser's own download
+         machinery attaches the Basic Auth credentials it already holds, takes
+         the filename from Content-Disposition, and streams the chunks straight
+         to disk - rather than assembling 24KB in a tab that is meant to be left
+         open for days. -->
+    <a class="btn" id="download" href="/api/logs/download" download>Download</a>
     <button type="button" id="pause">Pause</button>
     <button type="button" id="clear">Clear</button>
   </div>
@@ -81,6 +101,63 @@
     <div id="empty">Waiting for log lines&hellip;</div>
   </div>
   <div id="status"></div>
+</div>
+
+<div class="panel">
+  <h2>Send the log to a syslog server</h2>
+  <div class="fields">
+    <span>
+      <label for="sl-enabled">Shipping</label>
+      <input type="checkbox" id="sl-enabled"> <label for="sl-enabled">on</label>
+    </span>
+    <span>
+      <label for="sl-server">Collector address</label>
+      <input type="text" id="sl-server" size="15" placeholder="192.168.5.20">
+    </span>
+    <span>
+      <label for="sl-port">Port</label>
+      <input type="number" id="sl-port" min="1" max="65535" style="width:6em">
+    </span>
+    <span>
+      <label for="sl-facility">Facility</label>
+      <select id="sl-facility">
+        <option value="1">user</option>
+        <option value="3">daemon</option>
+        <option value="16">local0</option>
+        <option value="17">local1</option>
+        <option value="18">local2</option>
+        <option value="19">local3</option>
+        <option value="20">local4</option>
+        <option value="21">local5</option>
+        <option value="22">local6</option>
+        <option value="23">local7</option>
+      </select>
+    </span>
+    <span>
+      <label for="sl-severity">Send down to</label>
+      <select id="sl-severity">
+        <option value="3">error</option>
+        <option value="4">warning</option>
+        <option value="5">notice</option>
+        <option value="6">info</option>
+        <option value="7">debug</option>
+      </select>
+    </span>
+    <span>
+      <label for="sl-hostname">Hostname</label>
+      <input type="text" id="sl-hostname" size="20">
+    </span>
+    <button type="button" id="sl-save">Save</button>
+  </div>
+  <div id="syslog-msg"></div>
+  <div id="syslog-state"></div>
+  <div class="hint" id="sl-subnet-hint"></div>
+  <div class="hint">
+    Nothing here can tell whether the collector received anything. UDP has no
+    acknowledgement, and this device has no route to anywhere that could say.
+    &ldquo;Sent&rdquo; means handed to the network.
+  </div>
+  <div class="hint" id="sl-capture-hint"></div>
 </div>
 
 <script>
@@ -352,6 +429,15 @@ async function fetchOnce() {
   }
   renderStatus();
 
+  renderSyslogState(data);
+  renderCaptureCeiling(data);
+  // Retried here rather than only at startup: the panel's own load can fail
+  // while the log poll succeeds, and once it has loaded it still has to stay
+  // current - see the note on slLoaded.
+  if (!slLoaded || Date.now() - slLastLoad > SL_RELOAD_MS) {
+    loadSyslog().catch(() => {});
+  }
+
   return data.more;
 }
 
@@ -390,6 +476,146 @@ async function poll() {
     polling = false;
   }
 }
+
+// ---- syslog panel ----
+
+const slMsg = document.getElementById('syslog-msg');
+const slState = document.getElementById('syslog-state');
+
+// The device is the authority on these too - the "syslog" console command can
+// change them - so the form is only populated while nothing in it has focus,
+// the same rule the capture select follows. Without that, a refresh would yank
+// a half-typed address away.
+//
+// It has to keep refreshing rather than load once, because Save sends every
+// field, not just the changed one. A form populated at page load and submitted
+// half an hour later would write its stale copy over anything the console or
+// another tab had changed in between - silently, since the field the person
+// came to change is the only one they are looking at. Re-reading whenever the
+// form is idle keeps the copy it would write current.
+let slLoaded = false;
+let slLastLoad = 0;
+const SL_RELOAD_MS = 5000;
+
+function slFieldsFocused() {
+  const active = document.activeElement;
+  return active && active.id && active.id.startsWith('sl-');
+}
+
+function showSyslogConfig(data) {
+  if (slFieldsFocused()) return;
+  document.getElementById('sl-enabled').checked = data.enabled;
+  document.getElementById('sl-server').value = data.server;
+  document.getElementById('sl-port').value = data.port;
+  document.getElementById('sl-facility').value = String(data.facility);
+  document.getElementById('sl-severity').value = String(data.min_severity);
+  // The name is shown as a placeholder rather than a value when it is the
+  // MAC-derived default, so clearing the field means "go back to the default"
+  // instead of "no name at all".
+  document.getElementById('sl-hostname').value = data.hostname;
+  document.getElementById('sl-subnet-hint').textContent =
+    data.subnet === 'unknown'
+      ? 'The collector must be on this bridge’s own network — it has no gateway and cannot reach anything else.'
+      : 'The collector must be on ' + data.subnet + ' — this bridge has no gateway and cannot reach anything else.';
+  slLoaded = true;
+}
+
+async function loadSyslog() {
+  const res = await fetchWithTimeout('/api/syslog', {}, 2000);
+  showSyslogConfig(await res.json());
+  slLastLoad = Date.now();
+}
+
+// Fed from the /api/logs poll rather than a request of its own: that poll
+// already runs once a second and carries these counters, so the status line
+// costs nothing extra.
+function renderSyslogState(data) {
+  if (!data.syslog_enabled) {
+    slState.textContent = 'Not shipping. Turn it on above to send the log to a collector.';
+    return;
+  }
+  const parts = [];
+  if (data.syslog_backlog > 0) {
+    parts.push(data.syslog_backlog + ' line(s) waiting');
+  }
+  if (data.syslog_aged > 0) {
+    parts.push(data.syslog_aged + ' aged out of the buffer before they could be sent');
+  }
+  if (data.syslog_failed > 0) {
+    parts.push(data.syslog_failed + ' send failure(s) (errno ' + data.syslog_errno + ')');
+  }
+  const head = data.syslog_sent + ' line(s) handed to the network';
+  slState.textContent = parts.length ? head + ' · ' + parts.join(' · ') : head + '.';
+  slState.style.color = data.syslog_failed > 0 ? '#b00020' : '';
+}
+
+// The ring can never be more verbose than the capture level, so a severity
+// below it changes nothing. Same shape as the capture note above, and for the
+// same reason: without it the only reading is that the page is broken.
+function renderCaptureCeiling(data) {
+  const hint = document.getElementById('sl-capture-hint');
+  hint.textContent =
+    'The device only records down to "' + data.level + '" (this build’s maximum is "' +
+    data.max_level + '"), so choosing a level below that here sends no extra lines.';
+}
+
+document.getElementById('sl-save').addEventListener('click', async () => {
+  // Refuse to submit a form that has never been populated. Save sends every
+  // field, so submitting before the first load lands writes each control's
+  // default - and for the two <select>s that means their first option, which
+  // would quietly rewrite the facility to "user" and the severity to "error"
+  // on a device that had neither. Nothing on screen would say so: the fields
+  // would simply be showing what was about to be saved.
+  if (!slLoaded) {
+    slMsg.className = 'error';
+    slMsg.textContent = 'Settings have not loaded yet — nothing was saved. Try again in a moment.';
+    loadSyslog().catch(() => {});
+    return;
+  }
+
+  const hostname = document.getElementById('sl-hostname').value.trim();
+  const payload = {
+    // 1/0, not true/false: the device's JSON reader takes numbers. See
+    // syslog_post_handler() in web_server.c.
+    enabled: document.getElementById('sl-enabled').checked ? 1 : 0,
+    server: document.getElementById('sl-server').value.trim(),
+    port: Number(document.getElementById('sl-port').value),
+    facility: Number(document.getElementById('sl-facility').value),
+    min_severity: Number(document.getElementById('sl-severity').value),
+    hostname: hostname,
+  };
+
+  slMsg.className = '';
+  slMsg.textContent = 'Saving…';
+  try {
+    const res = await fetchWithTimeout('/api/syslog', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }, 4000);
+    if (res.ok) {
+      slMsg.className = 'ok';
+      slMsg.textContent = 'Saved. In effect now — no reboot needed.';
+      await loadSyslog();
+    } else {
+      // The device's rejection text is the useful part, especially the
+      // on-subnet one, so it is shown verbatim rather than summarised.
+      const text = await res.text();
+      slMsg.className = 'error';
+      slMsg.textContent = text || ('Rejected (HTTP ' + res.status + ')');
+    }
+  } catch (e) {
+    if (e === SETUP_ERROR) { location.href = '/admin?forced=1'; return; }
+    if (e === AUTH_ERROR) { location.reload(); return; }
+    slMsg.className = 'error';
+    slMsg.textContent = 'Could not reach the bridge.';
+  }
+});
+
+loadSyslog().catch(() => {
+  // Left to the poll below to retry - a panel that could not load is not a
+  // reason to stop tailing the log.
+});
 
 poll();
 const pollTimer = setInterval(poll, 1000);

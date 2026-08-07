@@ -31,6 +31,8 @@
 #include "web_server.h"
 #include "serial_console.h"
 #include "log_buf.h"
+#include "syslog.h"
+#include "syslog_cfg.h"
 
 static const char *TAG = "AOG-BRIDGE";
 
@@ -310,6 +312,30 @@ void app_main(void)
     // Admin credential RAM cache - must be up before web_server_start()/
     // serial_console_init() below, since both can call auth_cfg_load/save.
     ESP_ERROR_CHECK(auth_cfg_init());
+
+    // Remote syslog settings cache, for the same reason as auth_cfg above: the
+    // web server and the console both read and write it. It also has to precede
+    // syslog_init() below, whose task reads the configuration as its first act.
+    ESP_ERROR_CHECK(syslog_cfg_init());
+
+    // Remote syslog sender. Must be before esp_eth_start()/esp_wifi_start()
+    // below, for the same reason dhcp_server_start() and eth_link_init() are: it
+    // pins its socket to the bridge from IP_EVENT_NETIF_UP, and a handler
+    // registered after the bridge came up would never see the one event it
+    // needs - leaving the sender routing by the default netif, which during
+    // startup can be the AP port.
+    //
+    // Not deferred to the end of app_main next to web_server_start(), even
+    // though nothing before this point needs it: everything logged above - the
+    // banner, the reset history, the Ethernet and WiFi bring-up - is still in
+    // the ring, and shipping it is most of what this feature is for. The task
+    // starts its cursor at the oldest line the ring holds, so all of it goes.
+    //
+    // ESP_ERROR_CHECK'd, unlike reset_log_init(): this returns ESP_OK for
+    // anything recoverable, including a configuration that is absent or turned
+    // off. An error here means a mutex or a task could not be created, which is
+    // the class of failure that check exists for.
+    ESP_ERROR_CHECK(syslog_init(br_netif));
 
     // Since MAC forwarding is done in the lwIP bridge, the Ethernet MAC needs
     // to pass through frames not addressed to it.

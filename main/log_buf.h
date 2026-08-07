@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -71,6 +73,22 @@ void log_buf_get_range(uint32_t *oldest, uint32_t *newest, uint32_t *missed);
 // s_mutex in log_buf.c.
 bool log_buf_get_line(uint32_t seq, char *level, uint32_t *ts_ms,
                       char *tag, size_t tagsz, char *msg, size_t msgsz);
+
+// Wakes `task` with xTaskNotifyGive() whenever a line is committed, so a reader
+// can ship lines as they arrive rather than sampling the ring on a timer and
+// hoping it did not wrap in between. Sampling is fine for the log page, which
+// only has to show what is there now; it is not fine for the syslog sender,
+// which has to keep up with a burst - a boot sequence or an association storm
+// writes more than LOG_BUF_LINES inside a second, and a once-a-second reader
+// would ship a sample of it.
+//
+// This is the one FreeRTOS call the capture path makes, and it qualifies for
+// the one reason that matters here: it cannot log. See the note on s_mutex in
+// log_buf.c for why anything that could is disqualified.
+//
+// One reader. A second would need a list, and there is no second - every other
+// consumer polls. NULL detaches.
+void log_buf_set_notify(TaskHandle_t task);
 
 #ifdef __cplusplus
 }
