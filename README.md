@@ -1,6 +1,6 @@
 # wt32-bridge
 
-Version: 1.4.0 (see [version.txt](version.txt); shown on the web UI as "Rev 1.4.0")
+Version: 1.5.0 (see [version.txt](version.txt); shown on the web UI as "Rev 1.5.0")
 
 An ESP-IDF firmware project that turns a [WT32-ETH01](https://en.wireless-tag.com/product-item-2.html) (ESP32 + LAN8720 Ethernet PHY) module into an Ethernet↔WiFi bridge for [AgOpenGPS](https://github.com/AgOpenGPS-Official/AgOpenGPS). It bridges the wired Ethernet interface and a WiFi access point at the network layer, and serves a small web UI for configuration and live monitoring.
 
