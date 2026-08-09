@@ -226,6 +226,17 @@ bool client_track_quarantine_clear(const uint8_t mac[6]);
 void client_track_quarantine_enforce(bool on);
 bool client_track_quarantine_enforcing(void);
 
+// ---- kicking a wedged station ----
+
+// Tears down mac's current WiFi association, if it has one. Not a ban - it
+// only removes the station as it stands right now, so a client that retries
+// on its own is free to reassociate immediately. That's the intended use: a
+// wedged station rarely retries on its own, so forcing the drop is what gets
+// it working again, without touching any other client or rebooting the
+// bridge. Returns false if mac isn't a currently active client, or is a
+// wired one - there's no association to tear down on the Ethernet side.
+bool client_track_kick_station(const uint8_t mac[6]);
+
 #ifdef __cplusplus
 }
 #endif

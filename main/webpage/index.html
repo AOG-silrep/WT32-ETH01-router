@@ -152,7 +152,7 @@
       <span class="legend-item"><i style="background:var(--chart-rx)"></i><span id="legend-rx-label">Down (rx, bytes)</span></span>
       <span class="legend-item"><i style="background:var(--chart-tx)"></i><span id="legend-tx-label">Up (tx, bytes)</span></span>
     </div>
-    <div><span id="chart-title"></span> <button type="button" id="chart-mode">Show packets/s</button> <button type="button" id="chart-pause">Pause</button> <button type="button" id="chart-stop">Stop</button></div>
+    <div><button type="button" id="chart-kick">Kick</button> <span id="chart-title"></span> <button type="button" id="chart-mode">Show packets/s</button> <button type="button" id="chart-pause">Pause</button> <button type="button" id="chart-stop">Stop</button></div>
   </div>
   <canvas id="traffic-canvas" width="600" height="160"></canvas>
   <div id="chart-tooltip"></div>
@@ -294,7 +294,7 @@ async function refreshClients() {
       '<td class="rate">' + formatRate(c.tx_bps) + '</td>' +
       '<td class="rate">' + formatPps(c.rx_pps) + '</td>' +
       '<td class="rate">' + formatPps(c.tx_pps) + '</td>' +
-      '<td><button type="button" class="watch-btn" data-mac="' + esc(c.mac) + '" data-name="' + esc(c.name || '') + '">' +
+      '<td><button type="button" class="watch-btn" data-mac="' + esc(c.mac) + '" data-name="' + esc(c.name || '') + '" data-link="' + esc(c.link) + '">' +
         (c.mac === selectedMac ? 'Watching' : 'Graph') + '</button></td>';
     body.appendChild(tr);
     if (c.mac === selectedMac) {
@@ -325,7 +325,7 @@ function chartTitleFor(name, mac) {
   return name || mac;
 }
 
-function selectClient(mac, name) {
+function selectClient(mac, name, isWifi) {
   selectedMac = mac;
   lastSeq = 0;
   histRx = [];
@@ -337,6 +337,9 @@ function selectClient(mac, name) {
   document.getElementById('chart-title').textContent = chartTitleFor(name, mac);
   document.getElementById('chart-tooltip').textContent = '';
   document.getElementById('chart-panel').classList.add('show');
+  // Only a WiFi station has an association to tear down - an Ethernet
+  // client has no equivalent action, so the button isn't offered for one.
+  document.getElementById('chart-kick').style.display = isWifi ? '' : 'none';
   drawChart();
 }
 
@@ -346,8 +349,39 @@ function stopWatching() {
 }
 
 document.getElementById('clients-body').addEventListener('click', (e) => {
-  const btn = e.target.closest('.watch-btn');
-  if (btn) selectClient(btn.dataset.mac, btn.dataset.name);
+  const watchBtn = e.target.closest('.watch-btn');
+  if (watchBtn) selectClient(watchBtn.dataset.mac, watchBtn.dataset.name, watchBtn.dataset.link === 'wifi');
+});
+
+// A wedged station otherwise has no recovery short of rebooting the whole
+// bridge, which would drop every other client too - this tears down just
+// its own association. The client table's next poll shows whether it came
+// back.
+document.getElementById('chart-kick').addEventListener('click', async (e) => {
+  const btn = e.target;
+  const mac = selectedMac;
+  if (!mac) return;
+  btn.disabled = true;
+  const originalText = btn.textContent;
+  try {
+    const res = await fetch('/api/clients/kick', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mac })
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      btn.textContent = data.error || 'Failed';
+      setTimeout(() => { btn.textContent = originalText; btn.disabled = false; }, 2000);
+      return;
+    }
+  } catch (e) {
+    btn.textContent = 'Failed';
+    setTimeout(() => { btn.textContent = originalText; btn.disabled = false; }, 2000);
+    return;
+  }
+  btn.disabled = false;
+  refreshClients();
 });
 document.getElementById('chart-stop').addEventListener('click', stopWatching);
 document.getElementById('chart-pause').addEventListener('click', (e) => {

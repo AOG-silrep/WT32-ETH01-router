@@ -965,6 +965,48 @@ static client_entry_t *find_locked(const uint8_t *mac)
     return NULL;
 }
 
+// ---- kicking a wedged station ----
+//
+// The only thing that removes a station short of this is a reboot of the
+// whole bridge, which drops every other client too. This tears down one
+// station's current association on request - it doesn't ban the MAC, so a
+// station that immediately retries is free to reassociate right away. That's
+// the point: a wedged client typically doesn't retry on its own, so a fresh
+// association is the recovery, not a bug in this feature.
+bool client_track_kick_station(const uint8_t mac[6])
+{
+    if (s_mutex == NULL) {
+        return false;
+    }
+
+    bool is_wifi = false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    client_entry_t *e = find_locked(mac);
+    if (e != NULL) {
+        is_wifi = e->is_wifi;
+    }
+    xSemaphoreGive(s_mutex);
+
+    if (e == NULL || !is_wifi) {
+        // Not a live client, or a wired one - there's no association to tear
+        // down on the Ethernet side.
+        return false;
+    }
+
+    uint16_t aid;
+    if (esp_wifi_ap_get_sta_aid(mac, &aid) != ESP_OK) {
+        // Left between the lookup above and here.
+        return false;
+    }
+
+    char who[64];
+    ESP_LOGW(TAG, "kicking wifi station %02x:%02x:%02x:%02x:%02x:%02x (aid %u) - %s",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], (unsigned)aid,
+             describe_client(mac, who, sizeof(who)));
+
+    return esp_wifi_deauth_sta(aid) == ESP_OK;
+}
+
 // Of two MACs found on one address, true if b is the later arrival - the one
 // that loses it. First device on the address keeps it.
 //

@@ -1247,6 +1247,46 @@ static bool parse_mac(const char *str, uint8_t mac[6])
     return true;
 }
 
+static esp_err_t kick_post_handler(httpd_req_t *req)
+{
+    if (!check_admin_auth(req)) {
+        send_auth_error(req);
+        return ESP_OK;
+    }
+    if (auth_cfg_password_is_default()) {
+        send_setup_required(req);
+        return ESP_OK;
+    }
+    if (!csrf_check(req, "application/json")) {
+        return ESP_OK;
+    }
+
+    char buf[64];
+    if (recv_body(req, buf, sizeof(buf)) < 0) {
+        return ESP_FAIL;
+    }
+
+    char mac_str[24] = {0};
+    uint8_t mac[6];
+    if (!json_get_string(buf, "mac", mac_str, sizeof(mac_str)) || !parse_mac(mac_str, mac)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing or invalid \"mac\"");
+        return ESP_FAIL;
+    }
+
+    char resp[96];
+    int len;
+    if (client_track_kick_station(mac)) {
+        len = resp_append(resp, sizeof(resp), 0, "{\"ok\":true}");
+    } else {
+        len = resp_append(resp, sizeof(resp), 0,
+                           "{\"ok\":false,\"error\":\"Not a connected WiFi client\"}");
+    }
+    if (!resp_send_json(req, resp, len, sizeof(resp))) {
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
 static esp_err_t client_history_get_handler(httpd_req_t *req)
 {
     if (!check_admin_auth(req)) {
@@ -2235,6 +2275,7 @@ httpd_handle_t web_server_start(void)
     const httpd_uri_t admin_uri = {.uri = "/api/admin", .method = HTTP_POST, .handler = admin_post_handler};
     const httpd_uri_t clients_uri = {.uri = "/api/clients", .method = HTTP_GET, .handler = clients_get_handler};
     const httpd_uri_t history_uri = {.uri = "/api/client/history", .method = HTTP_GET, .handler = client_history_get_handler};
+    const httpd_uri_t kick_uri = {.uri = "/api/clients/kick", .method = HTTP_POST, .handler = kick_post_handler};
     const httpd_uri_t system_uri = {.uri = "/api/system", .method = HTTP_GET, .handler = system_get_handler};
     const httpd_uri_t ota_uri = {.uri = "/api/ota", .method = HTTP_POST, .handler = ota_post_handler};
     const httpd_uri_t leases_page_uri = {.uri = "/leases", .method = HTTP_GET, .handler = leases_page_get_handler};
@@ -2255,6 +2296,7 @@ httpd_handle_t web_server_start(void)
     httpd_register_uri_handler(server, &admin_uri);
     httpd_register_uri_handler(server, &clients_uri);
     httpd_register_uri_handler(server, &history_uri);
+    httpd_register_uri_handler(server, &kick_uri);
     httpd_register_uri_handler(server, &system_uri);
     httpd_register_uri_handler(server, &ota_uri);
     httpd_register_uri_handler(server, &leases_page_uri);

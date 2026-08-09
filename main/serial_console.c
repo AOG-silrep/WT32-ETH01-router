@@ -328,6 +328,11 @@ static int cmd_leases(int argc, char **argv)
 // ---- quarantine ----
 
 static struct {
+    struct arg_str *mac;
+    struct arg_end *end;
+} kick_args;
+
+static struct {
     struct arg_str *action;
     struct arg_str *mac;
     struct arg_end *end;
@@ -446,6 +451,33 @@ static int cmd_quarantine(int argc, char **argv)
 
         printf("%-15s %-18s %-18s %s\n", ip_str, blocked, holder, state);
     }
+    return 0;
+}
+
+// Not a ban: the station is free to reassociate right away, so this is for a
+// wedged client that isn't going to retry on its own, not for keeping a
+// device off the network.
+static int cmd_kick(int argc, char **argv)
+{
+    int errors = arg_parse(argc, argv, (void **)&kick_args);
+    if (errors != 0) {
+        arg_print_errors(stderr, kick_args.end, argv[0]);
+        return 1;
+    }
+
+    const char *who = kick_args.mac->sval[0];
+    uint8_t mac[6];
+    if (!parse_mac(who, mac)) {
+        printf("Not a MAC address: %s\n", who);
+        return 1;
+    }
+
+    if (!client_track_kick_station(mac)) {
+        printf("%s is not a connected WiFi client.\n", who);
+        return 1;
+    }
+
+    printf("Kicked %s - it will need to reassociate.\n", who);
     return 0;
 }
 
@@ -1026,6 +1058,20 @@ static void register_commands(void)
         .argtable = &quarantine_args,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&quarantine_cmd));
+
+    kick_args.mac = arg_str1(NULL, NULL, "<mac>", "WiFi station to disconnect");
+    kick_args.end = arg_end(1);
+    const esp_console_cmd_t kick_cmd = {
+        .command = "kick",
+        .help = "Tear down a WiFi station's current association so it has to reassociate. "
+                "Not a ban - a station that retries on its own is free to reconnect "
+                "immediately. For a client that's wedged and won't retry itself, without "
+                "rebooting the whole bridge.",
+        .hint = NULL,
+        .func = &cmd_kick,
+        .argtable = &kick_args,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&kick_cmd));
 
     const esp_console_cmd_t resets_cmd = {
         .command = "resets",
