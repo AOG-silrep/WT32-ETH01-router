@@ -1,0 +1,25 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "App Size",
+      "detail": "Show what percent of the app partition the last build's binary uses",
+      "type": "shell",
+      "command": "python3",
+      "args": [
+        "${workspaceFolder}/scripts/report_app_size.py",
+        "${workspaceFolder}/build/wt32-bridge.bin",
+        "${workspaceFolder}/build/partition_table/partition-table.bin"
+      ],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "icon": {
+        "id": "database",
+        "color": "terminal.ansiBlue"
+      }
+    }
+  ]
+}
