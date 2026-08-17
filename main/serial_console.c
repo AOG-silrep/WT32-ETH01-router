@@ -11,6 +11,8 @@
 #include "log_buf.h"
 #include "syslog.h"
 #include "syslog_cfg.h"
+#include "wan.h"
+#include "wan_cfg.h"
 #include "esp_console.h"
 #include "argtable3/argtable3.h"
 #include "esp_wifi.h"
@@ -574,6 +576,8 @@ static void reset_what_happened(const reset_log_entry_t *e, char *out, size_t n)
         strlcpy(out, "restart for firmware update", n);
     } else if (e->intent == RESET_INTENT_WIFI_SAVE) {
         strlcpy(out, "restart to apply WiFi settings", n);
+    } else if (e->intent == RESET_INTENT_WAN_SAVE) {
+        strlcpy(out, "restart to apply internet uplink settings", n);
     } else if (e->intent == RESET_INTENT_CONSOLE) {
         strlcpy(out, "console requested restart", n);
     } else if (e->intent == RESET_INTENT_FACTORY_RESET) {
@@ -909,6 +913,139 @@ static int cmd_syslog(int argc, char **argv)
     return 0;
 }
 
+// ---- wan ----
+
+static struct {
+    struct arg_str *state;
+    struct arg_str *ssid;
+    struct arg_str *password;
+    struct arg_str *ports;
+    struct arg_end *end;
+} wan_args;
+
+static void print_wan_status(const wan_cfg_t *cfg)
+{
+    wan_status_t st;
+    wan_get_status(&st);
+
+    char ports[WAN_CFG_PORTS_STR_MAX];
+    wan_cfg_format_ports(cfg, ports, sizeof(ports));
+
+    printf("Internet uplink: %s\n", cfg->enabled ? "on" : "off");
+    printf("  Upstream network: %s\n", cfg->ssid[0] ? cfg->ssid : "(not set)");
+    printf("  Password:         %s\n", cfg->password[0] ? "(set)" : "(open network)");
+    printf("  Allowed ports:    %s\n", ports[0] ? ports : "(none)");
+    printf("  State:            %s\n", wan_state_name(st.state));
+
+    if (st.state == WAN_STATE_SUBNET_CONFLICT) {
+        printf("  The upstream network hands out addresses on 192.168.5.x, the same range\n"
+               "  this bridge uses. Change the upstream router's range, or the uplink\n"
+               "  cannot work.\n");
+    }
+    if (st.ip.addr != 0) {
+        printf("  Address:          " IPSTR "/" IPSTR "\n", IP2STR(&st.ip), IP2STR(&st.netmask));
+        printf("  Gateway:          " IPSTR "\n", IP2STR(&st.gw));
+        printf("  DNS:              " IPSTR "\n", IP2STR(&st.dns));
+        printf("  Signal:           %d dBm\n", st.rssi);
+    }
+    if (st.ap_channel != 0) {
+        printf("  Radio channel:    %u", (unsigned)st.ap_channel);
+        if (st.ap_channel_configured != 0 && st.ap_channel != st.ap_channel_configured) {
+            printf(" (the \"wifi\" setting asks for %u, but one radio cannot serve two "
+                   "channels - the upstream network's wins)", (unsigned)st.ap_channel_configured);
+        }
+        printf("\n");
+    }
+    if (st.retry_in_s != 0) {
+        printf("  Retrying in:      %u s\n", (unsigned)st.retry_in_s);
+    }
+    printf("  NAT:              %s\n", st.napt_on ? "enabled" : "not enabled");
+    printf("  Connects/disconnects: %u/%u (last reason %u)\n",
+           (unsigned)st.connects, (unsigned)st.disconnects, (unsigned)st.last_reason);
+    printf("  Out: %u allowed, %u blocked by the port list\n",
+           (unsigned)st.tx_allowed, (unsigned)st.tx_blocked);
+    printf("  In:  %u allowed, %u blocked\n",
+           (unsigned)st.rx_allowed, (unsigned)st.rx_blocked);
+}
+
+static int cmd_wan(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **)&wan_args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, wan_args.end, argv[0]);
+        return 1;
+    }
+
+    wan_cfg_t cfg;
+    wan_cfg_get(&cfg);
+    const wan_cfg_t before = cfg;
+
+    bool any_given = wan_args.state->count > 0 || wan_args.ssid->count > 0 ||
+                     wan_args.password->count > 0 || wan_args.ports->count > 0;
+    if (!any_given) {
+        print_wan_status(&cfg);
+        return 0;
+    }
+
+    // Any field not explicitly given keeps its current saved value, the same
+    // contract "wifi", "syslog" and the web form follow.
+    if (wan_args.state->count > 0) {
+        const char *state = wan_args.state->sval[0];
+        if (strcmp(state, "on") == 0) {
+            cfg.enabled = true;
+        } else if (strcmp(state, "off") == 0) {
+            cfg.enabled = false;
+        } else {
+            printf("Error: expected \"on\" or \"off\", got \"%s\"\n", state);
+            return 1;
+        }
+    }
+    if (wan_args.ssid->count > 0) {
+        strlcpy(cfg.ssid, wan_args.ssid->sval[0], sizeof(cfg.ssid));
+    }
+    if (wan_args.password->count > 0) {
+        strlcpy(cfg.password, wan_args.password->sval[0], sizeof(cfg.password));
+    }
+    if (wan_args.ports->count > 0) {
+        const char *err_msg = NULL;
+        if (!wan_cfg_parse_ports(wan_args.ports->sval[0], cfg.ports, &cfg.nports, &err_msg)) {
+            printf("Error: %s\n", err_msg);
+            return 1;
+        }
+    }
+
+    const char *err_msg = NULL;
+    if (!wan_cfg_validate(&cfg, &err_msg)) {
+        printf("Error: %s\n", err_msg);
+        return 1;
+    }
+
+    // Only the radio's half of the configuration needs a restart; the allowlist
+    // is read from a published snapshot on every packet. See wan_post_handler().
+    bool radio_changed = (cfg.enabled != before.enabled) ||
+                         strcmp(cfg.ssid, before.ssid) != 0 ||
+                         strcmp(cfg.password, before.password) != 0;
+
+    if (wan_cfg_save(&cfg) != ESP_OK) {
+        printf("Error: failed to save uplink config\n");
+        return 1;
+    }
+
+    if (!radio_changed) {
+        wan_ports_changed();
+        printf("Saved. In effect now; no reboot needed.\n\n");
+        print_wan_status(&cfg);
+        return 0;
+    }
+
+    printf("Saved. Restarting to apply - every WiFi client will disconnect and rejoin,\n"
+           "on the upstream network's channel if the uplink comes up.\n");
+    reset_log_note_intent(RESET_INTENT_WAN_SAVE);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    return 0;
+}
+
 // ---- reboot ----
 
 static int cmd_reboot(int argc, char **argv)
@@ -953,9 +1090,10 @@ static int cmd_factory_reset(int argc, char **argv)
 
     if (factory_reset_args.confirm->count == 0 || strcmp(factory_reset_args.confirm->sval[0], "yes") != 0) {
         printf("This erases the saved WiFi and admin credentials, the saved DHCP\n"
-               "address reservations, and the remote syslog settings, restoring\n"
-               "compiled-in defaults, then reboots. Clients will be given fresh\n"
-               "addresses, and the device will stop shipping its log anywhere.\n"
+               "address reservations, the remote syslog settings, and the internet\n"
+               "uplink settings, restoring compiled-in defaults, then reboots.\n"
+               "Clients will be given fresh addresses, the device will stop shipping\n"
+               "its log anywhere, and it will stop joining any upstream network.\n"
                "\n"
                "The reboot/crash history is kept. It is evidence about the device\n"
                "rather than configuration of it, and a factory reset is often the\n"
@@ -969,15 +1107,18 @@ static int cmd_factory_reset(int argc, char **argv)
 
     // The syslog settings are erased along with the rest, deliberately: a device
     // sent away for repair or handed on should not carry on shipping its log to
-    // somebody's old collector.
+    // somebody's old collector. The uplink settings go for the stronger version
+    // of the same reason - they contain another network's WiFi password.
     esp_err_t err1 = erase_nvs_namespace("wifi_config");
     esp_err_t err2 = erase_nvs_namespace("auth_cfg");
     esp_err_t err3 = erase_nvs_namespace("dhcp_leases");
     esp_err_t err4 = erase_nvs_namespace("syslog_cfg");
-    if (err1 != ESP_OK || err2 != ESP_OK || err3 != ESP_OK || err4 != ESP_OK) {
-        printf("Error: failed to erase config (wifi: %s, admin: %s, leases: %s, syslog: %s)\n",
+    esp_err_t err5 = erase_nvs_namespace("wan_cfg");
+    if (err1 != ESP_OK || err2 != ESP_OK || err3 != ESP_OK || err4 != ESP_OK || err5 != ESP_OK) {
+        printf("Error: failed to erase config (wifi: %s, admin: %s, leases: %s, syslog: %s, "
+               "uplink: %s)\n",
                esp_err_to_name(err1), esp_err_to_name(err2), esp_err_to_name(err3),
-               esp_err_to_name(err4));
+               esp_err_to_name(err4), esp_err_to_name(err5));
         return 1;
     }
 
@@ -1112,6 +1253,27 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&syslog_cmd));
 
+    wan_args.state = arg_str0(NULL, NULL, "<on|off>", "turn the internet uplink on or off");
+    wan_args.ssid = arg_str0("s", "ssid", "<ssid>", "upstream network to join");
+    wan_args.password = arg_str0("p", "password", "<pass>", "upstream password; omit for an open network");
+    wan_args.ports = arg_str0(NULL, "ports", "<list>", "allowed destination ports, e.g. 2101,21116/udp");
+    wan_args.end = arg_end(5);
+    const esp_console_cmd_t wan_cmd = {
+        .command = "wan",
+        .help = "Show or set the WiFi internet uplink, which routes LAN clients out through "
+                "another WiFi network with NAT. No args shows the state and counters. Only the "
+                "listed ports can be reached through it (2101 is the usual NTRIP caster port); "
+                "everything else, in both directions, is dropped. An entry is a port number, "
+                "optionally suffixed /tcp or /udp; bare means TCP. Changing --ports takes "
+                "effect immediately; changing the network, password or on/off reboots. Note the "
+                "device has one radio: while the uplink is up, this bridge's own WiFi is forced "
+                "onto the upstream network's channel.",
+        .hint = NULL,
+        .func = &cmd_wan,
+        .argtable = &wan_args,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wan_cmd));
+
     const esp_console_cmd_t reboot_cmd = {
         .command = "reboot",
         .help = "Restart the device.",
@@ -1124,7 +1286,7 @@ static void register_commands(void)
     factory_reset_args.end = arg_end(1);
     const esp_console_cmd_t factory_reset_cmd = {
         .command = "factory-reset",
-        .help = "Erase saved WiFi/admin config, DHCP reservations and syslog settings back to compiled-in defaults and reboot. The reboot/crash history is deliberately kept.",
+        .help = "Erase saved WiFi/admin config, DHCP reservations, syslog settings and internet uplink settings back to compiled-in defaults and reboot. The reboot/crash history is deliberately kept.",
         .hint = NULL,
         .func = &cmd_factory_reset,
         .argtable = &factory_reset_args,

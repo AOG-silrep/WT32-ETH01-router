@@ -9,6 +9,14 @@
   h1 { font-size: 1.3em; }
   h2 { font-size: 1.1em; margin-top: 2em; }
   label { display: block; margin-top: 0.8em; font-size: 0.9em; }
+  /* "(locked to upstream)" carries a title tooltip explaining why. Without an
+     affordance a tooltip is invisible, so it gets the conventional one: dotted
+     underline and a help cursor. Empty and inert whenever the uplink is off. */
+  #channel-lock:not(:empty) { border-bottom: 1px dotted #898781; cursor: help; }
+  /* The disabled state is the same fact as the label, said to the eye. Browsers
+     grey a disabled select only faintly, and this one sits next to two enabled
+     inputs where "not editable" has to read at a glance. */
+  select:disabled { background: #f2f1ee; color: #898781; cursor: not-allowed; }
   input, select { width: 100%; box-sizing: border-box; padding: 0.4em; margin-top: 0.2em; font-size: 1em; }
   button { margin-top: 1em; padding: 0.5em 1.2em; font-size: 1em; }
   #wifi-msg { margin-top: 0.6em; font-size: 0.9em; }
@@ -59,6 +67,7 @@
 <div id="banner">Lost connection to bridge &mdash; retrying&hellip;</div>
 
 <h1>AgOpen router <span id="fw-version" style="font-size: 0.5em; color: #898781; font-weight: normal;"></span>
+<a href="/wan" style="font-size: 0.55em; font-weight: normal; color: #2a78d6; text-decoration: none; margin-left: 0.6em;">Internet uplink &rarr;</a>
 <a href="/leases" style="font-size: 0.55em; font-weight: normal; color: #2a78d6; text-decoration: none; margin-left: 0.6em;">DHCP leases &rarr;</a>
 <a href="/logs" style="font-size: 0.55em; font-weight: normal; color: #2a78d6; text-decoration: none; margin-left: 0.6em;">Device log &rarr;</a>
 <a href="/resets" style="font-size: 0.55em; font-weight: normal; color: #2a78d6; text-decoration: none; margin-left: 0.6em;">Reboot history &rarr;</a></h1>
@@ -74,12 +83,13 @@
   <label for="password">Password (leave blank to keep the current password)</label>
   <input type="password" id="password" maxlength="63" autocomplete="new-password">
 
-  <label for="channel">Channel</label>
+  <label for="channel" id="channel-label">Channel<span id="channel-lock"></span></label>
   <select id="channel">
     <option value="1">1</option>
     <option value="6">6</option>
     <option value="11">11</option>
   </select>
+
 
   <button type="submit">Save &amp; apply</button>
   <div id="wifi-msg"></div>
@@ -754,6 +764,7 @@ let pollTimer = null;
 // stop the loop never arrives in time, so the loop keeps stacking requests and
 // never recovers. One poll at a time keeps the 401 inside its timeout.
 let polling = false;
+let wanTick = 0;
 async function poll() {
   if (otaUploading || polling) return;
   polling = true;
@@ -761,6 +772,13 @@ async function poll() {
     await refreshClients();
     await refreshSystem();
     await refreshHistory();
+    // Every fifth cycle, not every one. The bridge serves HTTP from a single
+    // worker task and this page already polls three endpoints a second; this
+    // only drives the channel note, which changes on the scale of a WiFi
+    // association, so a fourth request every second would buy nothing.
+    if (wanTick++ % 5 === 0) {
+      await refreshWanChannelNote();
+    }
     failCount = 0;
     const banner = document.getElementById('banner');
     banner.classList.remove('show', 'restarting');
@@ -829,6 +847,41 @@ document.getElementById('wifi-form').addEventListener('submit', async (e) => {
     msg.className = 'error';
   }
 });
+
+// The uplink itself lives on /wan. All this page keeps is the state of the
+// channel selector, because that is where somebody is standing when the fact
+// matters: one radio, so a connected uplink overrides the channel chosen here.
+//
+// The select is disabled while that is true, so the control agrees with the
+// label instead of accepting a choice the radio would ignore. Two consequences
+// worth knowing:
+//
+//   - Changing the channel now means turning the uplink off first. That is the
+//     price of the control telling the truth.
+//   - The WiFi form still submits the right value. Its handler reads .value
+//     directly rather than relying on native form serialisation, and a disabled
+//     select still has one, so saving the form while locked round-trips the
+//     stored channel rather than clearing it.
+//
+// Only locked once the uplink is actually associated: d.channel is the radio's
+// real channel and stays 0 until then, so an enabled-but-not-connected uplink
+// leaves the selector alone, which is correct - nothing is overriding it yet.
+async function refreshWanChannelNote() {
+  const res = await fetchWithTimeout('/api/wan', {}, 1500);
+  const d = await res.json();
+  const label = document.getElementById('channel-label');
+  const lock = document.getElementById('channel-lock');
+  const sel = document.getElementById('channel');
+  if (d.enabled && d.channel) {
+    lock.textContent = ' (locked to upstream)';
+    label.title = 'The internet uplink is on, so this bridge’s WiFi has to use the same channel as the upstream network — currently channel ' + d.channel + '. Turn the uplink off to change this setting; it is used whenever the uplink is off.';
+    sel.disabled = true;
+  } else {
+    lock.textContent = '';
+    label.removeAttribute('title');
+    sel.disabled = false;
+  }
+}
 
 document.getElementById('admin-login-btn').addEventListener('click', () => {
   location.href = '/admin';

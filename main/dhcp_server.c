@@ -37,6 +37,7 @@
 #include "nvs.h"
 #include "dhcp_server.h"
 #include "client_track.h"   // client_track_mac_on_wired_port()
+#include "wan.h"            // wan_get_dns()
 
 static const char *TAG = "dhcp_server";
 
@@ -975,8 +976,24 @@ static uint8_t *put_offer_options(uint8_t *p, bool include_lease_time)
     }
 
     p = put_opt_ip(p, OPT_SERVER_ID, s_server_ip);
+    // OPT_ROUTER is unconditionally this bridge. When there is no uplink it is a
+    // gateway to nowhere, which is what it has always been; when there is one it
+    // is the real router, because NAPT runs here.
     p = put_opt_ip(p, OPT_ROUTER, s_server_ip);
-    p = put_opt_ip(p, OPT_DNS_SERVER, s_server_ip);
+
+    // The upstream resolver the uplink learnt, so a client can resolve a caster's
+    // name through the NAT - and this bridge's own address when there is no
+    // uplink, exactly as before. wan_get_dns() reads a published snapshot: it
+    // takes no lock and cannot block this task.
+    //
+    // Known limitation, and there is no DHCP mechanism that fixes it: a client
+    // that leased while the uplink was down keeps 192.168.5.1 as its resolver
+    // until it renews, up to LEASE_TIME_S/2 later. Nothing can push a new option
+    // to a client mid-lease. The alternative - running a resolver of our own on
+    // 192.168.5.1 and never changing this option - would cost a nineteenth lwIP
+    // socket, and README.md's socket budget shows all eighteen are spoken for.
+    uint32_t wan_dns = wan_get_dns();
+    p = put_opt_ip(p, OPT_DNS_SERVER, wan_dns != 0 ? wan_dns : s_server_ip);
     p = put_opt_ip(p, OPT_BROADCAST, (s_server_ip & s_netmask) | ~s_netmask);
 
     *p++ = OPT_INTERFACE_MTU;

@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgOpen router &ndash; Internet uplink</title>
+<style>
+  body { font-family: sans-serif; max-width: 700px; margin: 2em auto; padding: 0 1em; color: #222; }
+  h1 { font-size: 1.3em; }
+  h1 a { font-size: 0.7em; font-weight: normal; color: #2a78d6; text-decoration: none; margin-left: 0.6em; }
+  h1 a:hover { text-decoration: underline; }
+  #banner { display: none; background: #b00020; color: #fff; padding: 0.6em 1em; border-radius: 4px; margin-bottom: 1em; }
+  #banner.show { display: block; }
+  #banner.restarting { background: #8a6d1f; }
+  .panel { border: 2px solid #888; border-radius: 4px; padding: 0.8em; margin-top: 1em; }
+  .panel h2 { margin-top: 0; font-size: 1.05em; }
+  label { display: block; margin-top: 0.8em; font-size: 0.9em; }
+  input { width: 100%; box-sizing: border-box; padding: 0.4em; margin-top: 0.2em; font-size: 1em; }
+  input[type=checkbox] { width: auto; margin-right: 0.4em; }
+  button { margin-top: 1em; padding: 0.5em 1.2em; font-size: 1em; }
+  #wan-msg { margin-top: 0.6em; font-size: 0.9em; }
+  #wan-msg.error { color: #b00020; }
+  .hint { margin: -0.3em 0 0.4em 0; font-size: 0.88em; color: #5c5a55; }
+  .warn { margin: 0.2em 0 0.6em 0; font-size: 0.88em; color: #8a6d1f; }
+  /* The state line is the whole reason this page refreshes on its own, so it
+     gets room rather than being tucked under the button. */
+  #wan-state { margin-top: 1em; padding-top: 0.8em; border-top: 1px solid #ddd; font-size: 0.9em; color: #5c5a55; }
+  #wan-state.bad { color: #b00020; }
+  dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: 0.25em 1em; margin: 0.6em 0 0 0; font-size: 0.88em; }
+  dl.facts dt { color: #898781; }
+  dl.facts dd { margin: 0; font-family: monospace; }
+</style>
+</head>
+<body>
+
+<div id="banner"></div>
+
+<h1>Internet uplink <a href="/">&larr; Dashboard</a></h1>
+
+<div class="panel">
+<h2>Upstream network</h2>
+<form id="wan-form">
+  <label><input type="checkbox" id="wan-enabled"> Route clients to the internet through another WiFi network</label>
+
+  <label for="wan-ssid">Upstream network name (SSID)</label>
+  <input type="text" id="wan-ssid" maxlength="32">
+
+  <label for="wan-password">Upstream password (leave blank to keep the current one)</label>
+  <input type="password" id="wan-password" maxlength="63" autocomplete="new-password">
+
+  <label for="wan-ports">Allowed ports</label>
+  <p class="hint">Only these ports can be reached on the internet. Everything else &mdash; including anything trying to reach this bridge <em>from</em> the internet &mdash; is blocked. An entry is a port number, optionally suffixed <code>/tcp</code> or <code>/udp</code>; a bare number means TCP. The defaults cover NTRIP (2101, 2102) and RustDesk (21115&ndash;21117, including <code>21116/udp</code>, which RustDesk does not work without).</p>
+  <input type="text" id="wan-ports" placeholder="2101,2102,21115,21116,21116/udp,21117">
+
+  <p class="warn">This device has one radio. While the uplink is connected, the bridge&rsquo;s own WiFi is forced onto the upstream network&rsquo;s channel, and the channel set on the dashboard is ignored.</p>
+  <p class="warn">Saving a change to the network, password or the checkbox restarts the bridge. Every WiFi client will disconnect and rejoin. Changing only the port list takes effect immediately.</p>
+
+  <button type="submit">Save</button>
+  <div id="wan-msg"></div>
+</form>
+
+<div id="wan-state">Loading&hellip;</div>
+<dl class="facts" id="wan-facts"></dl>
+</div>
+
+<script>
+const AUTH_ERROR = new Error('auth');
+const SETUP_ERROR = new Error('setup');
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    if (res.status === 401) throw AUTH_ERROR;
+    if (res.status === 403) throw SETUP_ERROR;
+    return res;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Same two guards the syslog panel on /logs uses: wanLoaded stops a submit
+// before the first load (which would save the empty form over a real
+// configuration), and wanFieldsFocused() stops the background refresh
+// overwriting a field somebody is typing into.
+let wanLoaded = false;
+
+function wanFieldsFocused() {
+  const a = document.activeElement;
+  if (!a) return false;
+  return ['wan-enabled', 'wan-ssid', 'wan-password', 'wan-ports'].includes(a.id);
+}
+
+function wanStateText(d) {
+  const rssi = (d.rssi ? ', signal ' + d.rssi + ' dBm' : '');
+  switch (d.state) {
+    case 'disabled':   return 'Off. Clients can reach each other, but nothing beyond this bridge.';
+    case 'connecting': return 'Connecting to ' + (d.ssid || 'the upstream network') + '…';
+    case 'up':         return 'Connected to ' + d.ssid + ' — ' + d.ip + ' via ' + d.gw + rssi + '.';
+    case 'down':       return 'Uplink lost.' + (d.retry_in_s ? ' Retrying in ' + d.retry_in_s + ' s.' : '');
+    case 'no_ap':      return 'Cannot find ' + (d.ssid || 'the upstream network') + '.' + (d.retry_in_s ? ' Retrying in ' + d.retry_in_s + ' s.' : '');
+    case 'auth_failed':return 'Could not log in to ' + d.ssid + ' — check the password.';
+    case 'subnet_conflict':
+      return 'The upstream network hands out addresses on 192.168.5.x, the same range this bridge uses. Change the upstream router’s range, or the uplink cannot work.';
+    default:           return d.state;
+  }
+}
+
+function renderFacts(d) {
+  const rows = [];
+  if (d.ip) {
+    rows.push(['Address', d.ip + ' / ' + d.netmask]);
+    rows.push(['Gateway', d.gw]);
+    rows.push(['DNS', d.dns || '–']);
+  }
+  if (d.channel) {
+    let ch = String(d.channel);
+    if (d.ap_channel_configured && d.channel !== d.ap_channel_configured) {
+      ch += ' (dashboard asks for ' + d.ap_channel_configured + ')';
+    }
+    rows.push(['Radio channel', ch]);
+  }
+  rows.push(['LAN', d.lan]);
+  rows.push(['NAT', d.napt ? 'enabled' : 'not enabled']);
+  // The blocked counters are what an operator needs when their software
+  // mysteriously cannot connect, so they are shown even at zero.
+  rows.push(['Out', d.tx_allowed + ' allowed, ' + d.tx_blocked + ' blocked by the port list']);
+  rows.push(['In', d.rx_allowed + ' allowed, ' + d.rx_blocked + ' blocked']);
+  rows.push(['Connects', d.connects + ' up, ' + d.disconnects + ' down (last reason ' + d.last_reason + ')']);
+
+  document.getElementById('wan-facts').innerHTML =
+    rows.map(r => '<dt>' + esc(r[0]) + '</dt><dd>' + esc(r[1]) + '</dd>').join('');
+}
+
+async function refreshWan() {
+  const res = await fetchWithTimeout('/api/wan', {}, 1500);
+  const d = await res.json();
+
+  if (!wanFieldsFocused()) {
+    document.getElementById('wan-enabled').checked = !!d.enabled;
+    document.getElementById('wan-ssid').value = d.ssid;
+    document.getElementById('wan-ports').value = d.ports;
+  }
+  wanLoaded = true;
+
+  const state = document.getElementById('wan-state');
+  state.textContent = wanStateText(d);
+  state.className = (d.state === 'subnet_conflict' || d.state === 'auth_failed') ? 'bad' : '';
+  renderFacts(d);
+}
+
+document.getElementById('wan-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = document.getElementById('wan-msg');
+  msg.textContent = '';
+  msg.className = '';
+  if (!wanLoaded) {
+    msg.textContent = 'Still loading the current settings — try again in a moment';
+    msg.className = 'error';
+    return;
+  }
+  const payload = {
+    enabled: document.getElementById('wan-enabled').checked ? 1 : 0,
+    ssid: document.getElementById('wan-ssid').value,
+    password: document.getElementById('wan-password').value,
+    ports: document.getElementById('wan-ports').value
+  };
+  try {
+    const res = await fetch('/api/wan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      msg.textContent = await res.text();
+      msg.className = 'error';
+      return;
+    }
+    const data = await res.json();
+    document.getElementById('wan-password').value = '';
+    if (data.reboot) {
+      const banner = document.getElementById('banner');
+      banner.textContent = 'Saved — the bridge is restarting to apply the uplink…';
+      banner.classList.add('show', 'restarting');
+      setTimeout(() => location.reload(), 4000);
+    } else {
+      msg.textContent = 'Saved — in effect now.';
+      msg.className = '';
+    }
+  } catch (e) {
+    msg.textContent = 'Could not reach the bridge';
+    msg.className = 'error';
+  }
+});
+
+// One poll at a time, for the reason the dashboard records: the bridge serves
+// HTTP from a single worker task and delays a second before answering a failed
+// auth, so overlapping polls queue and time out in a way that reads as
+// "unreachable" rather than "credentials rejected".
+let polling = false;
+async function poll() {
+  if (polling) return;
+  polling = true;
+  try {
+    await refreshWan();
+    const banner = document.getElementById('banner');
+    banner.classList.remove('show');
+  } catch (e) {
+    const banner = document.getElementById('banner');
+    if (e === AUTH_ERROR || e === SETUP_ERROR) {
+      location.reload();
+      return;
+    }
+    banner.textContent = 'Cannot reach the bridge';
+    banner.classList.add('show');
+  } finally {
+    polling = false;
+  }
+}
+
+poll();
+// Two seconds rather than one: an association takes seconds to change, and this
+// page has no table to keep live.
+setInterval(poll, 2000);
+</script>
+
+</body>
+</html>

@@ -14,6 +14,8 @@
 #include "log_buf.h"
 #include "syslog.h"
 #include "syslog_cfg.h"
+#include "wan.h"
+#include "wan_cfg.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -35,6 +37,8 @@ extern const uint8_t leases_html_start[] asm("_binary_leases_html_start");
 extern const uint8_t leases_html_end[] asm("_binary_leases_html_end");
 extern const uint8_t resets_html_start[] asm("_binary_resets_html_start");
 extern const uint8_t resets_html_end[] asm("_binary_resets_html_end");
+extern const uint8_t wan_html_start[] asm("_binary_wan_html_start");
+extern const uint8_t wan_html_end[] asm("_binary_wan_html_end");
 
 // Pulls a JSON string field's value out of a flat {"key":"value",...}
 // object. Good enough for the small, fixed-shape request bodies this
@@ -1571,6 +1575,24 @@ static esp_err_t logs_page_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t wan_page_get_handler(httpd_req_t *req)
+{
+    if (!check_admin_auth(req)) {
+        send_auth_error(req);
+        return ESP_OK;
+    }
+    if (auth_cfg_password_is_default()) {
+        send_default_creds_redirect(req);
+        return ESP_OK;
+    }
+
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, (const char *)wan_html_start,
+                     wan_html_end - wan_html_start - 1);
+    return ESP_OK;
+}
+
 // Longest possible trailer appended after the packing loop in
 // logs_get_handler(), with every %u at 10 digits and all three level names at
 // their longest ("verbose"): 153 bytes for the log fields, plus 133 for the six
@@ -2004,6 +2026,167 @@ static esp_err_t syslog_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t wan_get_handler(httpd_req_t *req)
+{
+    if (!check_admin_auth(req)) {
+        send_auth_error(req);
+        return ESP_OK;
+    }
+    if (auth_cfg_password_is_default()) {
+        send_setup_required(req);
+        return ESP_OK;
+    }
+
+    wan_cfg_t cfg;
+    wan_cfg_get(&cfg);
+
+    wan_status_t st;
+    wan_get_status(&st);
+
+    char ports[WAN_CFG_PORTS_STR_MAX];
+    wan_cfg_format_ports(&cfg, ports, sizeof(ports));
+
+    char ip[16], mask[16], gw[16], dns[16];
+    esp_ip4addr_ntoa(&st.ip, ip, sizeof(ip));
+    esp_ip4addr_ntoa(&st.netmask, mask, sizeof(mask));
+    esp_ip4addr_ntoa(&st.gw, gw, sizeof(gw));
+    esp_ip4addr_ntoa(&st.dns, dns, sizeof(dns));
+
+    // 768 against a measured worst case of ~625: the SSID is user-supplied and
+    // goes through json_append_escaped(), which can expand any byte to \uXXXX,
+    // so 32 characters can reach 192; the port list is at most
+    // WAN_CFG_PORTS_STR_MAX (121) now that rules carry a "/udp" suffix and there
+    // can be twelve of them; the rest is ~250 of fixed JSON with every %u at ten
+    // digits, plus four dotted quads.
+    //
+    // The password is never sent, matching wifi_get_handler().
+    char resp[768];
+    int off = resp_append(resp, sizeof(resp), 0, "{\"enabled\":%s,\"ssid\":\"",
+                          cfg.enabled ? "true" : "false");
+    off = json_append_escaped(resp, sizeof(resp), off, cfg.ssid);
+    off = resp_append(resp, sizeof(resp), off,
+                      "\",\"ports\":\"%s\",\"state\":\"%s\",\"lan\":\"192.168.5.0/24\","
+                      "\"ip\":\"%s\",\"netmask\":\"%s\",\"gw\":\"%s\",\"dns\":\"%s\","
+                      "\"channel\":%u,\"ap_channel_configured\":%u,\"rssi\":%d,"
+                      "\"napt\":%s,\"connects\":%u,\"disconnects\":%u,\"last_reason\":%u,"
+                      "\"retry_in_s\":%u,\"tx_allowed\":%u,\"tx_blocked\":%u,"
+                      "\"rx_allowed\":%u,\"rx_blocked\":%u}",
+                      ports, wan_state_name(st.state),
+                      st.ip.addr == 0 ? "" : ip,
+                      st.ip.addr == 0 ? "" : mask,
+                      st.ip.addr == 0 ? "" : gw,
+                      st.dns.addr == 0 ? "" : dns,
+                      (unsigned)st.ap_channel, (unsigned)st.ap_channel_configured,
+                      (int)st.rssi, st.napt_on ? "true" : "false",
+                      (unsigned)st.connects, (unsigned)st.disconnects,
+                      (unsigned)st.last_reason, (unsigned)st.retry_in_s,
+                      (unsigned)st.tx_allowed, (unsigned)st.tx_blocked,
+                      (unsigned)st.rx_allowed, (unsigned)st.rx_blocked);
+
+    if (!resp_send_json(req, resp, off, sizeof(resp))) {
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t wan_post_handler(httpd_req_t *req)
+{
+    if (!check_admin_auth(req)) {
+        send_auth_error(req);
+        return ESP_OK;
+    }
+    if (auth_cfg_password_is_default()) {
+        send_setup_required(req);
+        return ESP_OK;
+    }
+    if (!csrf_check(req, "application/json")) {
+        return ESP_OK;
+    }
+
+    // 512 rather than the 256 the syslog handler uses: a full request here is a
+    // 32-byte SSID, a 63-byte password and a port list that can reach 121
+    // characters, which does not fit in 256 once the JSON around it is counted.
+    // recv_body() reports a body that overruns rather than truncating it, so
+    // undersizing this would show up as a save that fails, not one that half
+    // applies - but a port list nobody can save is still a bug.
+    char buf[512];
+    if (recv_body(req, buf, sizeof(buf)) < 0) {
+        return ESP_FAIL;
+    }
+
+    // Starts from what is saved, so any field the caller leaves out keeps its
+    // current value - the same contract syslog_post_handler() follows.
+    wan_cfg_t cfg;
+    wan_cfg_get(&cfg);
+    const wan_cfg_t before = cfg;
+
+    long val = 0;
+    // 1/0 rather than true/false, for the reason syslog_post_handler() records.
+    if (json_get_int(buf, "enabled", &val)) {
+        cfg.enabled = (val != 0);
+    }
+
+    char ssid[WAN_CFG_SSID_MAX_LEN] = {0};
+    if (json_get_string(buf, "ssid", ssid, sizeof(ssid))) {
+        strlcpy(cfg.ssid, ssid, sizeof(cfg.ssid));
+    }
+
+    // An absent or blank password keeps the stored one, so the form can be
+    // re-submitted without the upstream network's password being round-tripped
+    // through the browser - the same trick wifi_post_handler() uses.
+    char password[WAN_CFG_PASSWORD_MAX_LEN] = {0};
+    if (json_get_string(buf, "password", password, sizeof(password)) && password[0] != '\0') {
+        strlcpy(cfg.password, password, sizeof(cfg.password));
+    }
+
+    char ports[WAN_CFG_PORTS_STR_MAX] = {0};
+    if (json_get_string(buf, "ports", ports, sizeof(ports))) {
+        const char *err_msg = NULL;
+        if (!wan_cfg_parse_ports(ports, cfg.ports, &cfg.nports, &err_msg)) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, err_msg);
+            return ESP_FAIL;
+        }
+    }
+
+    const char *err_msg = NULL;
+    if (!wan_cfg_validate(&cfg, &err_msg)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, err_msg);
+        return ESP_FAIL;
+    }
+
+    // Which half of the configuration moved decides whether this costs a reboot.
+    // The allowlist is read from a published snapshot on every packet, so it can
+    // be swapped live; the radio's mode and credentials cannot.
+    bool radio_changed = (cfg.enabled != before.enabled) ||
+                         strcmp(cfg.ssid, before.ssid) != 0 ||
+                         strcmp(cfg.password, before.password) != 0;
+
+    if (wan_cfg_save(&cfg) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save uplink config");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, radio_changed ? "{\"ok\":true,\"reboot\":true}"
+                                       : "{\"ok\":true,\"reboot\":false}",
+                    HTTPD_RESP_USE_STRLEN);
+
+    if (!radio_changed) {
+        wan_ports_changed();
+        return ESP_OK;
+    }
+
+    // Reboot rather than reconfiguring in place, for the reason
+    // wifi_post_handler() records: the AP netif is a bridge port wired into
+    // esp_netif_br_glue, and going AP <-> APSTA hot-applies a mode change to it.
+    // It costs nothing that was not already lost either way - promoting the
+    // radio to APSTA forces it onto the upstream's channel, which drops every
+    // associated station regardless.
+    reset_log_note_intent(RESET_INTENT_WAN_SAVE);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+}
+
 // Chunk buffer for the download below. 1024 holds at least five lines at the
 // ~193-byte worst case (6 + 2 + 8 + 2 + 1 + 2 + 24 + 2 + 143 + newline), and is
 // static for the same reason logs_get_handler()'s response buffer is: the 8KB
@@ -2229,7 +2412,10 @@ httpd_handle_t web_server_start(void)
     // 24 rather than 20: the three syslog/download routes took the count to 19,
     // which is not the headroom this comment asks for - one more route and the
     // failure is silent. Each slot is a pointer.
-    config.max_uri_handlers = 24;
+    //
+    // 28 rather than 24: the two /api/wan routes take the count to 22, which is
+    // again not the headroom this comment asks for.
+    config.max_uri_handlers = 28;
 
     // Without this the server stops listening the moment every session slot is
     // taken: httpd_server() only adds listen_fd to the select set when a slot is
@@ -2288,6 +2474,9 @@ httpd_handle_t web_server_start(void)
     const httpd_uri_t logs_dl_uri = {.uri = "/api/logs/download", .method = HTTP_GET, .handler = logs_download_get_handler};
     const httpd_uri_t syslog_get_uri = {.uri = "/api/syslog", .method = HTTP_GET, .handler = syslog_get_handler};
     const httpd_uri_t syslog_post_uri = {.uri = "/api/syslog", .method = HTTP_POST, .handler = syslog_post_handler};
+    const httpd_uri_t wan_page_uri = {.uri = "/wan", .method = HTTP_GET, .handler = wan_page_get_handler};
+    const httpd_uri_t wan_get_uri = {.uri = "/api/wan", .method = HTTP_GET, .handler = wan_get_handler};
+    const httpd_uri_t wan_post_uri = {.uri = "/api/wan", .method = HTTP_POST, .handler = wan_post_handler};
 
     httpd_register_uri_handler(server, &index_uri);
     httpd_register_uri_handler(server, &admin_page_uri);
@@ -2311,6 +2500,9 @@ httpd_handle_t web_server_start(void)
     httpd_register_uri_handler(server, &logs_dl_uri);
     httpd_register_uri_handler(server, &syslog_get_uri);
     httpd_register_uri_handler(server, &syslog_post_uri);
+    httpd_register_uri_handler(server, &wan_page_uri);
+    httpd_register_uri_handler(server, &wan_get_uri);
+    httpd_register_uri_handler(server, &wan_post_uri);
 
     ESP_LOGI(TAG, "Web server started");
     return server;

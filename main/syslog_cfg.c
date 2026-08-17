@@ -194,6 +194,18 @@ bool syslog_cfg_validate(const syslog_cfg_t *cfg, uint32_t subnet_ip,
     // non-static err_msg and break the pattern every other *_validate() in this
     // repo follows; if the addressing ever changes, this string is the second
     // place to look.
+    //
+    // The internet uplink (wan.c) does NOT change this, and the check must not
+    // be relaxed because of it. The sender's socket is pinned to the bridge with
+    // SO_BINDTODEVICE, which overrides the routing table, so an off-subnet
+    // collector still fails with ENETUNREACH no matter what the default route
+    // is - relaxing the validator without also unbinding the socket would
+    // produce exactly the silent nowhere-sender this check exists to prevent.
+    // Unbinding it would undo syslog.c's deliberate choice to pin from
+    // IP_EVENT_NETIF_UP so its source address is stable. A collector across the
+    // uplink would additionally need a UDP rule in the allowlist - which the
+    // list can now express, since RustDesk needed one, so the remaining reasons
+    // are the two above rather than "it cannot be written down".
     if ((cfg->server_ip & subnet_mask) != (subnet_ip & subnet_mask)) {
         *err_msg = "The collector must be on this bridge's own 192.168.5.0/24 network - "
                    "the bridge has no gateway and cannot reach anything off it";

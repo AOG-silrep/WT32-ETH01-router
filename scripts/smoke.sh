@@ -43,14 +43,14 @@ code() { curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$@"; }
 echo "smoke: ${HOST} as ${USER}"
 
 # --- pages ------------------------------------------------------------------
-for path in / /admin /logs /leases /resets; do
+for path in / /admin /wan /logs /leases /resets; do
   check "GET ${path}" 200 "$(code "${AUTH[@]}" "http://${HOST}${path}")"
 done
 
 # --- JSON endpoints ---------------------------------------------------------
 # Piped through jq -e, so malformed JSON fails here rather than silently in a
 # browser. This is the check that would catch a response-buffer overflow.
-for path in /api/status /api/clients /api/system /api/leases /api/resets "/api/logs?since=0" /api/syslog; do
+for path in /api/status /api/clients /api/system /api/leases /api/resets "/api/logs?since=0" /api/syslog /api/wan; do
   if curl -s --max-time 10 "${AUTH[@]}" "http://${HOST}${path}" | jq -e . >/dev/null 2>&1; then
     check "GET ${path} parses" ok ok
   else
@@ -132,6 +132,33 @@ if curl -s --max-time 10 "${AUTH[@]}" "http://${HOST}/api/syslog" \
   check "GET /api/syslog shape" ok ok
 else
   check "GET /api/syslog shape" ok bad
+fi
+
+# The uplink's filter counters are the only evidence that traffic is being
+# dropped on purpose rather than lost, so a missing field there reads as "the
+# port list is not doing anything". Types only: a device with no uplink
+# configured is the normal case, not a failure.
+if curl -s --max-time 10 "${AUTH[@]}" "http://${HOST}/api/wan" \
+     | jq -e '(.enabled|type=="boolean") and (.ssid|type=="string")
+              and (.ports|type=="string") and (.state|type=="string")
+              and (.lan|type=="string") and (.napt|type=="boolean")
+              and (.channel|type=="number") and (.retry_in_s|type=="number")
+              and (.tx_allowed|type=="number") and (.tx_blocked|type=="number")
+              and (.rx_allowed|type=="number") and (.rx_blocked|type=="number")' \
+     >/dev/null 2>&1; then
+  check "GET /api/wan shape" ok ok
+else
+  check "GET /api/wan shape" ok bad
+fi
+
+# The password must never leave the device, in either direction. This is the
+# check that catches somebody adding it to the GET for the convenience of the
+# form - see wan_get_handler().
+if curl -s --max-time 10 "${AUTH[@]}" "http://${HOST}/api/wan" \
+     | jq -e 'has("password")|not' >/dev/null 2>&1; then
+  check "GET /api/wan withholds password" ok ok
+else
+  check "GET /api/wan withholds password" ok bad
 fi
 
 # The same counters ride on /api/logs, which is where the log page reads them

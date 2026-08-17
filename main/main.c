@@ -33,6 +33,8 @@
 #include "log_buf.h"
 #include "syslog.h"
 #include "syslog_cfg.h"
+#include "wan.h"
+#include "wan_cfg.h"
 
 static const char *TAG = "AOG-BRIDGE";
 
@@ -336,6 +338,25 @@ void app_main(void)
     // off. An error here means a mutex or a task could not be created, which is
     // the class of failure that check exists for.
     ESP_ERROR_CHECK(syslog_init(br_netif));
+
+    // Internet uplink settings cache. Same placement reasoning as
+    // syslog_cfg_init() above: the web server and the console both read and
+    // write it, and wan_init() below reads it as its first act.
+    ESP_ERROR_CHECK(wan_cfg_init());
+
+    // The WiFi-STA internet uplink, when one is configured. Has to precede
+    // esp_wifi_start() below for the same reason dhcp_server_start() and
+    // eth_link_init() do: it registers the WIFI_EVENT_STA_START handler that
+    // installs the uplink's packet filter, and a handler registered after that
+    // event has fired would never see it - leaving the uplink carrying traffic
+    // with nothing filtering it, which is the one state this feature must not
+    // have. It also needs esp_wifi_init() (done in wifi_init_softap() above) and
+    // the bridge netif, which is NAPT's inside interface.
+    //
+    // With no uplink configured this returns having created nothing: no STA
+    // netif, no NAPT, no hooks, and the radio still in WIFI_MODE_AP. The device
+    // then behaves exactly as it did before this feature existed.
+    ESP_ERROR_CHECK(wan_init(br_netif));
 
     // Since MAC forwarding is done in the lwIP bridge, the Ethernet MAC needs
     // to pass through frames not addressed to it.

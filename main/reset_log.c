@@ -217,6 +217,7 @@ const char *reset_log_intent_name(uint8_t intent)
     switch ((reset_intent_t)intent) {
     case RESET_INTENT_OTA:           return "ota";
     case RESET_INTENT_WIFI_SAVE:     return "wifi-save";
+    case RESET_INTENT_WAN_SAVE:      return "wan-save";
     case RESET_INTENT_CONSOLE:       return "console";
     case RESET_INTENT_FACTORY_RESET: return "factory-reset";
     case RESET_INTENT_UNKNOWN:       return "unknown";
