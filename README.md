@@ -277,10 +277,9 @@ deauthentication frames; WPA2 encryption of data is unaffected.
 
 ## Web UI
 
-Browse to the device (`192.168.5.1` by default) for WiFi settings, firmware update, and live
-system stats:
+Browse to the device (`192.168.5.1` by default) for WiFi settings and live system stats:
 
-![The web UI: WiFi settings, firmware update, and system stats](docs/web-ui.png)
+![The web UI: WiFi settings and system stats](docs/web-ui.png)
 
 Further down the same page, every connected client (WiFi and Ethernet) is listed with its
 live throughput. "Graph" plots that client's traffic over the last 30 seconds, switchable
@@ -463,6 +462,19 @@ so the three never disagree about one boot. Lines follow in fixed columns:
 The filename carries the boot number and uptime (`wt32-bridge-log-boot12-12041s.txt`) rather
 than a date, for the same reason the timestamps are what they are.
 
+### Admin page
+
+"Admin →" in the header opens `/admin`, which holds firmware update and the admin login. Both
+are the same kind of thing as the uplink settings — done deliberately, rarely, and never while
+watching the client table — so they live off the dashboard for the reason given under
+[Internet uplink page](#internet-uplink-page). Firmware update had a second reason to move: the
+device serves HTTP from a single worker task, so an upload streaming into flash blocks the
+dashboard's one-second poll, and the dashboard had to carry a flag suppressing its own "lost
+connection" banner for the duration. On a page that does not poll, the problem does not exist.
+
+While the admin password is still the default the firmware panel is hidden, because `/api/ota`
+answers `403` in that state along with every other API route — see below.
+
 ## Web UI login
 
 The web UI (`/`) and settings page (`/admin`) are behind HTTP Basic Auth. Until changed, the
@@ -477,7 +489,7 @@ but the pages needed to change it. `/` redirects to `/admin`, and every `/api/*`
 until setup is finished. Setting a new password is what unlocks it; the username is not a
 secret and changing it alone doesn't count.
 
-Change it from `/admin` (linked via the "Update username & password" button on the main page)
+Change it from `/admin` (the "Admin →" link in the dashboard header)
 or with the serial console's `admin` command (see below). The console applies the same rule, so
 `admin -u <name>` on a fresh device fails until you pass `-p <password>` too.
 
@@ -772,7 +784,7 @@ reboots with the default WiFi AP and `admin`/`admin` web login restored.
 - `main/reset_log.c` / `.h` — why the device restarted, kept in flash across reboots
 - `main/rail_witness.c` / `.h` — PHY-register marker distinguishing a reset from a power cycle
 - `main/webpage/index.html` — the web UI itself
-- `main/webpage/admin.html` — the `/admin` settings page
+- `main/webpage/admin.html` — the `/admin` settings page: firmware update and the admin login
 - `main/webpage/logs.html` — the `/logs` device log page, with the syslog settings panel
 - `main/webpage/leases.html` — the `/leases` DHCP table page
 - `main/webpage/resets.html` — the `/resets` reboot history page

@@ -51,11 +51,6 @@
   #chart-legend .legend-item i { display: inline-block; width: 0.7em; height: 0.7em; border-radius: 2px; margin-right: 0.3em; }
   #traffic-canvas { width: 100%; height: 160px; display: block; margin-top: 0.4em; cursor: crosshair; }
   #chart-tooltip { font-size: 0.85em; color: var(--chart-muted); height: 1.2em; margin-top: 0.2em; }
-  #ota-progress { width: 100%; margin-top: 0.8em; height: 1.2em; display: none; }
-  #ota-progress.show { display: block; }
-  #ota-msg { margin-top: 0.6em; font-size: 0.9em; }
-  #ota-msg.error { color: #b00020; }
-  #ota-msg.ok { color: #0a7a2f; }
   td.warn { color: #b00020; font-weight: 600; }
   /* Short enough to never need the panel's full width, so pinning it to one
      line cannot push the table wider than the panel on a phone. */
@@ -70,7 +65,8 @@
 <a href="/wan" style="font-size: 0.55em; font-weight: normal; color: #2a78d6; text-decoration: none; margin-left: 0.6em;">Internet uplink &rarr;</a>
 <a href="/leases" style="font-size: 0.55em; font-weight: normal; color: #2a78d6; text-decoration: none; margin-left: 0.6em;">DHCP leases &rarr;</a>
 <a href="/logs" style="font-size: 0.55em; font-weight: normal; color: #2a78d6; text-decoration: none; margin-left: 0.6em;">Device log &rarr;</a>
-<a href="/resets" style="font-size: 0.55em; font-weight: normal; color: #2a78d6; text-decoration: none; margin-left: 0.6em;">Reboot history &rarr;</a></h1>
+<a href="/resets" style="font-size: 0.55em; font-weight: normal; color: #2a78d6; text-decoration: none; margin-left: 0.6em;">Reboot history &rarr;</a>
+<a href="/admin" style="font-size: 0.55em; font-weight: normal; color: #2a78d6; text-decoration: none; margin-left: 0.6em;">Admin &rarr;</a></h1>
 
 <div class="panels">
 
@@ -94,20 +90,6 @@
   <button type="submit">Save &amp; apply</button>
   <div id="wifi-msg"></div>
 </form>
-</div>
-
-<div class="panel">
-<h2>Firmware update</h2>
-<form id="ota-form">
-  <label for="ota-file">Firmware image (.bin)</label>
-  <input type="file" id="ota-file" accept=".bin">
-
-  <button type="submit" id="ota-submit" disabled>Upload &amp; flash</button>
-  <progress id="ota-progress" value="0" max="100"></progress>
-  <div id="ota-msg"></div>
-</form>
-<p style="margin-top: 1.2em; margin-bottom: 0;"><strong>Change admin login</strong></p>
-<button type="button" id="admin-login-btn">Update username &amp; password</button>
 </div>
 
 <div class="panel">
@@ -752,7 +734,6 @@ async function refreshSystem() {
 }
 
 let failCount = 0;
-let otaUploading = false;
 let pollTimer = null;
 // setInterval fires every second regardless of how long the previous poll took,
 // so without this guard slow cycles stack up. That is not a hypothetical: the
@@ -766,7 +747,7 @@ let pollTimer = null;
 let polling = false;
 let wanTick = 0;
 async function poll() {
-  if (otaUploading || polling) return;
+  if (polling) return;
   polling = true;
   try {
     await refreshClients();
@@ -882,88 +863,6 @@ async function refreshWanChannelNote() {
     sel.disabled = false;
   }
 }
-
-document.getElementById('admin-login-btn').addEventListener('click', () => {
-  location.href = '/admin';
-});
-
-document.getElementById('ota-file').addEventListener('change', (e) => {
-  document.getElementById('ota-submit').disabled = !e.target.files.length;
-});
-
-document.getElementById('ota-form').addEventListener('submit', (e) => {
-  e.preventDefault();
-  const fileInput = document.getElementById('ota-file');
-  const file = fileInput.files[0];
-  if (!file) return;
-  if (!confirm('Flash "' + file.name + '" and reboot the device? This cannot be interrupted once started.')) {
-    return;
-  }
-
-  const submitBtn = document.getElementById('ota-submit');
-  const msg = document.getElementById('ota-msg');
-  const bar = document.getElementById('ota-progress');
-  msg.textContent = 'Uploading…';
-  msg.className = '';
-  bar.value = 0;
-  bar.classList.add('show');
-  fileInput.disabled = true;
-  submitBtn.disabled = true;
-  // The device's HTTP server handles one request at a time, so it can't
-  // also answer the 1s status poll while this upload is streaming into
-  // flash - suppress the "lost connection" banner for that expected gap
-  // instead of letting it stomp on the upload progress UI.
-  otaUploading = true;
-  document.getElementById('banner').classList.remove('show', 'restarting');
-
-  const xhr = new XMLHttpRequest();
-  xhr.open('POST', '/api/ota');
-  xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-
-  xhr.upload.addEventListener('progress', (ev) => {
-    if (ev.lengthComputable) {
-      const pct = Math.round((ev.loaded / ev.total) * 100);
-      bar.value = pct;
-      msg.textContent = pct < 100 ? ('Uploading… ' + pct + '%') : 'Verifying and flashing…';
-    }
-  });
-
-  xhr.onload = () => {
-    let data;
-    try {
-      data = JSON.parse(xhr.responseText);
-    } catch (e) {
-      data = null;
-    }
-    if (data && data.ok) {
-      bar.value = 100;
-      msg.textContent = 'Flash successful — rebooting…';
-      msg.className = 'ok';
-      const banner = document.getElementById('banner');
-      banner.textContent = 'Firmware updated — bridge is rebooting…';
-      banner.classList.add('show', 'restarting');
-      setTimeout(() => location.reload(), 5000);
-    } else {
-      otaUploading = false;
-      msg.textContent = (data && data.error) || 'Flash failed';
-      msg.className = 'error';
-      bar.classList.remove('show');
-      fileInput.disabled = false;
-      submitBtn.disabled = false;
-    }
-  };
-
-  xhr.onerror = () => {
-    otaUploading = false;
-    msg.textContent = 'Upload failed — could not reach the bridge';
-    msg.className = 'error';
-    bar.classList.remove('show');
-    fileInput.disabled = false;
-    submitBtn.disabled = false;
-  };
-
-  xhr.send(file);
-});
 
 loadStatus();
 poll();

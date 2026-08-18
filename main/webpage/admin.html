@@ -3,15 +3,22 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AgOpen router &ndash; Admin login</title>
+<title>AgOpen router &ndash; Admin</title>
 <style>
-  body { font-family: sans-serif; max-width: 420px; margin: 2em auto; padding: 0 1em; color: #222; }
+  body { font-family: sans-serif; max-width: 700px; margin: 2em auto; padding: 0 1em; color: #222; }
   h1 { font-size: 1.3em; }
-  a.back { font-size: 0.9em; text-decoration: none; color: #2a78d6; }
+  h1 a { font-size: 0.7em; font-weight: normal; color: #2a78d6; text-decoration: none; margin-left: 0.6em; }
+  h1 a:hover { text-decoration: underline; }
   .panel { border: 2px solid #888; border-radius: 4px; padding: 0.8em; margin-top: 1em; }
+  .panel h2 { margin-top: 0; font-size: 1.05em; }
   label { display: block; margin-top: 0.8em; font-size: 0.9em; }
   input { width: 100%; box-sizing: border-box; padding: 0.4em; margin-top: 0.2em; font-size: 1em; }
   button { margin-top: 1em; padding: 0.5em 1.2em; font-size: 1em; }
+  #ota-progress { width: 100%; margin-top: 0.8em; height: 1.2em; display: none; }
+  #ota-progress.show { display: block; }
+  #ota-msg { margin-top: 0.6em; font-size: 0.9em; }
+  #ota-msg.error { color: #b00020; }
+  #ota-msg.ok { color: #0a7a2f; }
   #admin-msg { margin-top: 0.6em; font-size: 0.9em; }
   #admin-msg.error { color: #b00020; }
   #admin-msg.ok { color: #0a7a2f; }
@@ -21,11 +28,23 @@
 </head>
 <body>
 
-<a class="back" id="back-link" href="/">&larr; Back to router</a>
-<h1>Admin login</h1>
+<h1>Admin <a href="/" id="back-link">&larr; Dashboard</a></h1>
 <div id="forced-banner">You're using the default admin password. Set a new password below to continue. You will be asked to log in again after saving.</div>
 
+<div class="panel" id="ota-panel">
+<h2>Firmware update</h2>
+<form id="ota-form">
+  <label for="ota-file">Firmware image (.bin)</label>
+  <input type="file" id="ota-file" accept=".bin">
+
+  <button type="submit" id="ota-submit" disabled>Upload &amp; flash</button>
+  <progress id="ota-progress" value="0" max="100"></progress>
+  <div id="ota-msg"></div>
+</form>
+</div>
+
 <div class="panel">
+<h2>Admin login</h2>
 <form id="admin-form">
   <label for="new-admin-user">New admin username (leave blank to keep the current one)</label>
   <input type="text" id="new-admin-user" maxlength="31" autocomplete="off">
@@ -47,7 +66,85 @@ if (new URLSearchParams(location.search).get('forced') === '1') {
   // and drop the "leave blank" wording that contradicts that.
   document.getElementById('new-admin-password').required = true;
   document.querySelector('label[for="new-admin-password"]').textContent = 'New admin password';
+  // While the password is still the default, /api/ota answers 403 like every
+  // other API route (send_setup_required() in web_server.c) - this page is only
+  // served at all so the password can be changed. Don't offer a control the
+  // server is going to refuse.
+  document.getElementById('ota-panel').style.display = 'none';
 }
+
+document.getElementById('ota-file').addEventListener('change', (e) => {
+  document.getElementById('ota-submit').disabled = !e.target.files.length;
+});
+
+// XMLHttpRequest rather than fetch() on purpose: upload progress events are the
+// one thing fetch() still cannot report, and a firmware upload over WiFi is long
+// enough that a progress bar is the difference between "working" and "hung".
+document.getElementById('ota-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const fileInput = document.getElementById('ota-file');
+  const file = fileInput.files[0];
+  if (!file) return;
+  if (!confirm('Flash "' + file.name + '" and reboot the device? This cannot be interrupted once started.')) {
+    return;
+  }
+
+  const submitBtn = document.getElementById('ota-submit');
+  const msg = document.getElementById('ota-msg');
+  const bar = document.getElementById('ota-progress');
+  msg.textContent = 'Uploading…';
+  msg.className = '';
+  bar.value = 0;
+  bar.classList.add('show');
+  fileInput.disabled = true;
+  submitBtn.disabled = true;
+
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/ota');
+  // csrf_check() requires this exact type on /api/ota.
+  xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+
+  xhr.upload.addEventListener('progress', (ev) => {
+    if (ev.lengthComputable) {
+      const pct = Math.round((ev.loaded / ev.total) * 100);
+      bar.value = pct;
+      msg.textContent = pct < 100 ? ('Uploading… ' + pct + '%') : 'Verifying and flashing…';
+    }
+  });
+
+  xhr.onload = () => {
+    let data;
+    try {
+      data = JSON.parse(xhr.responseText);
+    } catch (e) {
+      data = null;
+    }
+    if (data && data.ok) {
+      bar.value = 100;
+      msg.textContent = 'Flash successful — rebooting…';
+      msg.className = 'ok';
+      // The dashboard, not back here: its header carries the firmware revision,
+      // which is the one thing worth seeing after an update lands.
+      setTimeout(() => { location.href = '/'; }, 5000);
+    } else {
+      msg.textContent = (data && data.error) || 'Flash failed';
+      msg.className = 'error';
+      bar.classList.remove('show');
+      fileInput.disabled = false;
+      submitBtn.disabled = false;
+    }
+  };
+
+  xhr.onerror = () => {
+    msg.textContent = 'Upload failed — could not reach the bridge';
+    msg.className = 'error';
+    bar.classList.remove('show');
+    fileInput.disabled = false;
+    submitBtn.disabled = false;
+  };
+
+  xhr.send(file);
+});
 
 document.getElementById('admin-form').addEventListener('submit', async (e) => {
   e.preventDefault();
