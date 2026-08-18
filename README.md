@@ -697,11 +697,18 @@ board — a lookalike with different strapping needs these changed:
 
 | Function | GPIO |
 | --- | --- |
-| PHY power enable | 16 |
+| PHY clock enable (50 MHz oscillator) | 16 |
 | RMII MDC | 23 |
 | RMII MDIO | 18 |
 | PHY address | 1 (SMI) |
 | Console / flashing UART | UART0, 115200 8N1 |
+
+GPIO16 is usually called "PHY power" — including by this project's own
+`ETH_PHY_POWER_PIN` — but the schematic ([`docs/WT32_ETH01_V2.schematic.pdf`](docs/WT32_ETH01_V2.schematic.pdf))
+shows it as `IO16_OSC_EN`, gating the 50 MHz oscillator that supplies the RMII reference
+clock. The consequence is the same, which is why the wrong name survives: leave it low and
+the PHY never comes up. It matters when reading the schematic, where there is no power
+switch to find.
 
 Flash layout is 4 MB with a custom `partitions.csv`: the partition table sits at `0x10000`
 (moved down to make room for the signed bootloader), and there are two 1.5 MB OTA app slots.
