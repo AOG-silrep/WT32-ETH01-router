@@ -86,14 +86,45 @@ async function fetchWithTimeout(url, options, timeoutMs) {
 
 // Same two guards the syslog panel on /logs uses: wanLoaded stops a submit
 // before the first load (which would save the empty form over a real
-// configuration), and wanFieldsFocused() stops the background refresh
-// overwriting a field somebody is typing into.
+// configuration), and wanDirty stops the background refresh overwriting an
+// edit that has not been saved yet.
+//
+// Edited rather than focused, which is what this used to test. Focus is held
+// only while the caret is actually in the field, so clicking the hint text
+// below the form - or tabbing past the last field, or dismissing the keyboard
+// on a phone, or switching windows and coming back - handed the field straight
+// back to the next 2s poll, which wrote the stored value over what had just
+// been typed. The checkbox was the worst of it: tick it, click anywhere, and it
+// silently un-ticked itself. An edit is worth keeping whether or not the caret
+// is still sitting in it.
+//
+// A set of field ids rather than one flag for the form, because Save sends
+// every field and not just the changed one. Freezing the whole form on the
+// first keystroke would pin a stale copy of the fields nobody touched, and
+// saving would write that copy back over anything the console had changed
+// meanwhile. Per field, an untouched control keeps tracking the device, so the
+// copy Save would send stays current.
 let wanLoaded = false;
+const wanDirty = new Set();
 
-function wanFieldsFocused() {
-  const a = document.activeElement;
-  if (!a) return false;
-  return ['wan-enabled', 'wan-ssid', 'wan-password', 'wan-ports'].includes(a.id);
+// On the form, so both events arrive by bubbling from whichever control
+// changed. input covers typing; change covers the checkbox, which not every
+// browser fires input for.
+for (const ev of ['input', 'change']) {
+  document.getElementById('wan-form').addEventListener(ev, (e) => {
+    if (e.target.id) wanDirty.add(e.target.id);
+  });
+}
+
+// Writes a field from the device unless it is holding an unsaved edit.
+function wanSet(id, value) {
+  if (wanDirty.has(id)) return;
+  const el = document.getElementById(id);
+  if (el.type === 'checkbox') {
+    el.checked = value;
+  } else {
+    el.value = value;
+  }
 }
 
 function wanStateText(d) {
@@ -141,11 +172,9 @@ async function refreshWan() {
   const res = await fetchWithTimeout('/api/wan', {}, 1500);
   const d = await res.json();
 
-  if (!wanFieldsFocused()) {
-    document.getElementById('wan-enabled').checked = !!d.enabled;
-    document.getElementById('wan-ssid').value = d.ssid;
-    document.getElementById('wan-ports').value = d.ports;
-  }
+  wanSet('wan-enabled', !!d.enabled);
+  wanSet('wan-ssid', d.ssid);
+  wanSet('wan-ports', d.ports);
   wanLoaded = true;
 
   const state = document.getElementById('wan-state');
@@ -183,6 +212,11 @@ document.getElementById('wan-form').addEventListener('submit', async (e) => {
     }
     const data = await res.json();
     document.getElementById('wan-password').value = '';
+    // Clean again, so the poll resumes tracking the device. The ports-only
+    // branch below leaves this page in place, and the device normalises the
+    // list it was given ("2101" comes back "2101/tcp") - without this the form
+    // would sit on the raw text forever and never show what was really stored.
+    wanDirty.clear();
     if (data.reboot) {
       const banner = document.getElementById('banner');
       banner.textContent = 'Saved — the bridge is restarting to apply the uplink…';

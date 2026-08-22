@@ -483,36 +483,60 @@ const slMsg = document.getElementById('syslog-msg');
 const slState = document.getElementById('syslog-state');
 
 // The device is the authority on these too - the "syslog" console command can
-// change them - so the form is only populated while nothing in it has focus,
-// the same rule the capture select follows. Without that, a refresh would yank
-// a half-typed address away.
+// change them - so a field is only populated while it holds nothing unsaved.
+// Without that, a refresh would yank a half-typed address away.
 //
 // It has to keep refreshing rather than load once, because Save sends every
 // field, not just the changed one. A form populated at page load and submitted
 // half an hour later would write its stale copy over anything the console or
 // another tab had changed in between - silently, since the field the person
-// came to change is the only one they are looking at. Re-reading whenever the
-// form is idle keeps the copy it would write current.
+// came to change is the only one they are looking at. Re-reading whenever a
+// field is untouched keeps the copy it would write current.
+//
+// Tracked per field, and by edit rather than by focus. Focus was the old test
+// and it was the wrong one: it is held only while the caret is actually in the
+// control, so clicking anywhere else on the page handed the field straight back
+// to the next refresh, which wrote the stored value over what had just been
+// typed. A whole-form flag would have fixed that but broken the paragraph
+// above, since one keystroke would pin stale copies of the five fields nobody
+// touched and Save would write them back. A set of ids keeps both: what was
+// typed survives, and everything else stays current.
 let slLoaded = false;
 let slLastLoad = 0;
 const SL_RELOAD_MS = 5000;
+const slDirty = new Set();
 
-function slFieldsFocused() {
-  const active = document.activeElement;
-  return active && active.id && active.id.startsWith('sl-');
+// On document, because these controls are not wrapped in a form - the same
+// sl- prefix the refresh keys off is what identifies them. input covers typing
+// and the two selects; change covers the checkbox, which not every browser
+// fires input for.
+for (const ev of ['input', 'change']) {
+  document.addEventListener(ev, (e) => {
+    if (e.target.id && e.target.id.startsWith('sl-')) slDirty.add(e.target.id);
+  });
+}
+
+// Writes a field from the device unless it is holding an unsaved edit.
+function slSet(id, value) {
+  if (slDirty.has(id)) return;
+  const el = document.getElementById(id);
+  if (el.type === 'checkbox') {
+    el.checked = value;
+  } else {
+    el.value = value;
+  }
 }
 
 function showSyslogConfig(data) {
-  if (slFieldsFocused()) return;
-  document.getElementById('sl-enabled').checked = data.enabled;
-  document.getElementById('sl-server').value = data.server;
-  document.getElementById('sl-port').value = data.port;
-  document.getElementById('sl-facility').value = String(data.facility);
-  document.getElementById('sl-severity').value = String(data.min_severity);
+  slSet('sl-enabled', data.enabled);
+  slSet('sl-server', data.server);
+  slSet('sl-port', data.port);
+  slSet('sl-facility', String(data.facility));
+  slSet('sl-severity', String(data.min_severity));
   // The name is shown as a placeholder rather than a value when it is the
   // MAC-derived default, so clearing the field means "go back to the default"
   // instead of "no name at all".
-  document.getElementById('sl-hostname').value = data.hostname;
+  slSet('sl-hostname', data.hostname);
   document.getElementById('sl-subnet-hint').textContent =
     data.subnet === 'unknown'
       ? 'The collector must be on this bridge’s own network — it has no gateway and cannot reach anything else.'
@@ -596,6 +620,11 @@ document.getElementById('sl-save').addEventListener('click', async () => {
     if (res.ok) {
       slMsg.className = 'ok';
       slMsg.textContent = 'Saved. In effect now — no reboot needed.';
+      // Clean again, so the refresh resumes tracking the device. The device
+      // normalises what it was given (an empty hostname comes back as the
+      // MAC-derived default), and without this the fields would sit on the
+      // typed text forever and never show what was really stored.
+      slDirty.clear();
       await loadSyslog();
     } else {
       // The device's rejection text is the useful part, especially the
