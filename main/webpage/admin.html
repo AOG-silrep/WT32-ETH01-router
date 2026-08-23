@@ -5,15 +5,44 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AgOpen router &ndash; Admin</title>
 <style>
-  body { font-family: sans-serif; max-width: 700px; margin: 2em auto; padding: 0 1em; color: #222; }
+  body { font-family: sans-serif; color: #222; }
+  /* The page list, on every page. Sticky so it stays put while a long table
+     scrolls past it. flex-basis rather than a width, so the content column
+     takes whatever is left over and nothing has to add up to 100%. */
+  .layout { display: flex; align-items: flex-start; gap: 1.5em; max-width: 1300px; margin: 2em auto; padding: 0 1em; }
+  .sidenav { flex: 0 0 11em; box-sizing: border-box; position: sticky; top: 2em; font-size: 0.9em;
+             border-right: 1px solid #ddd; padding-right: 1em; }
+  .sidenav a { display: block; padding: 0.35em 0.5em; color: #2a78d6; text-decoration: none; border-radius: 3px; }
+  .sidenav a:hover { background: #eef4fc; }
+  /* The current page stays in the list so the list keeps its shape, but it is
+     a label rather than a destination - hence text colour, not link colour. */
+  .sidenav a.here { color: #222; font-weight: 600; background: #f0efec; }
+  /* Without min-width a wide table inside a flex item refuses to shrink and
+     shoves the sidebar off-screen rather than scrolling itself. */
+  .content { flex: 1 1 auto; min-width: 0; }
+  /* Under 700px the sidebar's ~200px is a big bite out of a phone held
+     portrait, and a nav that widens the page is the mistake f1645fa fixed on
+     the dashboard. Lay it out as a strip above the content instead. */
+  @media (max-width: 700px) {
+    .layout { display: block; }
+    .sidenav { position: static; border-right: 0; border-bottom: 1px solid #ddd;
+               padding: 0 0 0.5em 0; margin-bottom: 1em; }
+    .sidenav a { display: inline-block; }
+  }
   h1 { font-size: 1.3em; }
-  h1 a { font-size: 0.7em; font-weight: normal; color: #2a78d6; text-decoration: none; margin-left: 0.6em; }
-  h1 a:hover { text-decoration: underline; }
   .panel { border: 2px solid #888; border-radius: 4px; padding: 0.8em; margin-top: 1em; }
   .panel h2 { margin-top: 0; font-size: 1.05em; }
   label { display: block; margin-top: 0.8em; font-size: 0.9em; }
   input { width: 100%; box-sizing: border-box; padding: 0.4em; margin-top: 0.2em; font-size: 1em; }
   button { margin-top: 1em; padding: 0.5em 1.2em; font-size: 1em; }
+  /* Picking a file and flashing it are one action, so they share a line rather
+     than sitting a full input's width apart. Wraps rather than overflowing once
+     the panel is narrower than the two controls together. */
+  .file-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6em; margin-top: 0.2em; }
+  /* Both opt out of the block-level metrics above: the input sizes to its own
+     control instead of the full width, so the two buttons end up adjacent. */
+  .file-row input { width: auto; margin-top: 0; }
+  .file-row button { margin-top: 0; white-space: nowrap; }
   #ota-progress { width: 100%; margin-top: 0.8em; height: 1.2em; display: none; }
   #ota-progress.show { display: block; }
   #ota-msg { margin-top: 0.6em; font-size: 0.9em; }
@@ -28,16 +57,28 @@
 </head>
 <body>
 
-<h1>Admin <a href="/" id="back-link">&larr; Dashboard</a></h1>
+<div class="layout">
+<nav class="sidenav" id="sidenav">
+<a href="/">Dashboard</a>
+<a href="/wan">Internet uplink</a>
+<a href="/leases">DHCP leases</a>
+<a href="/logs">Device log</a>
+<a href="/resets">Reboot history</a>
+<a href="/admin" class="here">Admin</a>
+</nav>
+<div class="content">
+
+<h1>Admin</h1>
 <div id="forced-banner">You're using the default admin password. Set a new password below to continue. You will be asked to log in again after saving.</div>
 
 <div class="panel" id="ota-panel">
 <h2>Firmware update</h2>
 <form id="ota-form">
   <label for="ota-file">Firmware image (.bin)</label>
-  <input type="file" id="ota-file" accept=".bin">
-
-  <button type="submit" id="ota-submit" disabled>Upload &amp; flash</button>
+  <div class="file-row">
+    <input type="file" id="ota-file" accept=".bin">
+    <button type="submit" id="ota-submit" disabled>Upload &amp; flash</button>
+  </div>
   <progress id="ota-progress" value="0" max="100"></progress>
   <div id="ota-msg"></div>
 </form>
@@ -60,7 +101,11 @@
 <script>
 if (new URLSearchParams(location.search).get('forced') === '1') {
   document.getElementById('forced-banner').classList.add('show');
-  document.getElementById('back-link').style.display = 'none';
+  // Every link in the sidebar leads to a page that, while the password is
+  // still the default, answers with send_default_creds_redirect() straight
+  // back to this one (web_server.c). Offering them would be offering five
+  // round trips to nowhere, so the nav goes away until the password does.
+  document.getElementById('sidenav').style.display = 'none';
   // A username-only save can't clear this state - the server gates on the
   // password alone and would reject the request. Don't let the form send one,
   // and drop the "leave blank" wording that contradicts that.
@@ -186,6 +231,9 @@ document.getElementById('admin-form').addEventListener('submit', async (e) => {
   }
 });
 </script>
+
+</div>
+</div>
 
 </body>
 </html>

@@ -5,11 +5,36 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AgOpen router &ndash; DHCP leases</title>
 <style>
-  body { font-family: sans-serif; max-width: 1100px; margin: 2em auto; padding: 0 1em; color: #222; }
+  body { font-family: sans-serif; color: #222; }
+  /* The page list, on every page. Sticky so it stays put while a long table
+     scrolls past it. flex-basis rather than a width, so the content column
+     takes whatever is left over and nothing has to add up to 100%. */
+  .layout { display: flex; align-items: flex-start; gap: 1.5em; max-width: 1300px; margin: 2em auto; padding: 0 1em; }
+  .sidenav { flex: 0 0 11em; box-sizing: border-box; position: sticky; top: 2em; font-size: 0.9em;
+             border-right: 1px solid #ddd; padding-right: 1em; }
+  .sidenav a { display: block; padding: 0.35em 0.5em; color: #2a78d6; text-decoration: none; border-radius: 3px; }
+  .sidenav a:hover { background: #eef4fc; }
+  /* The current page stays in the list so the list keeps its shape, but it is
+     a label rather than a destination - hence text colour, not link colour. */
+  .sidenav a.here { color: #222; font-weight: 600; background: #f0efec; }
+  /* Without min-width a wide table inside a flex item refuses to shrink and
+     shoves the sidebar off-screen rather than scrolling itself. */
+  .content { flex: 1 1 auto; min-width: 0; }
+  /* Under 700px the sidebar's ~200px is a big bite out of a phone held
+     portrait, and a nav that widens the page is the mistake f1645fa fixed on
+     the dashboard. Lay it out as a strip above the content instead. */
+  @media (max-width: 700px) {
+    .layout { display: block; }
+    .sidenav { position: static; border-right: 0; border-bottom: 1px solid #ddd;
+               padding: 0 0 0.5em 0; margin-bottom: 1em; }
+    .sidenav a { display: inline-block; }
+  }
   h1 { font-size: 1.3em; }
-  h1 a { font-size: 0.7em; font-weight: normal; color: #2a78d6; text-decoration: none; margin-left: 0.6em; }
-  h1 a:hover { text-decoration: underline; }
-  #banner { display: none; background: #b00020; color: #fff; padding: 0.6em 1em; border-radius: 4px; margin-bottom: 1em; }
+  /* Outside .layout, so it spans the nav as well as the content - but it is
+     a rounded box, not a full-bleed strip, so it still has to sit in the
+     same column they do rather than run to the window edge. */
+  #banner { display: none; background: #b00020; color: #fff; padding: 0.6em 1em; border-radius: 4px;
+            max-width: 1300px; margin: 2em auto 1em; }
   #banner.show { display: block; }
   .panel { border: 2px solid #888; border-radius: 4px; padding: 0.8em; margin-top: 1em; }
   table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
@@ -54,7 +79,18 @@
 
 <div id="banner">Lost connection to bridge &mdash; retrying&hellip;</div>
 
-<h1>DHCP leases <a href="/">&larr; Dashboard</a></h1>
+<div class="layout">
+<nav class="sidenav" id="sidenav">
+<a href="/">Dashboard</a>
+<a href="/wan">Internet uplink</a>
+<a href="/leases" class="here">DHCP leases</a>
+<a href="/logs">Device log</a>
+<a href="/resets">Reboot history</a>
+<a href="/admin">Admin</a>
+</nav>
+<div class="content">
+
+<h1>DHCP leases</h1>
 
 <div class="panel">
   <div class="table-scroll">
@@ -324,6 +360,9 @@ poll();
 // worker task shared with the dashboard's own polling.
 const pollTimer = setInterval(poll, 3000);
 </script>
+
+</div>
+</div>
 
 </body>
 </html>
