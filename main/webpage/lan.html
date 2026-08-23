@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgOpen router &ndash; LAN</title>
+<style>
+  body { font-family: sans-serif; color: #222; }
+  /* The page list, on every page. Sticky so it stays put while a long table
+     scrolls past it. flex-basis rather than a width, so the content column
+     takes whatever is left over and nothing has to add up to 100%. */
+  .layout { display: flex; align-items: flex-start; gap: 1.5em; max-width: 1300px; margin: 2em auto; padding: 0 1em; }
+  .sidenav { flex: 0 0 11em; box-sizing: border-box; position: sticky; top: 2em; font-size: 0.9em;
+             border-right: 1px solid #ddd; padding-right: 1em; }
+  .sidenav a { display: block; padding: 0.35em 0.5em; color: #2a78d6; text-decoration: none; border-radius: 3px; }
+  .sidenav a:hover { background: #eef4fc; }
+  /* The current page stays in the list so the list keeps its shape, but it is
+     a label rather than a destination - hence text colour, not link colour. */
+  .sidenav a.here { color: #222; font-weight: 600; background: #f0efec; }
+  /* Without min-width a wide table inside a flex item refuses to shrink and
+     shoves the sidebar off-screen rather than scrolling itself. */
+  .content { flex: 1 1 auto; min-width: 0; }
+  /* Under 700px the sidebar's ~200px is a big bite out of a phone held
+     portrait, and a nav that widens the page is the mistake f1645fa fixed on
+     the dashboard. Lay it out as a strip above the content instead. */
+  @media (max-width: 700px) {
+    .layout { display: block; }
+    .sidenav { position: static; border-right: 0; border-bottom: 1px solid #ddd;
+               padding: 0 0 0.5em 0; margin-bottom: 1em; }
+    .sidenav a { display: inline-block; }
+  }
+  h1 { font-size: 1.3em; }
+  /* Outside .layout, so it spans the nav as well as the content - but it is
+     a rounded box, not a full-bleed strip, so it still has to sit in the
+     same column they do rather than run to the window edge. */
+  #banner { display: none; background: #b00020; color: #fff; padding: 0.6em 1em; border-radius: 4px;
+            max-width: 1300px; margin: 2em auto 1em; }
+  #banner.show { display: block; }
+  #banner.restarting { background: #c26a00; }
+  .panel { border: 2px solid #888; border-radius: 4px; padding: 0.8em; margin-top: 1em; }
+  .panel h2 { margin-top: 0; font-size: 1.05em; }
+  label { display: block; margin-top: 0.8em; font-size: 0.9em; }
+  input, select { width: 100%; box-sizing: border-box; padding: 0.4em; margin-top: 0.2em; font-size: 1em; }
+  button { margin-top: 1em; padding: 0.5em 1.2em; font-size: 1em; }
+  /* "(locked to upstream)" carries a title tooltip explaining why. Without an
+     affordance a tooltip is invisible, so it gets the conventional one: dotted
+     underline and a help cursor. Empty and inert whenever the WAN is off. */
+  #channel-lock:not(:empty) { border-bottom: 1px dotted #898781; cursor: help; }
+  /* The disabled state is the same fact as the label, said to the eye. Browsers
+     grey a disabled select only faintly, and this one sits next to two enabled
+     inputs where "not editable" has to read at a glance. */
+  select:disabled { background: #f2f1ee; color: #898781; cursor: not-allowed; }
+  #wifi-msg { margin-top: 0.6em; font-size: 0.9em; }
+  #wifi-msg.error { color: #b00020; }
+  #wifi-msg.ok { color: #0a7a2f; }
+</style>
+</head>
+<body>
+
+<div id="banner"></div>
+
+<div class="layout">
+<nav class="sidenav" id="sidenav">
+<a href="/">Dashboard</a>
+<a href="/wan">WAN</a>
+<a href="/lan" class="here">LAN</a>
+<a href="/leases">DHCP leases</a>
+<a href="/logs">Device log</a>
+<a href="/resets">Reboot history</a>
+<a href="/admin">Admin</a>
+</nav>
+<div class="content">
+
+<h1>LAN</h1>
+
+<div class="panel">
+<h2>WiFi</h2>
+<form id="wifi-form">
+  <label for="ssid">Network name (SSID)</label>
+  <input type="text" id="ssid" maxlength="31" required>
+
+  <label for="password">Password (leave blank to keep the current password)</label>
+  <input type="password" id="password" maxlength="63" autocomplete="new-password">
+
+  <label for="channel" id="channel-label">Channel<span id="channel-lock"></span></label>
+  <select id="channel">
+    <option value="1">1</option>
+    <option value="6">6</option>
+    <option value="11">11</option>
+  </select>
+
+  <button type="submit">Save &amp; apply</button>
+  <div id="wifi-msg"></div>
+</form>
+</div>
+
+<script>
+const AUTH_ERROR = new Error('auth');
+const SETUP_ERROR = new Error('setup');
+
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    if (res.status === 401) throw AUTH_ERROR;
+    if (res.status === 403) throw SETUP_ERROR;
+    return res;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Read once on load rather than on the poll below. The SSID and channel only
+// change when this form saves them, and saving reloads the page - so there is
+// nothing for a repeated read to discover, and polling it would overwrite
+// whatever is half-typed in the field.
+async function loadStatus() {
+  const res = await fetchWithTimeout('/api/status', {}, 1500);
+  const data = await res.json();
+  document.getElementById('ssid').value = data.ssid;
+  document.getElementById('channel').value = data.channel;
+}
+
+document.getElementById('wifi-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = document.getElementById('wifi-msg');
+  msg.textContent = '';
+  msg.className = '';
+  const ssid = document.getElementById('ssid').value;
+  const password = document.getElementById('password').value;
+  const channel = parseInt(document.getElementById('channel').value, 10);
+  try {
+    const res = await fetch('/api/wifi', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ssid, password, channel })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      document.getElementById('password').value = '';
+      const banner = document.getElementById('banner');
+      banner.textContent = 'Saved — WiFi is restarting, reconnecting…';
+      banner.classList.add('show', 'restarting');
+      setTimeout(() => location.reload(), 3000);
+    } else {
+      msg.textContent = data.error || 'Failed to save';
+      msg.className = 'error';
+    }
+  } catch (e) {
+    msg.textContent = 'Could not reach the bridge';
+    msg.className = 'error';
+  }
+});
+
+// The WAN itself lives on /wan. All this page keeps is the state of the
+// channel selector, because that is where somebody is standing when the fact
+// matters: one radio, so a connected WAN overrides the channel chosen here.
+//
+// The select is disabled while that is true, so the control agrees with the
+// label instead of accepting a choice the radio would ignore. Two consequences
+// worth knowing:
+//
+//   - Changing the channel now means turning the WAN off first. That is the
+//     price of the control telling the truth.
+//   - The WiFi form still submits the right value. Its handler reads .value
+//     directly rather than relying on native form serialisation, and a disabled
+//     select still has one, so saving the form while locked round-trips the
+//     stored channel rather than clearing it.
+//
+// Only locked once the WAN is actually associated: d.channel is the radio's
+// real channel and stays 0 until then, so an enabled-but-not-connected WAN
+// leaves the selector alone, which is correct - nothing is overriding it yet.
+async function refreshWanChannelNote() {
+  const res = await fetchWithTimeout('/api/wan', {}, 1500);
+  const d = await res.json();
+  const label = document.getElementById('channel-label');
+  const lock = document.getElementById('channel-lock');
+  const sel = document.getElementById('channel');
+  if (d.enabled && d.channel) {
+    lock.textContent = ' (locked to upstream)';
+    label.title = 'The WAN is on, so this bridge’s WiFi has to use the same channel as the upstream network — currently channel ' + d.channel + '. Turn the WAN off to change this setting; it is used whenever the WAN is off.';
+    sel.disabled = true;
+  } else {
+    lock.textContent = '';
+    label.removeAttribute('title');
+    sel.disabled = false;
+  }
+}
+
+// One poll at a time, for the reason the dashboard records: the bridge serves
+// HTTP from a single worker task and delays a second before answering a failed
+// auth, so overlapping polls queue and time out in a way that reads as
+// "unreachable" rather than "credentials rejected".
+let polling = false;
+async function poll() {
+  if (polling) return;
+  polling = true;
+  try {
+    await refreshWanChannelNote();
+    const banner = document.getElementById('banner');
+    banner.classList.remove('show');
+  } catch (e) {
+    if (e === AUTH_ERROR || e === SETUP_ERROR) {
+      location.reload();
+      return;
+    }
+    const banner = document.getElementById('banner');
+    banner.textContent = 'Cannot reach the bridge';
+    banner.classList.add('show');
+  } finally {
+    polling = false;
+  }
+}
+
+loadStatus();
+poll();
+// Five seconds. The only thing this drives is the channel note, which changes
+// on the scale of a WiFi association - the dashboard spent a fifth of its
+// one-second cycle on it for the same reason.
+setInterval(poll, 5000);
+</script>
+
+</div>
+</div>
+
+</body>
+</html>

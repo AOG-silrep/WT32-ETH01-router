@@ -7,7 +7,7 @@ An ESP-IDF firmware project that turns a [WT32-ETH01](https://en.wireless-tag.co
 ## Features
 
 - Ethernet (LAN8720 PHY) ↔ WiFi AP network bridge (`esp_netif_br_glue`)
-- Web UI (`main/webpage/index.html`) for WiFi configuration and live status
+- Web UI with a page per concern: live status on the dashboard, WiFi settings on `/lan`
 - Connected-client tracking and per-device traffic graphing
 - System monitor (heap, uptime, etc.) surfaced on the web UI, refreshed every second
 - DHCP lease table viewable in a browser (`/leases`), live state alongside what is in flash
@@ -277,7 +277,8 @@ deauthentication frames; WPA2 encryption of data is unaffected.
 
 ## Web UI
 
-Browse to the device (`192.168.5.1` by default) for WiFi settings and live system stats:
+Browse to the device (`192.168.5.1` by default) for live system stats, with the settings
+pages a click away in the sidebar:
 
 ![The web UI: WiFi settings and system stats](docs/web-ui.png)
 
@@ -293,13 +294,24 @@ between bytes/s and packets/s:
 allowlist, and the WAN's live state. It is a page rather than a dashboard panel because
 almost everything on it is either set once and left alone or read while diagnosing — neither
 of which wants to share a refresh cycle with the client table. The page polls `/api/wan` every
-two seconds; the dashboard keeps only the state of its channel selector, whose label reads
-"Channel (locked to upstream)" with a tooltip naming the channel in use, because that is where
-somebody is standing when the single-radio channel override matters. The selector is disabled
-while the WAN is associated, so changing the channel means turning the WAN off first. The
-saved value is untouched and is still what the AP uses whenever the WAN is off.
+two seconds. The channel selector on [`/lan`](#lan-page) reads it too, so the note there can
+say what the radio is really doing.
 
 See [WAN](#wan) for what it does and what it costs.
+
+### LAN page
+
+"LAN" in the sidebar opens `/lan`, which holds the access point's SSID, password and
+channel — the settings that used to be the dashboard's first panel. They moved for the
+reason the WAN settings did: they are set once and left alone, and a form that reloads its
+own fields does not belong on a page polling three endpoints a second. Saving reboots the
+radio, so every WiFi client disconnects and rejoins.
+
+The channel label reads "Channel (locked to upstream)" with a tooltip naming the channel in
+use whenever the WAN is associated, and the selector is disabled — so changing the channel
+means turning the WAN off first. The saved value is untouched and is still what the AP uses
+whenever the WAN is off. The page polls `/api/wan` every five seconds for that one fact and
+nothing else; `/api/status` is read once on load, since only this form changes it.
 
 ### DHCP leases
 
@@ -796,6 +808,7 @@ reboots with the default WiFi AP and `admin`/`admin` web login restored.
 - `main/webpage/leases.html` — the `/leases` DHCP table page
 - `main/webpage/resets.html` — the `/resets` reboot history page
 - `main/webpage/wan.html` — the `/wan` WAN page
+- `main/webpage/lan.html` — the `/lan` page: the access point's SSID, password and channel
 - `scripts/` — measurement gate, smoke tests, OTA helper (see [Diagnostics harness](#diagnostics-harness))
 - `bench/` — recorded gate runs; `00-baseline` is the reference
 
@@ -865,7 +878,7 @@ echo requests are dropped too, so the device does not answer pings from the WAN 
 
 The ESP32 has a single 2.4 GHz radio. While the WAN is connected, this bridge's own access
 point is **forced onto the upstream network's channel**, and every associated client is dropped
-and re-associates when that happens. The channel setting under **WiFi** still takes 1, 6 or 11
+and re-associates when that happens. The channel setting on `/lan` still takes 1, 6 or 11
 and is still correct advice — it is simply only used when the WAN is off. The web UI says
 which channel the radio is actually on, and the log warns when the two differ.
 

@@ -39,6 +39,8 @@ extern const uint8_t resets_html_start[] asm("_binary_resets_html_start");
 extern const uint8_t resets_html_end[] asm("_binary_resets_html_end");
 extern const uint8_t wan_html_start[] asm("_binary_wan_html_start");
 extern const uint8_t wan_html_end[] asm("_binary_wan_html_end");
+extern const uint8_t lan_html_start[] asm("_binary_lan_html_start");
+extern const uint8_t lan_html_end[] asm("_binary_lan_html_end");
 
 // Pulls a JSON string field's value out of a flat {"key":"value",...}
 // object. Good enough for the small, fixed-shape request bodies this
@@ -1593,6 +1595,24 @@ static esp_err_t wan_page_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t lan_page_get_handler(httpd_req_t *req)
+{
+    if (!check_admin_auth(req)) {
+        send_auth_error(req);
+        return ESP_OK;
+    }
+    if (auth_cfg_password_is_default()) {
+        send_default_creds_redirect(req);
+        return ESP_OK;
+    }
+
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, (const char *)lan_html_start,
+                     lan_html_end - lan_html_start - 1);
+    return ESP_OK;
+}
+
 // Longest possible trailer appended after the packing loop in
 // logs_get_handler(), with every %u at 10 digits and all three level names at
 // their longest ("verbose"): 153 bytes for the log fields, plus 133 for the six
@@ -2475,6 +2495,7 @@ httpd_handle_t web_server_start(void)
     const httpd_uri_t syslog_get_uri = {.uri = "/api/syslog", .method = HTTP_GET, .handler = syslog_get_handler};
     const httpd_uri_t syslog_post_uri = {.uri = "/api/syslog", .method = HTTP_POST, .handler = syslog_post_handler};
     const httpd_uri_t wan_page_uri = {.uri = "/wan", .method = HTTP_GET, .handler = wan_page_get_handler};
+    const httpd_uri_t lan_page_uri = {.uri = "/lan", .method = HTTP_GET, .handler = lan_page_get_handler};
     const httpd_uri_t wan_get_uri = {.uri = "/api/wan", .method = HTTP_GET, .handler = wan_get_handler};
     const httpd_uri_t wan_post_uri = {.uri = "/api/wan", .method = HTTP_POST, .handler = wan_post_handler};
 
@@ -2501,6 +2522,7 @@ httpd_handle_t web_server_start(void)
     httpd_register_uri_handler(server, &syslog_get_uri);
     httpd_register_uri_handler(server, &syslog_post_uri);
     httpd_register_uri_handler(server, &wan_page_uri);
+    httpd_register_uri_handler(server, &lan_page_uri);
     httpd_register_uri_handler(server, &wan_get_uri);
     httpd_register_uri_handler(server, &wan_post_uri);
 
