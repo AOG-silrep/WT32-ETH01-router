@@ -209,7 +209,7 @@ static bool egress_allowed(const wan_frame_t *f, const wan_rules_t *r)
 
     uint16_t sport, dport;
 
-    // While the uplink is down there is nowhere for anything to go, but the
+    // While the WAN is down there is nowhere for anything to go, but the
     // station still has to be able to get itself an address.
     if (IPH_PROTO(f->ip) == IP_PROTO_UDP && l4_ports(f, &sport, &dport) &&
         sport == 68 && dport == 67) {
@@ -222,7 +222,7 @@ static bool egress_allowed(const wan_frame_t *f, const wan_rules_t *r)
     switch (IPH_PROTO(f->ip)) {
     case IP_PROTO_ICMP:
         // Outbound ping only. It is the one diagnostic an operator has for "is
-        // the uplink actually carrying anything", and it reveals nothing.
+        // the WAN actually carrying anything", and it reveals nothing.
         return icmp_type(f) == ICMP_ECHO;
 
     case IP_PROTO_UDP:
@@ -359,7 +359,7 @@ static void on_sta_port_started(void *arg, esp_event_base_t base, int32_t id, vo
     s_sta_orig_linkoutput = nif->linkoutput;
     nif->input = sta_input_wrapper;
     nif->linkoutput = sta_output_wrapper;
-    ESP_LOGI(TAG, "WAN packet filter installed on the uplink");
+    ESP_LOGI(TAG, "WAN packet filter installed on the STA interface");
 
     s_status.state = WAN_STATE_CONNECTING;
     esp_wifi_connect();
@@ -394,7 +394,7 @@ static void schedule_retry(uint32_t seconds)
 //
 // The bridge is the *inside* netif: ip4.c skips translation when the output
 // netif carries the flag and skips the reverse lookup when the input netif does,
-// so the flag marks the inside, not the uplink.
+// so the flag marks the inside, not the WAN.
 static void napt_ensure(void)
 {
     if (s_napt_on || s_br_netif == NULL) {
@@ -470,7 +470,7 @@ static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
     uint32_t common = evt->ip_info.netmask.addr & LAN_MASK;
     if (((evt->ip_info.ip.addr ^ LAN_IP) & common) == 0) {
         ESP_LOGE(TAG, "upstream network gave us " IPSTR "/" IPSTR ", which overlaps this "
-                      "bridge's own 192.168.5.0/24 - the uplink cannot be used. Change the "
+                      "bridge's own 192.168.5.0/24 - the WAN cannot be used. Change the "
                       "upstream router's address range.",
                  IP2STR(&evt->ip_info.ip), IP2STR(&evt->ip_info.netmask));
         s_status.state = WAN_STATE_SUBNET_CONFLICT;
@@ -632,7 +632,7 @@ esp_err_t wan_init(esp_netif_t *br_netif)
     // always did.
     if (!cfg.enabled) {
         s_status.state = WAN_STATE_DISABLED;
-        ESP_LOGI(TAG, "internet uplink not configured - bridge only");
+        ESP_LOGI(TAG, "WAN not configured - bridge only");
         return ESP_OK;
     }
 
@@ -646,7 +646,7 @@ esp_err_t wan_init(esp_netif_t *br_netif)
     esp_netif_inherent_config_t sta_cfg = ESP_NETIF_INHERENT_DEFAULT_WIFI_STA();
     s_sta_netif = esp_netif_create_wifi(WIFI_IF_STA, &sta_cfg);
     if (s_sta_netif == NULL) {
-        ESP_LOGE(TAG, "could not create the uplink interface");
+        ESP_LOGE(TAG, "could not create the WAN interface");
         return ESP_ERR_NO_MEM;
     }
 
@@ -692,6 +692,6 @@ esp_err_t wan_init(esp_netif_t *br_netif)
                                                &on_bridge_up, NULL));
 
     s_status.state = WAN_STATE_CONNECTING;
-    ESP_LOGI(TAG, "internet uplink configured for \"%s\"", cfg.ssid);
+    ESP_LOGI(TAG, "WAN configured for \"%s\"", cfg.ssid);
     return ESP_OK;
 }

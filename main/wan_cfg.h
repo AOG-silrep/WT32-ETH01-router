@@ -9,10 +9,10 @@
 extern "C" {
 #endif
 
-// Which upstream network the WiFi uplink joins, and which destination ports a
-// LAN client is allowed to reach through it. The uplink itself is wan.c; this
+// Which upstream network WiFi as WAN joins, and which destination ports a
+// LAN client is allowed to reach through it. The WAN itself is wan.c; this
 // module only stores and validates, so the console and the web handler can
-// check a candidate configuration without caring whether the uplink is running
+// check a candidate configuration without caring whether the WAN is running
 // - the same split, and the same reason, as syslog_cfg.c and syslog.c.
 
 #define WAN_CFG_SSID_MAX_LEN     33   // includes NUL; 802.11 SSID is 32 octets

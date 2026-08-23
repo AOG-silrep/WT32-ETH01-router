@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AgOpen router &ndash; Internet uplink</title>
+<title>AgOpen router &ndash; WAN</title>
 <style>
   body { font-family: sans-serif; color: #222; }
   /* The page list, on every page. Sticky so it stays put while a long table
@@ -69,7 +69,7 @@
 <div class="layout">
 <nav class="sidenav" id="sidenav">
 <a href="/">Dashboard</a>
-<a href="/wan" class="here">Internet uplink</a>
+<a href="/wan" class="here">WAN</a>
 <a href="/leases">DHCP leases</a>
 <a href="/logs">Device log</a>
 <a href="/resets">Reboot history</a>
@@ -77,10 +77,10 @@
 </nav>
 <div class="content">
 
-<h1>Internet uplink</h1>
+<h1>WAN</h1>
 
 <div class="panel">
-<h2>Upstream network</h2>
+<h2>WiFi as WAN</h2>
 <form id="wan-form">
   <label><input type="checkbox" id="wan-enabled"> Route clients to the internet through another WiFi network</label>
 
@@ -94,7 +94,7 @@
   <p class="hint">Only these ports can be reached on the internet. Everything else &mdash; including anything trying to reach this bridge <em>from</em> the internet &mdash; is blocked. An entry is a port number, optionally suffixed <code>/tcp</code> or <code>/udp</code>; a bare number means TCP. The defaults cover NTRIP (2101, 2102) and RustDesk (21115&ndash;21117, including <code>21116/udp</code>, which RustDesk does not work without).</p>
   <input type="text" id="wan-ports" placeholder="2101,2102,21115,21116,21116/udp,21117">
 
-  <p class="warn">This device has one radio. While the uplink is connected, the bridge&rsquo;s own WiFi is forced onto the upstream network&rsquo;s channel, and the channel set on the dashboard is ignored.</p>
+  <p class="warn">This device has one radio. While the WAN is connected, the bridge&rsquo;s own WiFi is forced onto the upstream network&rsquo;s channel, and the channel set on the dashboard is ignored.</p>
   <p class="warn">Saving a change to the network, password or the checkbox restarts the bridge. Every WiFi client will disconnect and rejoin. Changing only the port list takes effect immediately.</p>
 
   <button type="submit">Save</button>
@@ -179,7 +179,7 @@ function wanStateText(d) {
     case 'no_ap':      return 'Cannot find ' + (d.ssid || 'the upstream network') + '.' + (d.retry_in_s ? ' Retrying in ' + d.retry_in_s + ' s.' : '');
     case 'auth_failed':return 'Could not log in to ' + d.ssid + ' — check the password.';
     case 'subnet_conflict':
-      return 'The upstream network hands out addresses on 192.168.5.x, the same range this bridge uses. Change the upstream router’s range, or the uplink cannot work.';
+      return 'The upstream network hands out addresses on 192.168.5.x, the same range this bridge uses. Change the upstream router’s range, or the WAN cannot work.';
     default:           return d.state;
   }
 }
@@ -261,7 +261,7 @@ document.getElementById('wan-form').addEventListener('submit', async (e) => {
     wanDirty.clear();
     if (data.reboot) {
       const banner = document.getElementById('banner');
-      banner.textContent = 'Saved — the bridge is restarting to apply the uplink…';
+      banner.textContent = 'Saved — the bridge is restarting to apply the WAN…';
       banner.classList.add('show', 'restarting');
       setTimeout(() => location.reload(), 4000);
     } else {

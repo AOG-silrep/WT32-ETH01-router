@@ -34,7 +34,7 @@
   label { display: block; margin-top: 0.8em; font-size: 0.9em; }
   /* "(locked to upstream)" carries a title tooltip explaining why. Without an
      affordance a tooltip is invisible, so it gets the conventional one: dotted
-     underline and a help cursor. Empty and inert whenever the uplink is off. */
+     underline and a help cursor. Empty and inert whenever the WAN is off. */
   #channel-lock:not(:empty) { border-bottom: 1px dotted #898781; cursor: help; }
   /* The disabled state is the same fact as the label, said to the eye. Browsers
      grey a disabled select only faintly, and this one sits next to two enabled
@@ -91,7 +91,7 @@
 <div class="layout">
 <nav class="sidenav" id="sidenav">
 <a href="/" class="here">Dashboard</a>
-<a href="/wan">Internet uplink</a>
+<a href="/wan">WAN</a>
 <a href="/leases">DHCP leases</a>
 <a href="/logs">Device log</a>
 <a href="/resets">Reboot history</a>
@@ -862,23 +862,23 @@ document.getElementById('wifi-form').addEventListener('submit', async (e) => {
   }
 });
 
-// The uplink itself lives on /wan. All this page keeps is the state of the
+// The WAN itself lives on /wan. All this page keeps is the state of the
 // channel selector, because that is where somebody is standing when the fact
-// matters: one radio, so a connected uplink overrides the channel chosen here.
+// matters: one radio, so a connected WAN overrides the channel chosen here.
 //
 // The select is disabled while that is true, so the control agrees with the
 // label instead of accepting a choice the radio would ignore. Two consequences
 // worth knowing:
 //
-//   - Changing the channel now means turning the uplink off first. That is the
+//   - Changing the channel now means turning the WAN off first. That is the
 //     price of the control telling the truth.
 //   - The WiFi form still submits the right value. Its handler reads .value
 //     directly rather than relying on native form serialisation, and a disabled
 //     select still has one, so saving the form while locked round-trips the
 //     stored channel rather than clearing it.
 //
-// Only locked once the uplink is actually associated: d.channel is the radio's
-// real channel and stays 0 until then, so an enabled-but-not-connected uplink
+// Only locked once the WAN is actually associated: d.channel is the radio's
+// real channel and stays 0 until then, so an enabled-but-not-connected WAN
 // leaves the selector alone, which is correct - nothing is overriding it yet.
 async function refreshWanChannelNote() {
   const res = await fetchWithTimeout('/api/wan', {}, 1500);
@@ -888,7 +888,7 @@ async function refreshWanChannelNote() {
   const sel = document.getElementById('channel');
   if (d.enabled && d.channel) {
     lock.textContent = ' (locked to upstream)';
-    label.title = 'The internet uplink is on, so this bridge’s WiFi has to use the same channel as the upstream network — currently channel ' + d.channel + '. Turn the uplink off to change this setting; it is used whenever the uplink is off.';
+    label.title = 'The WAN is on, so this bridge’s WiFi has to use the same channel as the upstream network — currently channel ' + d.channel + '. Turn the WAN off to change this setting; it is used whenever the WAN is off.';
     sel.disabled = true;
   } else {
     lock.textContent = '';

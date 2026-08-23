@@ -290,7 +290,7 @@ int wan_cfg_format_ports(const wan_cfg_t *cfg, char *out, size_t outsz)
 
 bool wan_cfg_validate(const wan_cfg_t *cfg, const char **err_msg)
 {
-    // Everything below only matters when the uplink will actually run. A
+    // Everything below only matters when the WAN will actually run. A
     // disabled configuration with a half-filled form should still save, so that
     // turning it back on later does not mean typing the upstream network's
     // password in again - the same reasoning syslog_cfg_validate() records.

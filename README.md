@@ -14,7 +14,7 @@ An ESP-IDF firmware project that turns a [WT32-ETH01](https://en.wireless-tag.co
 - Device log viewable in a browser (`/logs`), not just over serial
 - Remote syslog (RFC 5424 over UDP) and a downloadable log file, so the log outlives the device's 128-line buffer
 - Configurable WiFi channel (1, 6, or 11)
-- Optional WiFi internet uplink (routed, NAT'd) with a destination-port allowlist, so an
+- Optional WiFi as WAN (routed, NAT'd) with a destination-port allowlist, so an
   AgOpenGPS tablet can reach an NTRIP caster and a RustDesk session, and nothing else
 
 ## First boot
@@ -50,7 +50,7 @@ The addressing is compiled in (`main/main.c`) and not configurable from the UI o
 | Bridge forwarding table | 32 MACs | `max_fdb_dyn_entries` |
 | Client forgotten after | 5 minutes of silence | `CLIENT_AGE_OUT_US` |
 | lwIP socket descriptors | 18 | `CONFIG_LWIP_MAX_SOCKETS` |
-| Internet uplink | off by default | `wan_cfg` in NVS |
+| WAN | off by default | `wan_cfg` in NVS |
 | Allowed egress rules | 12 | `WAN_CFG_MAX_PORTS` |
 | NAT sessions | 256 | `IP_NAPT_MAX`, set in the root `CMakeLists.txt` |
 | NAT UDP idle timeout | 60 s | `IP_NAPT_TIMEOUT_MS_UDP`, same place |
@@ -65,7 +65,7 @@ limits.
 requires `max_open_sockets + 3`), one to the DHCP server, one to the syslog sender. Adding
 anything that opens a socket means raising this number in the same change.
 
-The [internet uplink](#internet-uplink) deliberately adds none: NAPT lives inside
+The [WAN](#wan) deliberately adds none: NAPT lives inside
 `ip4_input`/`ip4_forward`, the station's DHCP client uses lwIP's raw `udp_pcb` API, and the
 packet filter is a pair of `netif` function pointers. A DNS relay or an NTP client would be
 the thing that breaks this budget, which is why neither is here.
@@ -287,23 +287,23 @@ between bytes/s and packets/s:
 
 ![Connected clients table with a per-client traffic graph](docs/client-traffic.png)
 
-### Internet uplink page
+### WAN page
 
-"Internet uplink →" in the header opens `/wan`, which owns the upstream network, the port
-allowlist, and the uplink's live state. It is a page rather than a dashboard panel because
+"WAN" in the sidebar opens `/wan`, which owns the upstream network, the port
+allowlist, and the WAN's live state. It is a page rather than a dashboard panel because
 almost everything on it is either set once and left alone or read while diagnosing — neither
 of which wants to share a refresh cycle with the client table. The page polls `/api/wan` every
 two seconds; the dashboard keeps only the state of its channel selector, whose label reads
 "Channel (locked to upstream)" with a tooltip naming the channel in use, because that is where
 somebody is standing when the single-radio channel override matters. The selector is disabled
-while the uplink is associated, so changing the channel means turning the uplink off first. The
-saved value is untouched and is still what the AP uses whenever the uplink is off.
+while the WAN is associated, so changing the channel means turning the WAN off first. The
+saved value is untouched and is still what the AP uses whenever the WAN is off.
 
-See [Internet uplink](#internet-uplink) for what it does and what it costs.
+See [WAN](#wan) for what it does and what it costs.
 
 ### DHCP leases
 
-"DHCP leases →" in the header opens `/leases`, the same table the `leases` console command
+"DHCP leases" in the sidebar opens `/leases`, the same table the `leases` console command
 prints — one row per MAC, with the state wording deliberately identical so the two never
 disagree. It adds a **Saved (NVS)** column: the address currently committed to flash for that
 MAC, which is what the client gets back after a reboot.
@@ -319,7 +319,7 @@ clock across a power cycle there is no elapsed time to report, only ordering.
 
 ### Device log
 
-"Device log →" in the header opens `/logs`, a live tail of the same `ESP_LOG` output the
+"Device log" in the sidebar opens `/logs`, a live tail of the same `ESP_LOG` output the
 serial console carries — useful when the device is deployed somewhere you can't easily reach
 with a cable. The last 128 lines are kept on the device and polled once a second.
 
@@ -464,10 +464,10 @@ than a date, for the same reason the timestamps are what they are.
 
 ### Admin page
 
-"Admin →" in the header opens `/admin`, which holds firmware update and the admin login. Both
-are the same kind of thing as the uplink settings — done deliberately, rarely, and never while
+"Admin" in the sidebar opens `/admin`, which holds firmware update and the admin login. Both
+are the same kind of thing as the WAN settings — done deliberately, rarely, and never while
 watching the client table — so they live off the dashboard for the reason given under
-[Internet uplink page](#internet-uplink-page). Firmware update had a second reason to move: the
+[WAN page](#wan-page). Firmware update had a second reason to move: the
 device serves HTTP from a single worker task, so an upload streaming into flash blocks the
 dashboard's one-second poll, and the dashboard had to carry a flag suppressing its own "lost
 connection" banner for the duration. On a page that does not poll, the problem does not exist.
@@ -489,7 +489,7 @@ but the pages needed to change it. `/` redirects to `/admin`, and every `/api/*`
 until setup is finished. Setting a new password is what unlocks it; the username is not a
 secret and changing it alone doesn't count.
 
-Change it from `/admin` (the "Admin →" link in the dashboard header)
+Change it from `/admin` (the "Admin" link in the sidebar)
 or with the serial console's `admin` command (see below). The console applies the same rule, so
 `admin -u <name>` on a fresh device fails until you pass `-p <password>` too.
 
@@ -529,7 +529,7 @@ Every route returns JSON except `/api/logs/download`, which returns `text/plain`
 | `/api/logs/level` | POST | `{"level":"info"}` | sets the capture level |
 | `/api/syslog` | GET | — | syslog settings and counters, plus `subnet` |
 | `/api/syslog` | POST | `{"enabled":1,"server":…,"port":…,"facility":…,"min_severity":…,"hostname":…}` | saves; omitted fields keep their value. `enabled` is `1`/`0`, not `true`/`false` |
-| `/api/wan` | GET | — | uplink settings, state, and the filter counters. Never returns the password |
+| `/api/wan` | GET | — | WAN settings, state, and the filter counters. Never returns the password |
 | `/api/wan` | POST | `{"enabled":1,"ssid":…,"password":…,"ports":"2101,2102"}` | saves; omitted fields keep their value. Answers `{"ok":true,"reboot":…}` — a `ports`-only change applies live, anything else **reboots** |
 | `/api/wifi` | POST | `{"ssid":…,"password":…,"channel":…}` | saves and **reboots** |
 | `/api/admin` | POST | `{"new_admin_user":…,"new_admin_password":…}` | saves, no reboot |
@@ -765,9 +765,9 @@ list; the main ones:
 | `leases` | List DHCP leases and the MAC → IP reservations kept in flash — see [Clients keep their address across a reboot](#clients-keep-their-address-across-a-reboot). |
 | `loglevel [none\|error\|warn\|info\|debug\|verbose]` | Show or set how much log output reaches this serial console. Raises the web log page's capture level too, if that is what's holding the output back — see [Device log](#device-log). |
 | `syslog [on\|off] [-s <ip>] [-p <port>] [-f <facility>] [-l <severity>] [-n <name>]` | Show or set the remote syslog client. No args shows the settings and counters. The collector must be on the bridge's own subnet. Takes effect immediately — no reboot. See [Sending the log to a syslog server](#sending-the-log-to-a-syslog-server). |
-| `wan [on\|off] [-s <ssid>] [-p <password>] [--ports <list>]` | Show or set the WiFi internet uplink. No args shows the state and counters. Only the listed TCP ports can be reached through it. `--ports` takes effect immediately; changing the network, password or on/off reboots. See [Internet uplink](#internet-uplink). |
+| `wan [on\|off] [-s <ssid>] [-p <password>] [--ports <list>]` | Show or set WiFi as WAN. No args shows the state and counters. Only the listed TCP ports can be reached through it. `--ports` takes effect immediately; changing the network, password or on/off reboots. See [WAN](#wan). |
 | `reboot` | Restart the device. |
-| `factory-reset yes` | Erase saved WiFi and admin credentials, the saved DHCP reservations, the remote syslog settings, and the internet uplink settings, restoring compiled-in defaults (WiFi `AOG hub`/`password`; admin `admin`/`admin`), then reboot. Clients are given fresh addresses and the device stops shipping its log anywhere. Bare `factory-reset` (no `yes`) just prints this warning and changes nothing. |
+| `factory-reset yes` | Erase saved WiFi and admin credentials, the saved DHCP reservations, the remote syslog settings, and the WAN settings, restoring compiled-in defaults (WiFi `AOG hub`/`password`; admin `admin`/`admin`), then reboot. Clients are given fresh addresses and the device stops shipping its log anywhere. Bare `factory-reset` (no `yes`) just prints this warning and changes nothing. |
 
 **Locked out of the web UI?** Connect over serial and run `factory-reset yes`. The device
 reboots with the default WiFi AP and `admin`/`admin` web login restored.
@@ -785,8 +785,8 @@ reboots with the default WiFi AP and `admin`/`admin` web login restored.
 - `main/log_buf.c` / `.h` — in-memory log ring behind `/logs`, and the serial/capture level split
 - `main/syslog.c` / `.h` — RFC 5424 sender that ships that ring to a collector over UDP
 - `main/syslog_cfg.c` / `.h` — syslog settings (NVS), including the on-subnet validation
-- `main/wan.c` / `.h` — the WiFi internet uplink: STA lifecycle, NAPT, and the packet filter
-- `main/wan_cfg.c` / `.h` — uplink settings (NVS): upstream SSID/password and the port allowlist
+- `main/wan.c` / `.h` — WiFi as WAN: STA lifecycle, NAPT, and the packet filter
+- `main/wan_cfg.c` / `.h` — WAN settings (NVS): upstream SSID/password and the port allowlist
 - `main/eth_link.c` / `.h` — Ethernet port state (link, speed, duplex, flap count)
 - `main/reset_log.c` / `.h` — why the device restarted, kept in flash across reboots
 - `main/rail_witness.c` / `.h` — PHY-register marker distinguishing a reset from a power cycle
@@ -795,19 +795,19 @@ reboots with the default WiFi AP and `admin`/`admin` web login restored.
 - `main/webpage/logs.html` — the `/logs` device log page, with the syslog settings panel
 - `main/webpage/leases.html` — the `/leases` DHCP table page
 - `main/webpage/resets.html` — the `/resets` reboot history page
-- `main/webpage/wan.html` — the `/wan` internet uplink page
+- `main/webpage/wan.html` — the `/wan` WAN page
 - `scripts/` — measurement gate, smoke tests, OTA helper (see [Diagnostics harness](#diagnostics-harness))
 - `bench/` — recorded gate runs; `00-baseline` is the reference
 
-## Internet uplink
+## WAN
 
 Off by default. Turned on, the bridge joins another WiFi network as a client and routes LAN
 traffic out through it with NAT, so an AgOpenGPS tablet can reach an NTRIP caster over
-somebody's phone hotspot. Set it from `/wan` ("Internet uplink →" in the dashboard header) or
+somebody's phone hotspot. Set it from `/wan` ("WAN" in the sidebar) or
 the `wan` console command.
 
 **It is a router, not a wider bridge.** The LAN stays `192.168.5.0/24` and is still not
-configurable. The uplink is a second, separate network reached by routing, with NAPT on the
+configurable. The WAN is a second, separate network reached by routing, with NAPT on the
 bridge netif. It has to be: a WiFi station cannot be an L2 bridge port — 802.11 station frames
 carry three addresses, so a station cannot forward on behalf of other MACs, and
 `esp_netif_br_glue` only accepts an AP netif anyway.
@@ -855,7 +855,7 @@ station's own address. The web server binds `INADDR_ANY` — `esp_http_server` h
 bind-address option — so without a filter the admin UI, and `/api/ota` with it, would be
 reachable from the upstream network.
 
-So the uplink filters ingress too. The rule is exact rather than heuristic:
+So the WAN filters ingress too. The rule is exact rather than heuristic:
 `ip_napt_new_port()` can only ever return a port inside
 `[IP_NAPT_PORT_RANGE_START, IP_NAPT_PORT_RANGE_END]` (49152–61439), so every NAT return packet
 lands on a destination port in that window and nothing else legitimately does. Inbound ICMP
@@ -863,10 +863,10 @@ echo requests are dropped too, so the device does not answer pings from the WAN 
 
 ### One radio, one channel
 
-The ESP32 has a single 2.4 GHz radio. While the uplink is connected, this bridge's own access
+The ESP32 has a single 2.4 GHz radio. While the WAN is connected, this bridge's own access
 point is **forced onto the upstream network's channel**, and every associated client is dropped
 and re-associates when that happens. The channel setting under **WiFi** still takes 1, 6 or 11
-and is still correct advice — it is simply only used when the uplink is off. The web UI says
+and is still correct advice — it is simply only used when the WAN is off. The web UI says
 which channel the radio is actually on, and the log warns when the two differ.
 
 The `wan` console command and `/api/wan` both report the real channel alongside the configured
@@ -874,7 +874,7 @@ one.
 
 ### If the upstream network uses 192.168.5.x
 
-The uplink refuses to come up, loudly, rather than half-working. Overlap is tested as a mask
+The WAN refuses to come up, loudly, rather than half-working. Overlap is tested as a mask
 intersection, not as "is the address inside `192.168.5.0/24`" — an upstream handing out a `/16`
 at `192.168.0.0` collides just as fatally. The fix is on the other end: change the upstream
 router's address range. State shows as `subnet_conflict` and the device retries every 5 minutes
@@ -882,7 +882,7 @@ in case it is fixed.
 
 ### Two things to know before relying on it
 
-- **DNS after a lease.** A client that leased an address while the uplink was down keeps
+- **DNS after a lease.** A client that leased an address while the WAN was down keeps
   `192.168.5.1` as its resolver until it renews — up to an hour. Nothing in DHCP can push a new
   option mid-lease. Reconnect the client, or wait for the renewal.
 - **UDP NAT lifetime.** lwIP expires a UDP mapping after two seconds by default, which is far
@@ -903,7 +903,7 @@ the ELF section sizes (`xtensa-esp32-elf-size build/wt32-bridge.elf`) instead.
 
 At runtime the NAPT table is a single 8 KB heap allocation (`IP_NAPT_MAX=256`, 32 bytes per
 entry), claimed on the first `esp_netif_napt_enable()` and never given back. NAPT is
-deliberately never disabled on an uplink flap: `ip_napt_enable_netif(netif, 0)` frees the
+deliberately never disabled on a WAN flap: `ip_napt_enable_netif(netif, 0)` frees the
 table, and `ip_napt_init()` guards its allocation with `assert()`, so toggling it would mean
 re-allocating 8 KB on a fragmented heap behind an abort.
 
@@ -911,10 +911,10 @@ re-allocating 8 KB on a fragmented heap behind an abort.
 destination is not a local bridge MAC straight to `bridgeif_send_to_ports()` and frees it; it
 only reaches `ip4_input()` for group addresses bound for the CPU, or a local MAC. LAN-to-LAN
 traffic — the path the throughput figures below measure — never enters the IP layer, so IP
-forwarding and NAPT add nothing to it. What *does* cost is the radio: with the uplink up, AP
+forwarding and NAPT add nothing to it. What *does* cost is the radio: with the WAN up, AP
 and station share one channel and one airtime budget.
 
-With no uplink configured, none of this is reachable. `wan_init()` returns having created no
+With no WAN configured, none of this is reachable. `wan_init()` returns having created no
 station netif, no NAPT and no hooks, and the radio stays in `WIFI_MODE_AP`.
 
 ## The ~1.4 Mbit/s downlink figure was the test peer, not the bridge

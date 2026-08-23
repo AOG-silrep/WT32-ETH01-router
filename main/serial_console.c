@@ -577,7 +577,7 @@ static void reset_what_happened(const reset_log_entry_t *e, char *out, size_t n)
     } else if (e->intent == RESET_INTENT_WIFI_SAVE) {
         strlcpy(out, "restart to apply WiFi settings", n);
     } else if (e->intent == RESET_INTENT_WAN_SAVE) {
-        strlcpy(out, "restart to apply internet uplink settings", n);
+        strlcpy(out, "restart to apply WAN settings", n);
     } else if (e->intent == RESET_INTENT_CONSOLE) {
         strlcpy(out, "console requested restart", n);
     } else if (e->intent == RESET_INTENT_FACTORY_RESET) {
@@ -931,7 +931,7 @@ static void print_wan_status(const wan_cfg_t *cfg)
     char ports[WAN_CFG_PORTS_STR_MAX];
     wan_cfg_format_ports(cfg, ports, sizeof(ports));
 
-    printf("Internet uplink: %s\n", cfg->enabled ? "on" : "off");
+    printf("WAN: %s\n", cfg->enabled ? "on" : "off");
     printf("  Upstream network: %s\n", cfg->ssid[0] ? cfg->ssid : "(not set)");
     printf("  Password:         %s\n", cfg->password[0] ? "(set)" : "(open network)");
     printf("  Allowed ports:    %s\n", ports[0] ? ports : "(none)");
@@ -939,7 +939,7 @@ static void print_wan_status(const wan_cfg_t *cfg)
 
     if (st.state == WAN_STATE_SUBNET_CONFLICT) {
         printf("  The upstream network hands out addresses on 192.168.5.x, the same range\n"
-               "  this bridge uses. Change the upstream router's range, or the uplink\n"
+               "  this bridge uses. Change the upstream router's range, or the WAN\n"
                "  cannot work.\n");
     }
     if (st.ip.addr != 0) {
@@ -1039,7 +1039,7 @@ static int cmd_wan(int argc, char **argv)
     }
 
     printf("Saved. Restarting to apply - every WiFi client will disconnect and rejoin,\n"
-           "on the upstream network's channel if the uplink comes up.\n");
+           "on the upstream network's channel if the WAN comes up.\n");
     reset_log_note_intent(RESET_INTENT_WAN_SAVE);
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
@@ -1107,7 +1107,7 @@ static int cmd_factory_reset(int argc, char **argv)
 
     // The syslog settings are erased along with the rest, deliberately: a device
     // sent away for repair or handed on should not carry on shipping its log to
-    // somebody's old collector. The uplink settings go for the stronger version
+    // somebody's old collector. The WAN settings go for the stronger version
     // of the same reason - they contain another network's WiFi password.
     esp_err_t err1 = erase_nvs_namespace("wifi_config");
     esp_err_t err2 = erase_nvs_namespace("auth_cfg");
@@ -1253,20 +1253,20 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&syslog_cmd));
 
-    wan_args.state = arg_str0(NULL, NULL, "<on|off>", "turn the internet uplink on or off");
+    wan_args.state = arg_str0(NULL, NULL, "<on|off>", "turn the WAN on or off");
     wan_args.ssid = arg_str0("s", "ssid", "<ssid>", "upstream network to join");
     wan_args.password = arg_str0("p", "password", "<pass>", "upstream password; omit for an open network");
     wan_args.ports = arg_str0(NULL, "ports", "<list>", "allowed destination ports, e.g. 2101,21116/udp");
     wan_args.end = arg_end(5);
     const esp_console_cmd_t wan_cmd = {
         .command = "wan",
-        .help = "Show or set the WiFi internet uplink, which routes LAN clients out through "
+        .help = "Show or set WiFi as WAN, which routes LAN clients out through "
                 "another WiFi network with NAT. No args shows the state and counters. Only the "
                 "listed ports can be reached through it (2101 is the usual NTRIP caster port); "
                 "everything else, in both directions, is dropped. An entry is a port number, "
                 "optionally suffixed /tcp or /udp; bare means TCP. Changing --ports takes "
                 "effect immediately; changing the network, password or on/off reboots. Note the "
-                "device has one radio: while the uplink is up, this bridge's own WiFi is forced "
+                "device has one radio: while the WAN is up, this bridge's own WiFi is forced "
                 "onto the upstream network's channel.",
         .hint = NULL,
         .func = &cmd_wan,
@@ -1286,7 +1286,7 @@ static void register_commands(void)
     factory_reset_args.end = arg_end(1);
     const esp_console_cmd_t factory_reset_cmd = {
         .command = "factory-reset",
-        .help = "Erase saved WiFi/admin config, DHCP reservations, syslog settings and internet uplink settings back to compiled-in defaults and reboot. The reboot/crash history is deliberately kept.",
+        .help = "Erase saved WiFi/admin config, DHCP reservations, syslog settings and WAN settings back to compiled-in defaults and reboot. The reboot/crash history is deliberately kept.",
         .hint = NULL,
         .func = &cmd_factory_reset,
         .argtable = &factory_reset_args,

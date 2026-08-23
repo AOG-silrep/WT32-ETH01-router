@@ -9,19 +9,19 @@
 extern "C" {
 #endif
 
-// The WiFi-STA internet uplink: a routed, NAT'd second interface, plus the
+// WiFi as WAN: a routed, NAT'd second interface, plus the
 // packet filter that decides what may cross it.
 //
 // This is deliberately NOT an extension of the bridge. A WiFi station cannot be
 // an L2 bridge port - 802.11 station frames carry three addresses, so a station
 // cannot forward on behalf of other MACs, and esp_netif_br_glue only accepts an
-// AP netif anyway. So the uplink is a separate subnet reached by routing, with
+// AP netif anyway. So the WAN is a separate subnet reached by routing, with
 // NAPT on the bridge netif, and the LAN stays 192.168.5.0/24 exactly as before.
 //
 // What that costs, and why the UI says so out loud: the ESP32 has one 2.4 GHz
 // radio. In WIFI_MODE_APSTA the SoftAP is forced onto the upstream AP's channel,
 // so every associated client is dropped and re-associates, and the configured
-// channel (1/6/11) becomes advisory while the uplink is up.
+// channel (1/6/11) becomes advisory while the WAN is up.
 //
 // What it does not cost: the L2 bridged path. bridgeif_input() forwards a
 // unicast frame whose destination is not a local bridge MAC straight to
@@ -60,7 +60,7 @@ typedef struct {
     bool           napt_on;
 } wan_status_t;
 
-// Brings up the uplink if one is configured, and does nothing at all if not.
+// Brings up the WAN if one is configured, and does nothing at all if not.
 //
 // Must be called after esp_wifi_init() and setup_bridge(), and BEFORE
 // esp_wifi_start(): it registers the WIFI_EVENT_STA_START handler that installs
@@ -72,7 +72,7 @@ esp_err_t wan_init(esp_netif_t *br_netif);
 void wan_get_status(wan_status_t *out);
 
 // The upstream resolver to hand LAN clients in DHCP option 6, in network byte
-// order, or 0 when the uplink is not up. Reads a published snapshot: it takes no
+// order, or 0 when the WAN is not up. Reads a published snapshot: it takes no
 // lock and cannot block, so the DHCP server task can call it while building a
 // reply.
 uint32_t wan_get_dns(void);
