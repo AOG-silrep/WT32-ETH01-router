@@ -60,15 +60,14 @@
      able to widen a column. */
   td.state .conflict { display: block; white-space: normal; color: #b00020; font-weight: 600; }
   tr.blocked td.ip { color: #b00020; text-decoration: line-through; }
-  /* The first horizontal scroller in this UI, and a deliberate exception to how
-     the other pages handle a table that outgrows its panel. They keep every
-     column on one line only where the column has a fixed shape, and let the one
-     variable-length column wrap - logs.html does exactly that with the message
-     column, and index.html rations nowrap for the same reason. This table
-     instead pins every cell (see the rule above), which the duplicate-address
-     clause pushed past the window; scrolling the table rather than the document
-     was chosen over relaxing that. Keep #empty and #footer outside it so the
-     explanatory text stays put while the table moves. */
+  /* Scroll the table rather than let it widen the page. logs.html takes the
+     other route - fixed-shape columns on one line, the message column left to
+     wrap - but this table pins every cell (see the rule above), which the
+     duplicate-address clause pushed past the window, so relaxing that was what
+     got given up instead. index.html's client table scrolls the same way and
+     for its own version of the same reason: ten columns, two of them monospace
+     and unbreakable. Keep #empty and #footer outside it so the explanatory text
+     stays put while the table moves. */
   .table-scroll { overflow-x: auto; }
   #empty { color: #898781; font-size: 0.9em; padding: 1em 0.5em; }
   #footer { font-size: 0.85em; color: #898781; margin-top: 0.8em; }

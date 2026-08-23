@@ -35,6 +35,12 @@
   table { width: 100%; border-collapse: collapse; margin-top: 0.8em; font-size: 0.9em; }
   th, td { text-align: left; padding: 0.4em 0.5em; border-bottom: 1px solid #ddd; }
   .panel table th { white-space: nowrap; }
+  /* Ten columns, two of them monospace with no break opportunity, and the
+     headers pinned by the rule above - the row cannot fit a phone. Scroll the
+     table inside the panel rather than let it widen the whole document, the way
+     leases.html handles its own wide table. The h2 stays outside the wrapper so
+     the heading does not slide away from the panel it names. */
+  .table-scroll { overflow-x: auto; }
   td.mac, td.ip { font-family: monospace; }
   td.ip a.ip-link { color: #2a78d6; text-decoration: none; }
   td.ip a.ip-link:hover { text-decoration: underline; }
@@ -136,6 +142,7 @@
 
 <div class="panel panel-wide">
 <h2>Connected clients</h2>
+<div class="table-scroll">
 <table>
   <thead>
     <tr><th>Name</th><th>MAC</th><th>IP</th><th>Link</th><th>Signal</th>
@@ -147,6 +154,7 @@
     <tr><td colspan="10">Loading&hellip;</td></tr>
   </tbody>
 </table>
+</div>
 </div>
 
 </div>
