@@ -48,6 +48,14 @@
             max-width: 1300px; margin: 2em auto 1em; }
   #banner.show { display: block; }
   #banner.restarting { background: #c26a00; }
+  /* Carried over from /wan with the WAN panel. No measure cap on the state
+     line here - on /wan it needed one to keep prose off a full-width column,
+     but inside a dashboard panel the panel is already the measure. */
+  #wan-state { font-size: 0.9em; color: #5c5a55; }
+  #wan-state.bad { color: #b00020; }
+  dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: 0.25em 1em; margin: 0.6em 0 0 0; font-size: 0.88em; }
+  dl.facts dt { color: #898781; }
+  dl.facts dd { margin: 0; font-family: monospace; }
   tr.selected { background: #eef4fc; }
   button.watch-btn { margin: 0; padding: 0.2em 0.6em; font-size: 0.85em; }
   .panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 1.5em; margin-top: 1.5em; }
@@ -118,6 +126,12 @@
     <tr><th title="Frames handed to the WiFi radio since boot, and how many of those it gave up on after exhausting its 802.11 retries. Those are lost on air, and no other counter can see them — nothing above the driver is told a frame failed. A rising share points at range, interference, or a client that has gone away.">Radio delivery</th><td id="wifi-tx" title="Frames handed to the WiFi radio since boot, and how many of those it gave up on after exhausting its 802.11 retries. Those are lost on air, and no other counter can see them — nothing above the driver is told a frame failed. A rising share points at range, interference, or a client that has gone away.">&hellip;</td></tr>
   </tbody>
 </table>
+</div>
+
+<div class="panel">
+<h2>WAN</h2>
+<div id="wan-state">Loading&hellip;</div>
+<dl class="facts" id="wan-facts"></dl>
 </div>
 
 <div class="panel panel-wide">
@@ -736,6 +750,67 @@ let pollTimer = null;
 // "bridge unreachable" instead of "credentials rejected" - the 401 that would
 // stop the loop never arrives in time, so the loop keeps stacking requests and
 // never recovers. One poll at a time keeps the 401 inside its timeout.
+// Live WAN state, moved here from /wan when that page became settings only.
+// This is a reading taken while diagnosing, which is what this page is for; the
+// form that sets it is not.
+function wanStateText(d) {
+  const rssi = (d.rssi ? ', signal ' + d.rssi + ' dBm' : '');
+  switch (d.state) {
+    case 'disabled':   return 'Off. Clients can reach each other, but nothing beyond this bridge.';
+    case 'connecting': return 'Connecting to ' + (d.ssid || 'the upstream network') + '…';
+    case 'up':         return 'Connected to ' + d.ssid + ' — ' + d.ip + ' via ' + d.gw + rssi + '.';
+    case 'down':       return 'WAN lost.' + (d.retry_in_s ? ' Retrying in ' + d.retry_in_s + ' s.' : '');
+    case 'no_ap':      return 'Cannot find ' + (d.ssid || 'the upstream network') + '.' + (d.retry_in_s ? ' Retrying in ' + d.retry_in_s + ' s.' : '');
+    case 'auth_failed':return 'Could not log in to ' + d.ssid + ' — check the password.';
+    case 'subnet_conflict':
+      return 'The upstream network hands out addresses on 192.168.5.x, the same range this bridge uses. Change the upstream router’s range, or the WAN cannot work.';
+    default:           return d.state;
+  }
+}
+
+function renderFacts(d) {
+  const rows = [];
+  // Nothing below the state line means anything while the WAN is off, and this
+  // panel is now always on screen - a device not using the feature would carry
+  // a grid of zeros for it. The one sentence says all there is to say.
+  if (d.state === 'disabled') {
+    document.getElementById('wan-facts').innerHTML = '';
+    return;
+  }
+  if (d.ip) {
+    rows.push(['Address', d.ip + ' / ' + d.netmask]);
+    rows.push(['Gateway', d.gw]);
+    rows.push(['DNS', d.dns || '–']);
+  }
+  if (d.channel) {
+    let ch = String(d.channel);
+    if (d.ap_channel_configured && d.channel !== d.ap_channel_configured) {
+      ch += ' (LAN page asks for ' + d.ap_channel_configured + ')';
+    }
+    rows.push(['Radio channel', ch]);
+  }
+  rows.push(['LAN', d.lan]);
+  rows.push(['NAT', d.napt ? 'enabled' : 'not enabled']);
+  // The blocked counters are what an operator needs when their software
+  // mysteriously cannot connect, so they are shown even at zero.
+  rows.push(['Out', d.tx_allowed + ' allowed, ' + d.tx_blocked + ' blocked by the port list']);
+  rows.push(['In', d.rx_allowed + ' allowed, ' + d.rx_blocked + ' blocked']);
+  rows.push(['Connects', d.connects + ' up, ' + d.disconnects + ' down (last reason ' + d.last_reason + ')']);
+
+  document.getElementById('wan-facts').innerHTML =
+    rows.map(r => '<dt>' + esc(r[0]) + '</dt><dd>' + esc(r[1]) + '</dd>').join('');
+}
+
+async function refreshWan() {
+  const res = await fetchWithTimeout('/api/wan', {}, 1500);
+  const d = await res.json();
+  const state = document.getElementById('wan-state');
+  state.textContent = wanStateText(d);
+  state.className = (d.state === 'subnet_conflict' || d.state === 'auth_failed') ? 'bad' : '';
+  renderFacts(d);
+}
+
+let wanTick = 0;
 let polling = false;
 async function poll() {
   if (polling) return;
@@ -744,6 +819,13 @@ async function poll() {
     await refreshClients();
     await refreshSystem();
     await refreshHistory();
+    // Every second cycle, not every one. This page already makes three requests
+    // a second and the bridge serves HTTP from a single worker task, so a fourth
+    // every second is a real cost; two seconds is the cadence /wan itself used
+    // for this same data, so nothing is lost by halving it.
+    if (wanTick++ % 2 === 0) {
+      await refreshWan();
+    }
     failCount = 0;
     const banner = document.getElementById('banner');
     banner.classList.remove('show', 'restarting');

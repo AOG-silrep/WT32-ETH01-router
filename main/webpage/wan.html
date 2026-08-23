@@ -52,14 +52,7 @@
      paragraphs to about 150 characters a line - roughly twice what is
      comfortable to read. ch rather than px, so the cap tracks each element's
      own font size; the fields keep the full width. */
-  .hint, .warn, #wan-state { max-width: 68ch; }
-  /* The state line is the whole reason this page refreshes on its own, so it
-     gets room rather than being tucked under the button. */
-  #wan-state { margin-top: 1em; padding-top: 0.8em; border-top: 1px solid #ddd; font-size: 0.9em; color: #5c5a55; }
-  #wan-state.bad { color: #b00020; }
-  dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: 0.25em 1em; margin: 0.6em 0 0 0; font-size: 0.88em; }
-  dl.facts dt { color: #898781; }
-  dl.facts dd { margin: 0; font-family: monospace; }
+  .hint, .warn { max-width: 68ch; }
 </style>
 </head>
 <body>
@@ -95,24 +88,17 @@
   <p class="hint">Only these ports can be reached on the internet. Everything else &mdash; including anything trying to reach this bridge <em>from</em> the internet &mdash; is blocked. An entry is a port number, optionally suffixed <code>/tcp</code> or <code>/udp</code>; a bare number means TCP. The defaults cover NTRIP (2101, 2102) and RustDesk (21115&ndash;21117, including <code>21116/udp</code>, which RustDesk does not work without).</p>
   <input type="text" id="wan-ports" placeholder="2101,2102,21115,21116,21116/udp,21117">
 
-  <p class="warn">This device has one radio. While the WAN is connected, the bridge&rsquo;s own WiFi is forced onto the upstream network&rsquo;s channel, and the channel set on the dashboard is ignored.</p>
+  <p class="warn">This device has one radio. While the WAN is connected, the bridge&rsquo;s own WiFi is forced onto the upstream network&rsquo;s channel, and the channel set on the LAN page is ignored.</p>
   <p class="warn">Saving a change to the network, password or the checkbox restarts the bridge. Every WiFi client will disconnect and rejoin. Changing only the port list takes effect immediately.</p>
 
   <button type="submit">Save</button>
   <div id="wan-msg"></div>
 </form>
-
-<div id="wan-state">Loading&hellip;</div>
-<dl class="facts" id="wan-facts"></dl>
 </div>
 
 <script>
 const AUTH_ERROR = new Error('auth');
 const SETUP_ERROR = new Error('setup');
-
-function esc(s) {
-  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
 
 async function fetchWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController();
@@ -170,47 +156,6 @@ function wanSet(id, value) {
   }
 }
 
-function wanStateText(d) {
-  const rssi = (d.rssi ? ', signal ' + d.rssi + ' dBm' : '');
-  switch (d.state) {
-    case 'disabled':   return 'Off. Clients can reach each other, but nothing beyond this bridge.';
-    case 'connecting': return 'Connecting to ' + (d.ssid || 'the upstream network') + '…';
-    case 'up':         return 'Connected to ' + d.ssid + ' — ' + d.ip + ' via ' + d.gw + rssi + '.';
-    case 'down':       return 'Uplink lost.' + (d.retry_in_s ? ' Retrying in ' + d.retry_in_s + ' s.' : '');
-    case 'no_ap':      return 'Cannot find ' + (d.ssid || 'the upstream network') + '.' + (d.retry_in_s ? ' Retrying in ' + d.retry_in_s + ' s.' : '');
-    case 'auth_failed':return 'Could not log in to ' + d.ssid + ' — check the password.';
-    case 'subnet_conflict':
-      return 'The upstream network hands out addresses on 192.168.5.x, the same range this bridge uses. Change the upstream router’s range, or the WAN cannot work.';
-    default:           return d.state;
-  }
-}
-
-function renderFacts(d) {
-  const rows = [];
-  if (d.ip) {
-    rows.push(['Address', d.ip + ' / ' + d.netmask]);
-    rows.push(['Gateway', d.gw]);
-    rows.push(['DNS', d.dns || '–']);
-  }
-  if (d.channel) {
-    let ch = String(d.channel);
-    if (d.ap_channel_configured && d.channel !== d.ap_channel_configured) {
-      ch += ' (dashboard asks for ' + d.ap_channel_configured + ')';
-    }
-    rows.push(['Radio channel', ch]);
-  }
-  rows.push(['LAN', d.lan]);
-  rows.push(['NAT', d.napt ? 'enabled' : 'not enabled']);
-  // The blocked counters are what an operator needs when their software
-  // mysteriously cannot connect, so they are shown even at zero.
-  rows.push(['Out', d.tx_allowed + ' allowed, ' + d.tx_blocked + ' blocked by the port list']);
-  rows.push(['In', d.rx_allowed + ' allowed, ' + d.rx_blocked + ' blocked']);
-  rows.push(['Connects', d.connects + ' up, ' + d.disconnects + ' down (last reason ' + d.last_reason + ')']);
-
-  document.getElementById('wan-facts').innerHTML =
-    rows.map(r => '<dt>' + esc(r[0]) + '</dt><dd>' + esc(r[1]) + '</dd>').join('');
-}
-
 async function refreshWan() {
   const res = await fetchWithTimeout('/api/wan', {}, 1500);
   const d = await res.json();
@@ -219,11 +164,6 @@ async function refreshWan() {
   wanSet('wan-ssid', d.ssid);
   wanSet('wan-ports', d.ports);
   wanLoaded = true;
-
-  const state = document.getElementById('wan-state');
-  state.textContent = wanStateText(d);
-  state.className = (d.state === 'subnet_conflict' || d.state === 'auth_failed') ? 'bad' : '';
-  renderFacts(d);
 }
 
 document.getElementById('wan-form').addEventListener('submit', async (e) => {
@@ -260,14 +200,19 @@ document.getElementById('wan-form').addEventListener('submit', async (e) => {
     // list it was given ("2101" comes back "2101/tcp") - without this the form
     // would sit on the raw text forever and never show what was really stored.
     wanDirty.clear();
+    // Both branches end on the dashboard, because that is where the WAN's live
+    // state moved to - and the state line is how you find out whether what you
+    // just saved actually worked.
     if (data.reboot) {
       const banner = document.getElementById('banner');
       banner.textContent = 'Saved — the bridge is restarting to apply the WAN…';
       banner.classList.add('show', 'restarting');
-      setTimeout(() => location.reload(), 4000);
+      setTimeout(() => { location.href = '/'; }, 4000);
     } else {
       msg.textContent = 'Saved — in effect now.';
       msg.className = '';
+      // A beat, so the confirmation registers before the page changes under it.
+      setTimeout(() => { location.href = '/'; }, 800);
     }
   } catch (e) {
     msg.textContent = 'Could not reach the bridge';
@@ -301,9 +246,10 @@ async function poll() {
 }
 
 poll();
-// Two seconds rather than one: an association takes seconds to change, and this
-// page has no table to keep live.
-setInterval(poll, 2000);
+// Five seconds. All this poll does now is keep the form in step with a change
+// made from the console - the live state it used to drive at two seconds moved
+// to the dashboard panel.
+setInterval(poll, 5000);
 </script>
 
 </div>

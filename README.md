@@ -277,8 +277,8 @@ deauthentication frames; WPA2 encryption of data is unaffected.
 
 ## Web UI
 
-Browse to the device (`192.168.5.1` by default) for live system stats, with the settings
-pages a click away in the sidebar:
+Browse to the device (`192.168.5.1` by default) for live system stats — including the WAN's
+connection state and counters — with the settings pages a click away in the sidebar:
 
 ![The web UI: WiFi settings and system stats](docs/web-ui.png)
 
@@ -290,12 +290,15 @@ between bytes/s and packets/s:
 
 ### WAN page
 
-"WAN" in the sidebar opens `/wan`, which owns the upstream network, the port
-allowlist, and the WAN's live state. It is a page rather than a dashboard panel because
-almost everything on it is either set once and left alone or read while diagnosing — neither
-of which wants to share a refresh cycle with the client table. The page polls `/api/wan` every
-two seconds. The channel selector on [`/lan`](#lan-page) reads it too, so the note there can
-say what the radio is really doing.
+"WAN" in the sidebar opens `/wan`, which owns the upstream network and the port allowlist.
+It is settings only: the connection state and the counters are a panel on the dashboard,
+because they are read while diagnosing rather than while configuring. Saving here therefore
+lands you on the dashboard, which is where the answer to "did that work?" now lives.
+
+The page polls `/api/wan` every five seconds, only to keep its own form in step with a change
+made from the console. The dashboard polls the same endpoint every two seconds for the panel,
+and the channel selector on [`/lan`](#lan-page) reads it every five for its lock note — one
+endpoint, three readers, each at the cadence its own job needs.
 
 See [WAN](#wan) for what it does and what it costs.
 
