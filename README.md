@@ -280,7 +280,7 @@ deauthentication frames; WPA2 encryption of data is unaffected.
 Browse to the device (`192.168.5.1` by default) for live system stats — including the WAN's
 connection state and counters — with the settings pages a click away in the sidebar:
 
-![The web UI: WiFi settings and system stats](docs/web-ui.png)
+![The web UI: system stats, diagnostics and WAN state](docs/web-ui.png)
 
 Further down the same page, every connected client (WiFi and Ethernet) is listed with its
 live throughput. "Graph" plots that client's traffic over the last 30 seconds, switchable
