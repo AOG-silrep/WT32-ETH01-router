@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgOpen router &ndash; Port Whitelist</title>
+<style>
+  body { font-family: sans-serif; color: #222; }
+  /* The page list, on every page. Sticky so it stays put while a long table
+     scrolls past it. flex-basis rather than a width, so the content column
+     takes whatever is left over and nothing has to add up to 100%. */
+  .layout { display: flex; align-items: flex-start; gap: 1.5em; max-width: 1300px; margin: 2em auto; padding: 0 1em; }
+  .sidenav { flex: 0 0 11em; box-sizing: border-box; position: sticky; top: 2em; font-size: 0.9em;
+             border-right: 1px solid #ddd; padding-right: 1em; }
+  .sidenav a { display: block; padding: 0.35em 0.5em; color: #2a78d6; text-decoration: none; border-radius: 3px; }
+  .sidenav a:hover { background: #eef4fc; }
+  /* The current page stays in the list so the list keeps its shape, but it is
+     a label rather than a destination - hence text colour, not link colour. */
+  .sidenav a.here { color: #222; font-weight: 600; background: #f0efec; }
+  /* Without min-width a wide table inside a flex item refuses to shrink and
+     shoves the sidebar off-screen rather than scrolling itself. */
+  .content { flex: 1 1 auto; min-width: 0; }
+  /* Under 700px the sidebar's ~200px is a big bite out of a phone held
+     portrait, and a nav that widens the page is the mistake f1645fa fixed on
+     the dashboard. Lay it out as a strip above the content instead. */
+  @media (max-width: 700px) {
+    .layout { display: block; }
+    .sidenav { position: static; border-right: 0; border-bottom: 1px solid #ddd;
+               padding: 0 0 0.5em 0; margin-bottom: 1em; }
+    .sidenav a { display: inline-block; }
+  }
+  h1 { font-size: 1.3em; }
+  /* Outside .layout, so it spans the nav as well as the content - but it is
+     a rounded box, not a full-bleed strip, so it still has to sit in the
+     same column they do rather than run to the window edge. */
+  #banner { display: none; background: #b00020; color: #fff; padding: 0.6em 1em; border-radius: 4px;
+            max-width: 1300px; margin: 2em auto 1em; }
+  #banner.show { display: block; }
+  #banner.restarting { background: #8a6d1f; }
+  .panel { border: 2px solid #888; border-radius: 4px; padding: 0.8em; margin-top: 1em; }
+  .panel h2 { margin-top: 0; font-size: 1.05em; }
+  label { display: block; margin-top: 0.8em; font-size: 0.9em; }
+  input { width: 100%; box-sizing: border-box; padding: 0.4em; margin-top: 0.2em; font-size: 1em; }
+  button { margin-top: 1em; padding: 0.5em 1.2em; font-size: 1em; }
+  #ports-msg { margin-top: 0.6em; font-size: 0.9em; }
+  #ports-msg.error { color: #b00020; }
+  .hint { margin: -0.3em 0 0.4em 0; font-size: 0.88em; color: #5c5a55; }
+  .warn { margin: 0.2em 0 0.6em 0; font-size: 0.88em; color: #8a6d1f; }
+  /* Give the prose a measure. This page fills the same ~1070px column as the
+     table pages, which suits the fields and the facts grid but runs these
+     paragraphs to about 150 characters a line - roughly twice what is
+     comfortable to read. ch rather than px, so the cap tracks each element's
+     own font size; the fields keep the full width. */
+  .hint, .warn { max-width: 68ch; }
+</style>
+</head>
+<body>
+
+<div id="banner"></div>
+
+<div class="layout">
+<nav class="sidenav" id="sidenav">
+<a href="/">Dashboard</a>
+<a href="/wan">WAN</a>
+<a href="/ports" class="here">Port Whitelist</a>
+<a href="/lan">LAN</a>
+<a href="/leases">DHCP leases</a>
+<a href="/logs">Device log</a>
+<a href="/resets">Reboot history</a>
+<a href="/admin">Admin</a>
+</nav>
+<div class="content">
+
+<h1>Port Whitelist</h1>
+
+<div class="panel">
+<h2>Ports a LAN client may reach</h2>
+<form id="ports-form">
+  <label for="ports-list">Allowed ports</label>
+  <p class="hint">Only these ports can be reached on the internet. Everything else &mdash; including anything trying to reach this bridge <em>from</em> the internet &mdash; is blocked. An entry is a port number, optionally suffixed <code>/tcp</code> or <code>/udp</code>; a bare number means TCP. The defaults cover NTRIP (2101, 2102) and RustDesk (21115&ndash;21117, including <code>21116/udp</code>, which RustDesk does not work without).</p>
+  <p class="hint">Two things are always allowed and do not belong on this list: DNS, to the resolver the upstream network hands out, and NTP (<code>123/udp</code>) to any server. NTP is open for devices on the LAN as well as for the bridge itself &mdash; a tablet with the wrong clock fails TLS and NTRIP authentication, and this bridge is its only way out. Adding <code>123/udp</code> here would change nothing and would spend one of your twelve rules.</p>
+  <input type="text" id="ports-list" placeholder="2101,2102,21115,21116,21116/udp,21117">
+
+  <p class="warn">Saving takes effect immediately &mdash; this list is the one WAN setting that does not restart the bridge. The list has no effect at all while the WAN is switched off, since nothing is being routed out.</p>
+
+  <button type="submit">Save</button>
+  <div id="ports-msg"></div>
+</form>
+</div>
+
+<script>
+const AUTH_ERROR = new Error('auth');
+const SETUP_ERROR = new Error('setup');
+
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    if (res.status === 401) throw AUTH_ERROR;
+    if (res.status === 403) throw SETUP_ERROR;
+    return res;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// The same two guards /wan keeps for its own fields, and for the same reasons.
+// loaded stops a submit before the first load, which would save an empty list
+// over a real one. dirty stops the poll below writing the device's copy over an
+// edit that has not been saved yet - tracked on edit rather than on focus,
+// because focus is released by clicking the hint text or dismissing a phone
+// keyboard, and the next poll then took back what had just been typed.
+let loaded = false;
+let dirty = false;
+
+const field = document.getElementById('ports-list');
+field.addEventListener('input', () => { dirty = true; });
+
+async function refreshPorts() {
+  const res = await fetchWithTimeout('/api/wan', {}, 1500);
+  const d = await res.json();
+  if (!dirty) field.value = d.ports;
+  loaded = true;
+}
+
+document.getElementById('ports-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = document.getElementById('ports-msg');
+  msg.textContent = '';
+  msg.className = '';
+  if (!loaded) {
+    msg.textContent = 'Still loading the current list \u2014 try again in a moment';
+    msg.className = 'error';
+    return;
+  }
+  try {
+    // Ports alone. /api/wan keeps every field the request omits, so this cannot
+    // disturb the SSID or the password, and a ports-only change is the one the
+    // device applies without restarting.
+    const res = await fetch('/api/wan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ports: field.value })
+    });
+    if (!res.ok) {
+      msg.textContent = await res.text();
+      msg.className = 'error';
+      return;
+    }
+    await res.json();
+    // Clean again, so the poll resumes tracking the device. That matters more
+    // here than anywhere: the device normalises what it stored ("2101" comes
+    // back "2101/tcp"), and without this the field would sit on the raw text
+    // and never show what is actually in force.
+    dirty = false;
+    msg.textContent = 'Saved \u2014 in effect now.';
+    // Staying on the page rather than bouncing to the dashboard the way /wan
+    // does. Nothing restarts, there is no live state to go and check, and the
+    // next poll rewrites the field with the normalised list - which is the
+    // confirmation worth having.
+    refreshPorts();
+  } catch (e) {
+    msg.textContent = 'Could not reach the bridge';
+    msg.className = 'error';
+  }
+});
+
+// One poll at a time, for the reason the dashboard records: the bridge serves
+// HTTP from a single worker task and delays a second before answering a failed
+// auth, so overlapping polls queue and time out in a way that reads as
+// "unreachable" rather than "credentials rejected".
+let polling = false;
+async function poll() {
+  if (polling) return;
+  polling = true;
+  try {
+    await refreshPorts();
+    document.getElementById('banner').classList.remove('show');
+  } catch (e) {
+    if (e === AUTH_ERROR || e === SETUP_ERROR) {
+      location.reload();
+      return;
+    }
+    const banner = document.getElementById('banner');
+    banner.textContent = 'Cannot reach the bridge';
+    banner.classList.add('show');
+  } finally {
+    polling = false;
+  }
+}
+
+poll();
+// Five seconds, matching /wan. All this keeps in step with is a change made
+// from the serial console; nothing here moves on its own.
+setInterval(poll, 5000);
+</script>
+
+</div>
+</div>
+
+</body>
+</html>

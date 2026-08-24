@@ -569,8 +569,8 @@ static void log_refused(const wan_frame_t *f)
                      IP2STR(&dst), more);
             return;
         }
-        ESP_LOGW(TAG, "port list refused %s to " IPSTR ":%u - add \"%u%s\" on the WAN page "
-                      "if that is wanted%s",
+        ESP_LOGW(TAG, "port list refused %s to " IPSTR ":%u - add \"%u%s\" on the Port "
+                      "Whitelist page if that is wanted%s",
                  proto == IP_PROTO_UDP ? "UDP" : "TCP", IP2STR(&dst), (unsigned)dport,
                  (unsigned)dport, proto == IP_PROTO_UDP ? "/udp" : "", more);
         return;

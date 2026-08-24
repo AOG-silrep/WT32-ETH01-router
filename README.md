@@ -299,10 +299,16 @@ between bytes/s and packets/s:
 
 ### WAN page
 
-"WAN" in the sidebar opens `/wan`, which owns the upstream network and the port allowlist.
-It is settings only: the connection state and the counters are a panel on the dashboard,
-because they are read while diagnosing rather than while configuring. Saving here therefore
-lands you on the dashboard, which is where the answer to "did that work?" now lives.
+"WAN" in the sidebar opens `/wan`, which owns the upstream network: the on/off switch, the
+SSID and the password. It is settings only: the connection state and the counters are a panel
+on the dashboard, because they are read while diagnosing rather than while configuring. Saving
+here therefore lands you on the dashboard, which is where the answer to "did that work?" now
+lives.
+
+The port allowlist is not here. It is on [`/ports`](#port-whitelist-page), because every field
+that remains on this page restarts the bridge when it changes and the port list does not —
+which meant every port edit used to carry a warning about clients disconnecting that did not
+apply to it.
 
 The page polls `/api/wan` every five seconds, only to keep its own form in step with a change
 made from the console. The dashboard polls the same endpoint every two seconds for the panel,
@@ -310,6 +316,18 @@ and the channel selector on [`/lan`](#lan-page) reads it every five for its lock
 endpoint, three readers, each at the cadence its own job needs.
 
 See [WAN](#wan) for what it does and what it costs.
+
+### Port Whitelist page
+
+"Port Whitelist" in the sidebar opens `/ports`, which owns the destination-port allowlist and
+nothing else. It posts `{"ports":…}` to `/api/wan`, which keeps every field the request omits,
+so saving here cannot disturb the SSID or the password.
+
+Saving does not restart anything, so unlike `/wan` the page stays where it is. Its poll then
+rewrites the field with what the device actually stored — the list is normalised on the way in,
+so `2101` comes back `2101/tcp`, and seeing that is the confirmation worth having.
+
+See [Only the listed ports get out](#only-the-listed-ports-get-out) for what the list means.
 
 ### LAN page
 
@@ -546,7 +564,7 @@ Every route returns JSON except `/api/logs/download`, which returns `text/plain`
 
 | Route | Method | Body / query | Returns |
 | --- | --- | --- | --- |
-| `/` `/admin` `/wan` `/logs` `/leases` `/resets` | GET | — | the six HTML pages |
+| `/` `/admin` `/wan` `/ports` `/lan` `/logs` `/leases` `/resets` | GET | — | the eight HTML pages |
 | `/api/status` | GET | — | `{ssid, channel}` |
 | `/api/system` | GET | — | see the table below |
 | `/api/clients` | GET | — | array, one object per client |
@@ -836,7 +854,8 @@ reboots with the default WiFi AP and `admin`/`admin` web login restored.
 - `main/webpage/logs.html` — the `/logs` device log page, with the syslog settings panel
 - `main/webpage/leases.html` — the `/leases` DHCP table page
 - `main/webpage/resets.html` — the `/resets` reboot history page
-- `main/webpage/wan.html` — the `/wan` WAN page
+- `main/webpage/wan.html` — the `/wan` WAN page: the uplink's on/off, SSID and password
+- `main/webpage/ports.html` — the `/ports` Port Whitelist page
 - `main/webpage/lan.html` — the `/lan` page: the access point's SSID, password and channel
 - `scripts/` — measurement gate, smoke tests, OTA helper (see [Diagnostics harness](#diagnostics-harness))
 - `bench/` — recorded gate runs; `00-baseline` is the reference

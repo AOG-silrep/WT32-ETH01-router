@@ -40,6 +40,8 @@ extern const uint8_t leases_html_end[] asm("_binary_leases_html_end");
 extern const uint8_t resets_html_start[] asm("_binary_resets_html_start");
 extern const uint8_t resets_html_end[] asm("_binary_resets_html_end");
 extern const uint8_t wan_html_start[] asm("_binary_wan_html_start");
+extern const uint8_t ports_html_start[] asm("_binary_ports_html_start");
+extern const uint8_t ports_html_end[] asm("_binary_ports_html_end");
 extern const uint8_t wan_html_end[] asm("_binary_wan_html_end");
 extern const uint8_t lan_html_start[] asm("_binary_lan_html_start");
 extern const uint8_t lan_html_end[] asm("_binary_lan_html_end");
@@ -1693,6 +1695,28 @@ static esp_err_t wan_page_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// The port list used to be a field on /wan. It is its own page because it is
+// the one WAN setting that applies without a restart, and mixing it in with
+// three fields that all reboot the bridge meant every port edit carried a
+// warning about clients disconnecting that did not apply to it.
+static esp_err_t ports_page_get_handler(httpd_req_t *req)
+{
+    if (!check_admin_auth(req)) {
+        send_auth_error(req);
+        return ESP_OK;
+    }
+    if (auth_cfg_password_is_default()) {
+        send_default_creds_redirect(req);
+        return ESP_OK;
+    }
+
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, (const char *)ports_html_start,
+                     ports_html_end - ports_html_start - 1);
+    return ESP_OK;
+}
+
 static esp_err_t lan_page_get_handler(httpd_req_t *req)
 {
     if (!check_admin_auth(req)) {
@@ -2662,7 +2686,11 @@ httpd_handle_t web_server_start(void)
     //
     // 28 rather than 24: the two /api/wan routes take the count to 22, which is
     // again not the headroom this comment asks for.
-    config.max_uri_handlers = 28;
+    //
+    // 32 rather than 28: /api/time and /ports took the count to 28, which is the
+    // cap exactly - the state this comment exists to prevent, where the next
+    // route added is the one that silently does not register.
+    config.max_uri_handlers = 32;
 
     // Without this the server stops listening the moment every session slot is
     // taken: httpd_server() only adds listen_fd to the select set when a slot is
@@ -2725,6 +2753,7 @@ httpd_handle_t web_server_start(void)
     const httpd_uri_t syslog_post_uri = {.uri = "/api/syslog", .method = HTTP_POST, .handler = syslog_post_handler};
     const httpd_uri_t wan_page_uri = {.uri = "/wan", .method = HTTP_GET, .handler = wan_page_get_handler};
     const httpd_uri_t lan_page_uri = {.uri = "/lan", .method = HTTP_GET, .handler = lan_page_get_handler};
+    const httpd_uri_t ports_page_uri = {.uri = "/ports", .method = HTTP_GET, .handler = ports_page_get_handler};
     const httpd_uri_t wan_get_uri = {.uri = "/api/wan", .method = HTTP_GET, .handler = wan_get_handler};
     const httpd_uri_t wan_post_uri = {.uri = "/api/wan", .method = HTTP_POST, .handler = wan_post_handler};
 
@@ -2752,6 +2781,7 @@ httpd_handle_t web_server_start(void)
     httpd_register_uri_handler(server, &syslog_post_uri);
     httpd_register_uri_handler(server, &wan_page_uri);
     httpd_register_uri_handler(server, &lan_page_uri);
+    httpd_register_uri_handler(server, &ports_page_uri);
     httpd_register_uri_handler(server, &wan_get_uri);
     httpd_register_uri_handler(server, &wan_post_uri);
     httpd_register_uri_handler(server, &time_get_uri);

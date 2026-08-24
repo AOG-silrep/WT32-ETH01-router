@@ -1443,7 +1443,8 @@ static void register_commands(void)
         .command = "wan",
         .help = "Show or set WiFi as WAN, which routes LAN clients out through "
                 "another WiFi network with NAT. No args shows the state and counters. Only the "
-                "listed ports can be reached through it (2101 is the usual NTRIP caster port); "
+                "listed ports can be reached through it (2101 is the usual NTRIP caster port; "
+                "the web UI keeps that list on its own Port Whitelist page); "
                 "everything else, in both directions, is dropped, except DNS to the resolver the "
                 "upstream network hands out and NTP on 123/udp, which are always allowed and do "
                 "not belong on the list. An entry is a port number, "

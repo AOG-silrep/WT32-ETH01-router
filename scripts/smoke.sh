@@ -43,7 +43,7 @@ code() { curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$@"; }
 echo "smoke: ${HOST} as ${USER}"
 
 # --- pages ------------------------------------------------------------------
-for path in / /admin /wan /lan /logs /leases /resets; do
+for path in / /admin /wan /ports /lan /logs /leases /resets; do
   check "GET ${path}" 200 "$(code "${AUTH[@]}" "http://${HOST}${path}")"
 done
 

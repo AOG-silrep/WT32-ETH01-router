@@ -63,6 +63,7 @@
 <nav class="sidenav" id="sidenav">
 <a href="/">Dashboard</a>
 <a href="/wan" class="here">WAN</a>
+<a href="/ports">Port Whitelist</a>
 <a href="/lan">LAN</a>
 <a href="/leases">DHCP leases</a>
 <a href="/logs">Device log</a>
@@ -84,13 +85,10 @@
   <label for="wan-password">Upstream password (leave blank to keep the current one)</label>
   <input type="password" id="wan-password" maxlength="63" autocomplete="new-password">
 
-  <label for="wan-ports">Allowed ports</label>
-  <p class="hint">Only these ports can be reached on the internet. Everything else &mdash; including anything trying to reach this bridge <em>from</em> the internet &mdash; is blocked. An entry is a port number, optionally suffixed <code>/tcp</code> or <code>/udp</code>; a bare number means TCP. The defaults cover NTRIP (2101, 2102) and RustDesk (21115&ndash;21117, including <code>21116/udp</code>, which RustDesk does not work without).</p>
-  <p class="hint">Two things are always allowed and do not belong on this list: DNS, to the resolver the upstream network hands out, and NTP (<code>123/udp</code>) to any server. NTP is open for devices on the LAN as well as for the bridge itself &mdash; a tablet with the wrong clock fails TLS and NTRIP authentication, and this bridge is its only way out. Adding <code>123/udp</code> here would change nothing and would spend one of your twelve rules.</p>
-  <input type="text" id="wan-ports" placeholder="2101,2102,21115,21116,21116/udp,21117">
+  <p class="hint">Which ports a client may reach through this uplink is on the <a href="/ports">Port Whitelist</a> page. It is set separately because it is the one WAN setting that takes effect without restarting the bridge.</p>
 
   <p class="warn">This device has one radio. While the WAN is connected, the bridge&rsquo;s own WiFi is forced onto the upstream network&rsquo;s channel, and the channel set on the LAN page is ignored.</p>
-  <p class="warn">Saving a change to the network, password or the checkbox restarts the bridge. Every WiFi client will disconnect and rejoin. Changing only the port list takes effect immediately.</p>
+  <p class="warn">Saving a change to the network, password or the checkbox restarts the bridge. Every WiFi client will disconnect and rejoin.</p>
 
   <button type="submit">Save</button>
   <div id="wan-msg"></div>
@@ -163,7 +161,6 @@ async function refreshWan() {
 
   wanSet('wan-enabled', !!d.enabled);
   wanSet('wan-ssid', d.ssid);
-  wanSet('wan-ports', d.ports);
   wanLoaded = true;
 }
 
@@ -180,8 +177,7 @@ document.getElementById('wan-form').addEventListener('submit', async (e) => {
   const payload = {
     enabled: document.getElementById('wan-enabled').checked ? 1 : 0,
     ssid: document.getElementById('wan-ssid').value,
-    password: document.getElementById('wan-password').value,
-    ports: document.getElementById('wan-ports').value
+    password: document.getElementById('wan-password').value
   };
   try {
     const res = await fetch('/api/wan', {
@@ -196,10 +192,10 @@ document.getElementById('wan-form').addEventListener('submit', async (e) => {
     }
     const data = await res.json();
     document.getElementById('wan-password').value = '';
-    // Clean again, so the poll resumes tracking the device. The ports-only
-    // branch below leaves this page in place, and the device normalises the
-    // list it was given ("2101" comes back "2101/tcp") - without this the form
-    // would sit on the raw text forever and never show what was really stored.
+    // Clean again, so the poll resumes tracking the device. Every field this
+    // form still sends reboots the bridge when it changes, so in practice the
+    // page is about to be replaced - but a Save that changed nothing does not
+    // reboot, and without this the form would sit on its own text from then on.
     wanDirty.clear();
     // Both branches end on the dashboard, because that is where the WAN's live
     // state moved to - and the state line is how you find out whether what you
