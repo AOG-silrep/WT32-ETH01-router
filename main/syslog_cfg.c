@@ -207,8 +207,15 @@ bool syslog_cfg_validate(const syslog_cfg_t *cfg, uint32_t subnet_ip,
     // list can now express, since RustDesk needed one, so the remaining reasons
     // are the two above rather than "it cannot be written down".
     if ((cfg->server_ip & subnet_mask) != (subnet_ip & subnet_mask)) {
-        *err_msg = "The collector must be on this bridge's own 192.168.5.0/24 network - "
-                   "the bridge has no gateway and cannot reach anything off it";
+        // Under 104 characters, and worth re-measuring if it is ever reworded.
+        // esp_http_server logs what it sends and log_buf.c keeps 144 bytes a
+        // line, but the budget is not 144: the ring takes the tag as the text up
+        // to the first colon, which here is "httpd_txrx", so httpd's own
+        // "httpd_resp_send_err: 400 Bad Request - " stays inside the message and
+        // spends 39 of them. This message has twice been shortened to a figure
+        // that turned out still to be over.
+        *err_msg = "The collector must be on the bridge's 192.168.5.0/24 network - "
+                   "it has no gateway to anywhere else";
         return false;
     }
     if (cfg->server_ip == subnet_ip) {
