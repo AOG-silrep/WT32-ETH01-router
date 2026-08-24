@@ -865,6 +865,11 @@ bool wan_is_up(void)
     return s_status.state == WAN_STATE_UP;
 }
 
+bool wan_is_enabled(void)
+{
+    return s_status.state != WAN_STATE_DISABLED;
+}
+
 void wan_ports_changed(void)
 {
     const wan_rules_t *r = s_active;

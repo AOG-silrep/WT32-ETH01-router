@@ -48,6 +48,33 @@ static const char *TAG = "dhcp_server";
 // CONFIG_LWIP_DHCPS_LEASE_UNIT 60), so clients see no change in renew timing.
 #define LEASE_TIME_S 7200
 
+// ...except while a configured uplink has not yet learnt a resolver, when the
+// lease is this instead. See the DNS option in put_offer_options() for what
+// goes wrong without it: the client is handed this bridge's own address as its
+// resolver, nothing here answers on port 53, and it keeps that dead answer
+// until it next renews - which at 7200s is an hour of a LAN that can ping an
+// address and resolve nothing.
+//
+// A client renews at T1, half the lease, so 120 brings it back within a minute
+// of the WAN finding DNS. What that costs is a renewal per client per minute,
+// and this file already establishes that a renewal is close to free: it never
+// marks the table dirty (see s_dirty) so it writes no flash, and its log line
+// is inside an "if (moved)" so a client keeping its address prints nothing.
+#define LEASE_TIME_NO_DNS_S 120
+
+// Which of the two to offer right now.
+//
+// Both halves of the test matter. Without wan_is_enabled(), a device with no
+// uplink configured - the common deployment, and the one WAN_STATE_DISABLED is
+// commented to leave behaving "as it always did" - would shorten every lease
+// forever waiting for a resolver that is never coming. Without the DNS test,
+// there would be nothing to shorten it for.
+static uint32_t lease_time_s(void)
+{
+    return (wan_is_enabled() && wan_get_dns() == 0) ? LEASE_TIME_NO_DNS_S
+                                                    : LEASE_TIME_S;
+}
+
 // How long an address is held between the OFFER and the REQUEST that confirms
 // it, so two clients discovering at the same time can't be offered the same
 // address. Short, because a client that never comes back for it shouldn't tie
@@ -966,14 +993,18 @@ static uint8_t *put_opt_ip(uint8_t *p, uint8_t code, uint32_t net_ip)
 // The same option set ESP-IDF's server sent, so nothing downstream of the
 // bridge sees a different network than it did before. IDF's option 43 vendor
 // blob is ESP-specific and is not reproduced.
-static uint8_t *put_offer_options(uint8_t *p, bool include_lease_time)
+// lease_s is the lease to advertise, or 0 to omit the option entirely - which
+// is what a NAK and a DHCPINFORM ACK want. Passed in rather than read from
+// lease_time_s() here, so that one transaction advertises and records the same
+// figure even if the WAN changes state between the two.
+static uint8_t *put_offer_options(uint8_t *p, uint32_t lease_s)
 {
     p = put_opt_ip(p, OPT_SUBNET_MASK, s_netmask);
 
-    if (include_lease_time) {
+    if (lease_s != 0) {
         *p++ = OPT_LEASE_TIME;
         *p++ = 4;
-        uint32_t t = lwip_htonl(LEASE_TIME_S);
+        uint32_t t = lwip_htonl(lease_s);
         memcpy(p, &t, 4);
         p += 4;
     }
@@ -989,12 +1020,17 @@ static uint8_t *put_offer_options(uint8_t *p, bool include_lease_time)
     // uplink, exactly as before. wan_get_dns() reads a published snapshot: it
     // takes no lock and cannot block this task.
     //
-    // Known limitation, and there is no DHCP mechanism that fixes it: a client
-    // that leased while the uplink was down keeps 192.168.5.1 as its resolver
-    // until it renews, up to LEASE_TIME_S/2 later. Nothing can push a new option
-    // to a client mid-lease. The alternative - running a resolver of our own on
-    // 192.168.5.1 and never changing this option - would cost a nineteenth lwIP
-    // socket, and README.md's socket budget shows all eighteen are spoken for.
+    // Nothing can push a new option to a client mid-lease, so a client that
+    // leased while the uplink was down keeps 192.168.5.1 - an address on which
+    // this device answers no DNS at all - until it next renews. What the lease
+    // length decides is when that renewal comes, and that is ours to set: see
+    // LEASE_TIME_NO_DNS_S, which bounds the wait at about a minute instead of
+    // the hour LEASE_TIME_S/2 would make it.
+    //
+    // It bounds rather than eliminates, and the thing that would eliminate it -
+    // running a resolver of our own on 192.168.5.1 so this option never has to
+    // change - would cost a nineteenth lwIP socket, and README.md's socket
+    // budget shows all eighteen are spoken for.
     uint32_t wan_dns = wan_get_dns();
     p = put_opt_ip(p, OPT_DNS_SERVER, wan_dns != 0 ? wan_dns : s_server_ip);
     p = put_opt_ip(p, OPT_BROADCAST, (s_server_ip & s_netmask) | ~s_netmask);
@@ -1030,7 +1066,7 @@ static void copy_hostname(const uint8_t *val, uint8_t len, char *out, size_t out
 
 // ---- sending ----
 
-static void send_reply(const dhcp_msg_t *req, uint8_t type, uint32_t yiaddr, bool with_lease)
+static void send_reply(const dhcp_msg_t *req, uint8_t type, uint32_t yiaddr, uint32_t lease_s)
 {
     dhcp_msg_t rep;
     memset(&rep, 0, sizeof(rep));
@@ -1059,7 +1095,7 @@ static void send_reply(const dhcp_msg_t *req, uint8_t type, uint32_t yiaddr, boo
         // describe, and RFC 2131 forbids the rest.
         p = put_opt_ip(p, OPT_SERVER_ID, s_server_ip);
     } else {
-        p = put_offer_options(p, with_lease);
+        p = put_offer_options(p, lease_s);
     }
     *p++ = OPT_END;
 
@@ -1180,7 +1216,7 @@ static void handle_message(dhcp_msg_t *m, size_t len)
                      mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
             return;
         }
-        send_reply(m, DHCPOFFER, ip, true);
+        send_reply(m, DHCPOFFER, ip, lease_time_s());
         break;
     }
 
@@ -1198,6 +1234,11 @@ static void handle_message(dhcp_msg_t *m, size_t len)
         }
 
         bool wired = client_track_mac_on_wired_port(mac);
+        // Read once, before the lock, and used both for the entry below and for
+        // the ACK further down. Reading it twice would let a WAN that came up in
+        // between record one lease and advertise another, leaving this table
+        // expiring out of step with what the client believes it holds.
+        uint32_t lease_s = lease_time_s();
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         uint32_t ip = select_address_locked(mac, requested, wired);
         bool ok = (ip != 0) && (requested == 0 || requested == ip);
@@ -1207,7 +1248,7 @@ static void handle_message(dhcp_msg_t *m, size_t len)
         if (ok) {
             lease_t *before = find_by_mac_locked(mac);
             moved = (before == NULL || before->ip != ip);
-            commit_lease_locked(mac, ip, LEASE_TIME_S, true);
+            commit_lease_locked(mac, ip, lease_s, true);
         }
         xSemaphoreGive(s_mutex);
 
@@ -1215,7 +1256,8 @@ static void handle_message(dhcp_msg_t *m, size_t len)
             // Which port a client was served from is otherwise invisible, and it
             // is the one thing worth knowing when an address is not what somebody
             // expected. Only on the ACK, and only when the address changed: a
-            // renewal every couple of hours per client says nothing.
+            // renewal says nothing, and there can be one a minute per client
+            // while LEASE_TIME_NO_DNS_S is in force.
             esp_ip4_addr_t pretty = { .addr = ip };
             char ip_str[16];
             esp_ip4addr_ntoa(&pretty, ip_str, sizeof(ip_str));
@@ -1228,10 +1270,10 @@ static void handle_message(dhcp_msg_t *m, size_t len)
             // The client is asking for an address this server will not give
             // it. NAK sends it back to DISCOVER, where it gets the address
             // that is actually reserved for it.
-            send_reply(m, DHCPNAK, 0, false);
+            send_reply(m, DHCPNAK, 0, 0);
             return;
         }
-        send_reply(m, DHCPACK, ip, true);
+        send_reply(m, DHCPACK, ip, lease_s);
         post_assigned_event(mac, ip, hostname);
         break;
     }
@@ -1287,7 +1329,7 @@ static void handle_message(dhcp_msg_t *m, size_t len)
         // The client configured itself and only wants the options. No address
         // and no lease time, per RFC 2131.
         if (m->ciaddr != 0) {
-            send_reply(m, DHCPACK, 0, false);
+            send_reply(m, DHCPACK, 0, 0);
         }
         break;
 

@@ -957,8 +957,13 @@ in case it is fixed.
 ### Two things to know before relying on it
 
 - **DNS after a lease.** A client that leased an address while the WAN was down keeps
-  `192.168.5.1` as its resolver until it renews — up to an hour. Nothing in DHCP can push a new
-  option mid-lease. Reconnect the client, or wait for the renewal.
+  `192.168.5.1` as its resolver — an address on which this device answers no DNS — until it
+  renews. Nothing in DHCP can push a new option mid-lease, so the lease length is what decides
+  when the client comes back for one: while an uplink is configured but has not yet learnt a
+  resolver, the lease is 120 s rather than 7200, and a client renews at half of it. That bounds
+  the wait at about a minute instead of an hour. It bounds rather than removes — reconnecting
+  the client is still the instant fix. A device with no uplink configured is unaffected and
+  keeps the 7200 s lease.
 - **UDP NAT lifetime.** lwIP expires a UDP mapping after two seconds by default, which is far
   shorter than any real NAT and would leave a RustDesk client unreachable between heartbeats.
   It is raised to 60 s via `IP_NAPT_TIMEOUT_MS_UDP` in the root `CMakeLists.txt`. Anything else

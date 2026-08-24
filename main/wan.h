@@ -79,6 +79,17 @@ uint32_t wan_get_dns(void);
 
 bool wan_is_up(void);
 
+// True when an uplink is configured at all, whatever state it has reached -
+// connecting, retrying, or failed authentication all count. Distinct from
+// wan_is_up(), and the distinction is the point: "no uplink configured" and
+// "an uplink that has not got there yet" look identical to anything that only
+// asks whether the WAN is up, and they call for opposite behaviour in
+// dhcp_server.c's lease length.
+//
+// Lock-free, like wan_is_up() and wan_get_dns() above, so the DHCP server task
+// can call it while building a reply.
+bool wan_is_enabled(void);
+
 // Re-reads the allowed-port list from wan_cfg and republishes it to the filter.
 // Takes effect on the next packet; no reboot, unlike an SSID change.
 void wan_ports_changed(void);
