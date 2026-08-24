@@ -50,7 +50,7 @@ done
 # --- JSON endpoints ---------------------------------------------------------
 # Piped through jq -e, so malformed JSON fails here rather than silently in a
 # browser. This is the check that would catch a response-buffer overflow.
-for path in /api/status /api/clients /api/system /api/leases /api/resets "/api/logs?since=0" /api/syslog /api/wan; do
+for path in /api/status /api/clients /api/system /api/leases /api/resets "/api/logs?since=0" /api/syslog /api/wan /api/time; do
   if curl -s --max-time 10 "${AUTH[@]}" "http://${HOST}${path}" | jq -e . >/dev/null 2>&1; then
     check "GET ${path} parses" ok ok
   else
@@ -81,11 +81,31 @@ if curl -s --max-time 10 "${AUTH[@]}" "http://${HOST}/api/resets" \
               and (.resets|all(has("seq") and has("reason") and has("partition")
                               and has("uptime_s") and has("uptime_approx")
                               and has("uptime_max_s") and has("rail_held")
-                              and (.rail_held|type=="boolean" or .==null)))' \
+                              and (.rail_held|type=="boolean" or .==null)
+                              and has("when") and has("when_epoch")
+                              and (.when|type=="string" or .==null)))' \
      >/dev/null 2>&1; then
   check "GET /api/resets shape" ok ok
 else
   check "GET /api/resets shape" ok bad
+fi
+
+# The clock fields are checked with has() rather than a type test, because null
+# is the correct and usual value: a device with no WAN never learns the time, and
+# a test that demanded a string here would fail on exactly the deployment the
+# fallback exists for.
+#
+# The zone list is what the admin form and the console's "time" command both
+# offer, so an empty one is a silently broken menu rather than a failed request.
+if curl -s --max-time 10 "${AUTH[@]}" "http://${HOST}/api/time" \
+     | jq -e '(.tz|type=="string") and has("now") and (.source|type=="string")
+              and (.stale|type=="boolean") and has("last_sync")
+              and (.zones|type=="array") and (.zones|length > 0)
+              and (.zones|all(has("label") and has("tz")))' \
+     >/dev/null 2>&1; then
+  check "GET /api/time shape" ok ok
+else
+  check "GET /api/time shape" ok bad
 fi
 
 # jq -e . above passes on JSON that is valid but incomplete, and this is now the
@@ -97,7 +117,9 @@ if curl -s --max-time 10 "${AUTH[@]}" "http://${HOST}/api/system" \
               and (.boot_intent|type=="string") and has("boot_prev_uptime_s")
               and (.boot_prev_uptime_approx|type=="boolean")
               and has("boot_prev_uptime_max_s")
-              and has("boot_prev_ready") and (.boot_rollback|type=="boolean")' \
+              and has("boot_prev_ready") and (.boot_rollback|type=="boolean")
+              and has("boot_when") and has("now")
+              and (.clock_source|type=="string") and (.clock_stale|type=="boolean")' \
      >/dev/null 2>&1; then
   check "GET /api/system boot fields" ok ok
 else

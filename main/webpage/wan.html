@@ -86,6 +86,7 @@
 
   <label for="wan-ports">Allowed ports</label>
   <p class="hint">Only these ports can be reached on the internet. Everything else &mdash; including anything trying to reach this bridge <em>from</em> the internet &mdash; is blocked. An entry is a port number, optionally suffixed <code>/tcp</code> or <code>/udp</code>; a bare number means TCP. The defaults cover NTRIP (2101, 2102) and RustDesk (21115&ndash;21117, including <code>21116/udp</code>, which RustDesk does not work without).</p>
+  <p class="hint">Two things are always allowed and do not belong on this list: DNS, to the resolver the upstream network hands out, and NTP (<code>123/udp</code>) to any server. NTP is open for devices on the LAN as well as for the bridge itself &mdash; a tablet with the wrong clock fails TLS and NTRIP authentication, and this bridge is its only way out. Adding <code>123/udp</code> here would change nothing and would spend one of your twelve rules.</p>
   <input type="text" id="wan-ports" placeholder="2101,2102,21115,21116,21116/udp,21117">
 
   <p class="warn">This device has one radio. While the WAN is connected, the bridge&rsquo;s own WiFi is forced onto the upstream network&rsquo;s channel, and the channel set on the LAN page is ignored.</p>

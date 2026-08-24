@@ -34,8 +34,28 @@ project(wt32-bridge)
 # 60 s comfortably covers RustDesk's heartbeat interval and is at the
 # conservative end of what a consumer NAT would use. The cost is table
 # occupancy: entries live longer, against the IP_NAPT_MAX above.
+#
+# SNTP_CHECK_RESPONSE: lwIP defaults this to 0, which means it accepts an NTP
+# reply from anybody - it does not compare the source against the server it
+# asked. That is the wrong default here for a specific reason: the WAN is
+# somebody else's network, often a hotspot, and this device's clock is what
+# dates the reboot history. An attacker on the same hotspot could hand it any
+# time it liked, and a wrong date in the evidence is worse than no date, because
+# it invites a diagnosis rather than merely failing to support one.
+#
+# 1 makes sntp_recv() check the source address and port against the server the
+# request went to. It is not authentication - NTP without NTS has none, and a
+# reply can still be spoofed by anyone able to forge the server's address - but
+# it closes the case of any host on the upstream network simply sending one.
+#
+# This matters more here than the usual "belt and braces" because the packet
+# filter does NOT narrow the return path: an NTP reply comes back to an
+# ephemeral local port inside the NAPT window, which wan.c admits along with all
+# translated traffic. lwIP's own check is the only thing tying a reply to the
+# server the request went to.
 idf_component_get_property(lwip_lib lwip COMPONENT_LIB)
 target_compile_definitions(${lwip_lib} PRIVATE
     IP_NAPT_MAX=256
-    IP_NAPT_TIMEOUT_MS_UDP=60000)
+    IP_NAPT_TIMEOUT_MS_UDP=60000
+    SNTP_CHECK_RESPONSE=1)
 

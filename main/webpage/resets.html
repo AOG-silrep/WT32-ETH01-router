@@ -104,6 +104,12 @@
      sans-serif, as leases.html does for its own "not saved" - prose in a
      monospace column reads as a value that happens to spell a word. */
   td.unknown { color: #898781; font-style: italic; font-family: sans-serif; }
+  th.when, td.when { font-family: monospace; font-size: 0.95em; }
+  /* Hidden wholesale rather than per-row: on a device that has never had a WAN
+     no record can carry a date, and a column of dashes would cost the widest
+     thing on the page to say nothing. Toggled in render(). */
+  table.no-when th.when, table.no-when td.when { display: none; }
+  td.when .undated { color: #898781; font-family: sans-serif; font-style: italic; }
   /* A firmware change is the single most useful adjacency on this page when it
      sits directly above a run of crashes, so it gets its own colour. */
   td.fw .changed { color: #8a4b00; font-weight: 600; }
@@ -132,11 +138,12 @@
 <h1>Reboot history</h1>
 
 <div class="panel">
-  <table>
+  <table id="reset-table">
     <thead>
       <tr><th title="Counts boots that got as far as starting the firmware. A boot the bootloader rejected outright never gets a record, so the numbers are consecutive but do not count every power-up.">Boot</th>
           <th>What happened</th>
-          <th class="dur" title="How long the device had been running before this reset. Not a clock reading - this device cannot date past events, only measure how long each boot lasted. A &gt; or &lt; means the figure was recovered from the periodic checkpoint in flash after a power event, and is a bound rather than a reading; hover a row for both ends of it. The bars are on a logarithmic scale from ten seconds to a year, so they are comparable at a glance but their lengths are not in proportion to the durations - read the figures for that. A frayed end means the bar is a bound and the real run was longer.">Ran for</th>
+          <th class="when" title="When this boot started, which is within a second or so of the reset that caused it. Shown in the timezone set on the Admin page. The device only knows the time while the WAN can reach an NTP server, and forgets it on a power cut - so a boot that ran without one is never dated, and never can be. That is not a fault and does not affect the order or the durations.">When</th>
+          <th class="dur" title="How long the device had been running before this reset. Measured, not derived from the dates in the When column - this is a duration the device counts for itself, and it is present on every record whether or not that boot ever knew what time it was. A &gt; or &lt; means the figure was recovered from the periodic checkpoint in flash after a power event, and is a bound rather than a reading; hover a row for both ends of it. The bars are on a logarithmic scale from ten seconds to a year, so they are comparable at a glance but their lengths are not in proportion to the durations - read the figures for that. A frayed end means the bar is a bound and the real run was longer.">Ran for</th>
           <th title="The firmware that came up after this reset, and which of the two OTA slots it booted from.">Firmware</th></tr>
     </thead>
     <tbody id="reset-body"></tbody>
@@ -341,6 +348,44 @@ function drawBar(cell, text, seconds, bound) {
   cell.appendChild(track);
 }
 
+// How long the device was dark between the boot below this row and this one.
+//
+// Note which record supplies which half, because the two are not the same boot:
+// a record's "when" is when the boot it OPENED started, while its uptime_s is
+// how long the boot BEFORE it lasted. So the older row dates the start of the
+// earlier boot, and THIS row's uptime_s is that boot's length - reading the
+// length off the older row would take the length of the boot before it and put
+// the answer one boot out.
+//
+// It inherits the precision of the duration it is built on: where uptime_s is a
+// checkpoint-recovered floor, the earlier boot ran at least that long and so
+// ended no earlier than that - which makes the gap a CEILING. Marked as one
+// rather than presented as a reading, the same discipline the "ran for" column
+// applies to the figure underneath it.
+//
+// Returns '' when there is no duration to subtract, where a guess would be
+// worse than a blank.
+function darkTime(r, older) {
+  if (r.uptime_s === null) return '';
+  const endedAt = older.when_epoch + r.uptime_s;
+  const gap = r.when_epoch - endedAt;
+  // Below the error budget, report the gap as nothing rather than as a figure.
+  // The budget is small and worth stating, because guessing it high throws away
+  // real information: a reboot takes tens of seconds and would be reported as
+  // instant. The sources are the one-second granularity the uptime is counted
+  // in at each end, SNTP's own accuracy (milliseconds), and the oscillator's
+  // drift between two syncs an hour apart - a few hundred parts per million of
+  // an hour, so of the order of a second. Fifteen covers that several times
+  // over and still shows a reboot as the gap it is.
+  if (gap < 15) return 'Came back immediately after boot #' + older.seq + ' ended.';
+  return (r.uptime_approx ? 'At most ' : '') +
+         formatUptime(gap) + ' dark between boot #' + older.seq + ' ending and this one starting.' +
+         (r.uptime_approx
+            ? ' At most, because boot #' + older.seq + '\u2019s length is a lower bound, so it ' +
+              'ended no earlier than that \u2014 and the gap no longer than this.'
+            : '');
+}
+
 // Every cell is filled with textContent rather than innerHTML. The version
 // string is the one field here written by a different firmware image than the
 // one running, so it is treated as data, not markup.
@@ -371,6 +416,31 @@ function addRow(r, older) {
       whatCell.title += ' The Ethernet PHY came up cleared, so the 3.3 V rail ' +
                         'really did drop — this was a power event and not a ' +
                         'reset at the EN pin.';
+    }
+  }
+
+  const when = row.insertCell();
+  when.className = 'when';
+  if (r.when === null) {
+    const dash = document.createElement('span');
+    dash.className = 'undated';
+    dash.textContent = '\u2014';
+    dash.title = 'This boot never had a clock: no WAN, or a WAN that never reached ' +
+                 'an NTP server, or a record written before the firmware could date ' +
+                 'one. Nothing about the order or the duration is affected.';
+    when.appendChild(dash);
+  } else {
+    // Rendered by the device, not here. The timezone is a device setting and a
+    // browser has no parser for a POSIX TZ string, so formatting in the page
+    // would put this column in a different zone from the serial console on the
+    // same device. Epochs are used below only for arithmetic, which is the same
+    // number in any zone.
+    when.textContent = r.when;
+    if (older && older.when_epoch !== null && r.when_epoch !== null) {
+      const dark = darkTime(r, older);
+      if (dark) {
+        when.title = dark;
+      }
     }
   }
 
@@ -433,6 +503,8 @@ function addRow(r, older) {
 
 function render(data) {
   body.textContent = '';
+  const anyWhen = data.resets.some(r => r.when !== null);
+  document.getElementById('reset-table').classList.toggle('no-when', !anyWhen);
   // Newest first from the server; each row is handed the record below it so it
   // can spot a firmware change across the boundary.
   data.resets.forEach((r, i) => addRow(r, data.resets[i + 1]));
@@ -445,13 +517,34 @@ function render(data) {
   footer.textContent = data.count + ' of ' + data.max + ' records kept' +
                        (newest ? ' · boot #' + newest.seq : '') + '.';
 
+  // Three different things to say, because the reader's question is different in
+  // each case. With no dates at all the old absolute still holds and is the
+  // whole story. With some dates, the useful sentence is why the others have
+  // none. With all of them dated, saying anything about undated rows would be
+  // explaining a case that is not on screen.
+  const anyUndated = data.resets.some(r => r.when === null);
   const note = document.createElement('span');
   note.className = 'note';
-  note.textContent = 'These are ordered, not timestamped. With no battery-backed ' +
-                     'clock and no time source on a transparent bridge, the device ' +
-                     'can say one reset happened before another and how long the ' +
-                     'boot before it lasted, but never on what date. Only the most ' +
-                     'recent ' + data.max + ' are kept.';
+  if (!anyWhen) {
+    note.textContent = 'These are ordered, not timestamped. This device has no ' +
+                       'battery-backed clock, and none of these boots had a working ' +
+                       'WAN to ask a time server through — so it can say one reset ' +
+                       'happened before another and how long the boot before it ' +
+                       'lasted, but not on what date. Set up a WAN and later boots ' +
+                       'will be dated. Only the most recent ' + data.max + ' are kept.';
+  } else if (anyUndated) {
+    note.textContent = 'Ordered first, dated where possible. This device has no ' +
+                       'battery-backed clock: it learns the time from the WAN and ' +
+                       'forgets it on a power cut, so a boot that ran without one ' +
+                       'shows no date and never will. The order and the durations ' +
+                       'are complete either way. Only the most recent ' + data.max +
+                       ' are kept.';
+  } else {
+    note.textContent = 'Dates come from the WAN, in the timezone set on the Admin ' +
+                       'page. This device has no battery-backed clock, so a boot ' +
+                       'that runs without a working WAN shows no date. Only the most ' +
+                       'recent ' + data.max + ' are kept.';
+  }
   footer.appendChild(note);
 
   const scale = document.createElement('span');

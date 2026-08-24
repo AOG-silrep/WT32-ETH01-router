@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include "sys_monitor.h"
 #include "reset_log.h"
+#include "clock_time.h"
 #include "rail_witness.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -106,6 +107,11 @@ static void sys_monitor_task(void *arg)
         // MDIO lock. Almost every call returns immediately - it only touches
         // the PHY every thirty seconds.
         rail_witness_tick();
+
+        // And again, for a call that writes to flash at most once per boot: the
+        // SNTP sync callback that triggers it runs in the tcpip task, which is
+        // the one place an NVS write must not happen.
+        clock_time_tick();
     }
 }
 

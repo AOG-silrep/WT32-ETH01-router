@@ -1,6 +1,7 @@
 #include <string.h>
 #include "wan.h"
 #include "wan_cfg.h"
+#include "clock_time.h"
 #include "wifi_cfg.h"
 #include "esp_netif_net_stack.h"
 #include "esp_event.h"
@@ -243,6 +244,36 @@ static bool egress_allowed(const wan_frame_t *f, const wan_rules_t *r)
         if (dport == 53 && r->dns_ip != 0 && f->ip->dest.addr == r->dns_ip) {
             return true;
         }
+        // NTP out, to anywhere, whoever asked. Three things this is not, and the
+        // reasons are the design:
+        //
+        // Not on the configured port list. That list is what a LAN client may
+        // reach, capped at twelve on the reasoning in wan_cfg.h that a list long
+        // enough to need scrolling is a list nobody audits. Knowing what time it
+        // is is not a per-deployment policy choice, and spending one of twelve
+        // audited slots on it would crowd out the rules that are.
+        //
+        // Not pinned to one server either, which was the first design and reads
+        // tidier than this. It would have mirrored the DNS rule above - resolve
+        // the pool, publish that one address, open a hole exactly one host wide.
+        // What it also would have done is deny NTP to everything on the LAN, and
+        // the LAN needs it more than this device does: a tablet behind this
+        // bridge has the same no-clock problem and worse consequences from it,
+        // since TLS validation fails outright on a clock wrong by enough and
+        // token auth against an NTRIP caster rejects stale requests. This bridge
+        // is the only route those clients have out. Denying them NTP to keep one
+        // filter rule tidy is a bridge-wide regression bought with nothing.
+        //
+        // Not free, and the cost belongs written down rather than in a commit
+        // message: "what leaves this device is enumerable" now enumerates one
+        // more thing, and UDP/123 to anywhere is a low-bandwidth channel for
+        // anyone determined enough to tunnel over it. That is strictly less than
+        // the DNS carve-out immediately above already concedes, and it adds no
+        // inbound exposure at all - ingress_allowed() still admits only NAPT
+        // return traffic, so nothing upstream reaches port 123 here or behind.
+        if (IPH_PROTO(f->ip) == IP_PROTO_UDP && dport == 123) {
+            return true;
+        }
         // Protocol as well as number. The list started TCP-only, on the
         // reasoning that a UDP port is a hole with no session behind it and
         // NTRIP is TCP; RustDesk is what changed it, since its ID registration
@@ -304,7 +335,7 @@ static bool ingress_allowed(const wan_frame_t *f, const wan_rules_t *r)
         if (dport == 68) {
             return true;  // our own DHCP client's offer/ack
         }
-        // Replies to the one thing this device is allowed to send for ITSELF.
+        // Replies to the two things this device is allowed to send for ITSELF.
         //
         // These are needed because the NAT-window rule below does not cover
         // locally-originated traffic, and the reason is easy to miss: NAPT only
@@ -319,11 +350,19 @@ static bool ingress_allowed(const wan_frame_t *f, const wan_rules_t *r)
         //
         // Matched on the SOURCE port rather than ours, for the same reason the
         // egress rules match on destination: it is the half that identifies the
-        // service and the half translation leaves alone. It is additionally
+        // service and the half translation leaves alone. DNS is additionally
         // pinned to the resolver we are permitted to query, so this admits
         // exactly the answers to the questions egress_allowed() lets out.
+        //
+        // NTP is not pinned to an address, mirroring its egress rule - the
+        // server may be any of a pool. What keeps that honest is
+        // SNTP_CHECK_RESPONSE=1 (see the root CMakeLists.txt), which makes lwIP
+        // discard a reply that did not come from the server it asked.
         if (IPH_PROTO(f->ip) == IP_PROTO_UDP && sport == 53 &&
             r->dns_ip != 0 && f->ip->src.addr == r->dns_ip) {
+            return true;
+        }
+        if (IPH_PROTO(f->ip) == IP_PROTO_UDP && sport == 123) {
             return true;
         }
         // What is left is the NAT return window, and it covers FORWARDED traffic
@@ -331,8 +370,8 @@ static bool ingress_allowed(const wan_frame_t *f, const wan_rules_t *r)
         // [IP_NAPT_PORT_RANGE_START, IP_NAPT_PORT_RANGE_END], so every
         // translated reply lands in it and nothing else legitimately does.
         //
-        // It does NOT cover this device's own traffic, which is what the rule
-        // above is for. An earlier version of this comment claimed it did, on
+        // It does NOT cover this device's own traffic, which is what the rules
+        // above are for. An earlier version of this comment claimed it did, on
         // the reasoning that lwIP draws local UDP ports from
         // UDP_LOCAL_PORT_RANGE_START (0xc000) - the same 49152 this window
         // starts at - so a reply to a locally-originated request would land
@@ -353,6 +392,13 @@ static bool ingress_allowed(const wan_frame_t *f, const wan_rules_t *r)
         // allowed ports, so roughly one boot in five resolved names perfectly
         // and the other four could not resolve at all - which reads as a flaky
         // network rather than as a filter bug.
+        //
+        // NTP was never exposed the same way, and the rule above is belt and
+        // braces for it. sntp.c binds a local port only in
+        // SNTP_OPMODE_LISTENONLY; this device polls, so udp_sendto() binds
+        // implicitly through udp_new_port(), which is a sequential counter from
+        // 0xc000 rather than a random draw. A device that opens a handful of UDP
+        // ports per boot sits at the bottom of this window and always did.
         //
         // Which leaves one imprecision, for any future local traffic with no
         // rule above: udp_new_port() runs to 0xffff while this window stops at
@@ -642,6 +688,7 @@ static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
         s_status.ip.addr = 0;
         s_status.dns.addr = 0;
         publish_rules(false, 0);
+        clock_time_wan_down();
         // Not silently degraded: a half-working uplink whose LAN routing has
         // quietly become ambiguous is worse than no uplink at all.
         esp_wifi_disconnect();
@@ -676,6 +723,7 @@ static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
     // tx_blocked, which the WAN panel presents as evidence that the port list is
     // wrong. Ordered after publish_rules() so the filter is already open when
     // the first packet goes.
+    clock_time_wan_up();
 
     ESP_LOGI(TAG, "uplink up: " IPSTR " via " IPSTR ", DNS " IPSTR,
              IP2STR(&evt->ip_info.ip), IP2STR(&evt->ip_info.gw), IP2STR(&s_status.dns));
@@ -694,6 +742,7 @@ static void on_lost_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
     s_status.ip.addr = 0;
     s_status.dns.addr = 0;
     publish_rules(false, 0);
+    clock_time_wan_down();
     ESP_LOGW(TAG, "uplink lost its address");
 }
 
@@ -710,6 +759,7 @@ static void on_sta_disconnected(void *arg, esp_event_base_t base, int32_t id, vo
     // Also here, not only in on_lost_ip(): whether losing the association posts
     // a LOST_IP depends on how the netif goes down, and the clock going quiet is
     // not something to leave to that. The call is idempotent.
+    clock_time_wan_down();
 
     // A conflict has already scheduled its own long retry and said why; letting
     // the ordinary backoff below overwrite that would turn a clear diagnosis

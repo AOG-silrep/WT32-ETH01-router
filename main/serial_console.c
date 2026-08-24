@@ -8,6 +8,8 @@
 #include "sys_monitor.h"
 #include "eth_link.h"
 #include "reset_log.h"
+#include "clock_time.h"
+#include "clock_cfg.h"
 #include "log_buf.h"
 #include "syslog.h"
 #include "syslog_cfg.h"
@@ -166,7 +168,11 @@ static int cmd_sysinfo(int argc, char **argv)
     // hours, and last time it was a panic".
     reset_log_entry_t cur;
     if (reset_log_get_current(&cur)) {
-        char desc[112];
+        // 160, not 112: the longest wording is a 63-character "what happened",
+        // " after " , a 23-character duration and the parenthesised boot number
+        // and date, which is 139. 112 predates the date and was already one
+        // long reason short of truncating.
+        char desc[160];
         describe_reset(&cur, desc, sizeof(desc));
         printf("Last restart:   %s\n", desc);
     }
@@ -630,20 +636,125 @@ static void describe_reset(const reset_log_entry_t *e, char *out, size_t n)
     char what[64], ran[24];
     reset_what_happened(e, what, sizeof(what));
     reset_ran_for(e, ran, sizeof(ran));
+
+    // The boot number, and the date when that boot had a clock to know it by.
+    // Appended rather than leading, and only when known, for the reason
+    // resetText() gives on the dashboard: "why" is what this line is for and
+    // "when" is the qualifier, and most devices will have no date at all.
+    //
+    // Built once because all four wordings below end with it. Written out per
+    // wording it was the same parenthesis four times, and a fifth wording that
+    // forgot the date is how this line and the dashboard's would drift into
+    // describing one boot two ways - which is the drift the shared
+    // describe_reset() exists to prevent.
+    char tail[CLOCK_TIME_STR_MAX + 24];
+    if (e->flags & RESET_LOG_F_BOOT_TIME) {
+        char when[CLOCK_TIME_STR_MAX];
+        clock_time_format((time_t)e->boot_epoch, when, sizeof(when));
+        snprintf(tail, sizeof(tail), "(boot #%u, %s)", (unsigned)e->boot_seq, when);
+    } else {
+        snprintf(tail, sizeof(tail), "(boot #%u)", (unsigned)e->boot_seq);
+    }
+
     if (e->flags & RESET_LOG_F_PREV_STATE) {
-        snprintf(out, n, "%s after %s (boot #%u)", what, ran, (unsigned)e->boot_seq);
+        snprintf(out, n, "%s after %s %s", what, ran, tail);
     } else if (reset_uptime_is_floor(e) && e->prev_uptime_s == 0) {
         // ran is already "<10s"; a sentence has the room to spell it out, and
         // "after <10s" reads worse than this does.
-        snprintf(out, n, "%s in under %u seconds (boot #%u)", what,
-                 (unsigned)reset_log_uptime_ceiling(0), (unsigned)e->boot_seq);
+        snprintf(out, n, "%s in under %u seconds %s", what,
+                 (unsigned)reset_log_uptime_ceiling(0), tail);
     } else if (reset_uptime_is_floor(e)) {
         // ran is ">5m"; again the mark belongs in the column, not the sentence.
-        snprintf(out, n, "%s after more than %s (boot #%u)", what, ran + 1,
-                 (unsigned)e->boot_seq);
+        snprintf(out, n, "%s after more than %s %s", what, ran + 1, tail);
     } else {
-        snprintf(out, n, "%s (boot #%u)", what, (unsigned)e->boot_seq);
+        snprintf(out, n, "%s %s", what, tail);
     }
+}
+
+static struct {
+    struct arg_str *tz;
+    struct arg_lit *list;
+    struct arg_end *end;
+} time_args;
+
+static int cmd_time(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **)&time_args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, time_args.end, argv[0]);
+        return 1;
+    }
+
+    if (time_args.list->count > 0) {
+        const char *label, *tz;
+        for (int i = 0; clock_cfg_zone(i, &label, &tz); i++) {
+            printf("  %-24s %s\n", label, tz);
+        }
+        printf("\nAny other zone can be given as a POSIX TZ string directly.\n");
+        return 0;
+    }
+
+    if (time_args.tz->count > 0) {
+        clock_cfg_t cfg;
+        clock_cfg_get(&cfg);
+
+        // An IANA label from the shared list is accepted as well as a raw POSIX
+        // string, because "America/Chicago" is what a person knows and
+        // "CST6CDT,M3.2.0,M11.1.0" is what the C library needs. The lookup lives
+        // in clock_cfg so /api/time accepts the same words; a NULL back means it
+        // is not a label, which is the normal path for anyone who typed their own.
+        const char *want = time_args.tz->sval[0];
+        const char *resolved = clock_cfg_zone_from_label(want);
+        strlcpy(cfg.tz, resolved ? resolved : want, sizeof(cfg.tz));
+
+        const char *err_msg = NULL;
+        if (!clock_cfg_validate(&cfg, &err_msg)) {
+            printf("%s\n", err_msg);
+            return 1;
+        }
+        if (clock_cfg_save(&cfg) != ESP_OK) {
+            printf("Failed to save the timezone.\n");
+            return 1;
+        }
+        printf("Timezone set to %s.\n", cfg.tz);
+    }
+
+    clock_cfg_t cfg;
+    clock_cfg_get(&cfg);
+    printf("timezone        %s\n", cfg.tz);
+
+    time_t now;
+    if (clock_time_now(&now)) {
+        char now_str[CLOCK_TIME_STR_MAX];
+        clock_time_format(now, now_str, sizeof(now_str));
+        printf("time            %s %s\n", now_str, clock_time_zone_abbrev(now));
+
+        const char *src = clock_time_source();
+        if (strcmp(src, "carried") == 0) {
+            printf("source          carried through RTC memory from an earlier boot - this\n"
+                   "                reset did not cut power, so the clock survived it\n");
+        } else {
+            printf("source          NTP, over the WAN\n");
+        }
+
+        time_t last = clock_time_last_sync();
+        if (last != 0) {
+            char last_str[CLOCK_TIME_STR_MAX];
+            clock_time_format(last, last_str, sizeof(last_str));
+            printf("last sync       %s\n", last_str);
+        }
+        if (clock_time_stale()) {
+            printf("\nNothing has corrected this clock in over a day. It runs on the internal\n"
+                   "RC oscillator rather than a crystal, so by now it is likely to be out by\n"
+                   "of the order of a minute. Treat the date as sound and the seconds as not.\n");
+        }
+    } else {
+        printf("time            unknown\n");
+        printf("\nThis device has no battery-backed clock, so it only knows the time while\n"
+               "the WAN can reach an NTP server, and forgets it on the next power cut. The\n"
+               "reset history is ordered and timed either way; see \"resets\".\n");
+    }
+    return 0;
 }
 
 static int cmd_resets(int argc, char **argv)
@@ -656,7 +767,36 @@ static int cmd_resets(int argc, char **argv)
         return 0;
     }
 
-    printf("%-6s %-46s %9s  %s\n", "BOOT", "WHAT HAPPENED", "RAN FOR", "FIRMWARE");
+    // One pass, three questions. The WHEN column and both footnotes below are
+    // each gated on a property of the whole list, and asking each question in a
+    // loop of its own was three walks over the same array to learn three things
+    // one walk already knows.
+    //
+    // The WHEN column appears only when at least one record can fill it, which
+    // on most devices is never - an empty column of dashes on every row would
+    // cost 20 characters of an 80-column terminal to say nothing. Same
+    // reasoning as the footnotes: explain, and occupy space, only when there is
+    // something to explain.
+    bool any_when = false, any_blank = false, any_floor = false;
+    for (int i = 0; i < count; i++) {
+        bool dated = (recs[i].flags & RESET_LOG_F_BOOT_TIME) != 0;
+        any_when  = any_when  || dated;
+        any_blank = any_blank || !dated;
+        any_floor = any_floor || reset_uptime_is_floor(&recs[i]);
+    }
+
+    // The column is rendered into a cell that carries its own trailing space and
+    // is empty when the column is off, so the two layouts share one format
+    // string rather than having one each. Written out per layout it was four
+    // format strings - header and row, present and absent - that had to be kept
+    // in step by hand, and the one that drifts is the one nobody looks at
+    // because it only appears on devices that have never had a clock.
+    char when_hdr[CLOCK_TIME_STR_MAX + 1] = "";
+    if (any_when) {
+        snprintf(when_hdr, sizeof(when_hdr), "%-*s ", (int)(CLOCK_TIME_STR_MAX - 1), "WHEN");
+    }
+    printf("%-6s %-46s %s%9s  %s\n",
+           "BOOT", "WHAT HAPPENED", when_hdr, "RAN FOR", "FIRMWARE");
     for (int i = 0; i < count; i++) {
         char seq_str[12];
         snprintf(seq_str, sizeof(seq_str), "#%u", (unsigned)recs[i].boot_seq);
@@ -669,23 +809,38 @@ static int cmd_resets(int argc, char **argv)
         snprintf(fw, sizeof(fw), "%s %s%s", recs[i].version, recs[i].part,
                  (recs[i].flags & RESET_LOG_F_OTA_PENDING) ? " (on trial)" : "");
 
-        printf("%-6s %-46s %9s  %s\n", seq_str, what, ran, fw);
+        char when[CLOCK_TIME_STR_MAX + 1] = "";
+        if (any_when) {
+            char t[CLOCK_TIME_STR_MAX] = "-";
+            if (recs[i].flags & RESET_LOG_F_BOOT_TIME) {
+                clock_time_format((time_t)recs[i].boot_epoch, t, sizeof(t));
+            }
+            snprintf(when, sizeof(when), "%-*s ", (int)(CLOCK_TIME_STR_MAX - 1), t);
+        }
+        printf("%-6s %-46s %s%9s  %s\n", seq_str, what, when, ran, fw);
     }
 
     // Only explained when there is something on screen to explain, so the
     // footer of a device that has never lost power stays two lines.
-    bool any_floor = false;
-    for (int i = 0; i < count; i++) {
-        any_floor = any_floor || reset_uptime_is_floor(&recs[i]);
-    }
     if (any_floor) {
         printf("\nA marked figure (\">5m\", \"<10s\") is recovered from the uptime checkpoint\n"
                "in flash after a power event, and is a bound rather than a reading. An\n"
                "unmarked one came exactly from the counter in RTC memory.\n");
     }
 
-    printf("\n%d of %d records kept. Ordered, not timestamped - this device has no\n"
-           "clock across a reboot. Kept across factory-reset on purpose.\n",
+    if (any_when) {
+        // Named as the two different things a blank means, because they lead to
+        // different conclusions: one is "this boot had no way to know" and the
+        // other is "this record predates the field". Neither is a fault.
+        if (any_blank) {
+            printf("\nA \"-\" under WHEN is a boot that never had a clock: no WAN, or a WAN\n"
+                   "that never reached an NTP server, or a record written before this\n"
+                   "firmware. The order and the durations are unaffected.\n");
+        }
+    }
+
+    printf("\n%d of %d records kept. Ordered first and dated only where the WAN could\n"
+           "reach a time server - see \"time\". Kept across factory-reset on purpose.\n",
            count, RESET_LOG_MAX_RECORDS);
     return 0;
 }
@@ -962,7 +1117,7 @@ static void print_wan_status(const wan_cfg_t *cfg)
     printf("  NAT:              %s\n", st.napt_on ? "enabled" : "not enabled");
     printf("  Connects/disconnects: %u/%u (last reason %u)\n",
            (unsigned)st.connects, (unsigned)st.disconnects, (unsigned)st.last_reason);
-    printf("  Out: %u allowed, %u blocked by the port list\n",
+    printf("  Out: %u allowed, %u blocked by the port list (DNS and NTP bypass it)\n",
            (unsigned)st.tx_allowed, (unsigned)st.tx_blocked);
     printf("  In:  %u allowed, %u blocked\n",
            (unsigned)st.rx_allowed, (unsigned)st.rx_blocked);
@@ -1101,6 +1256,11 @@ static int cmd_factory_reset(int argc, char **argv)
                "would destroy the record of the very fault being chased. Use\n"
                "\"resets\" to read it.\n"
                "\n"
+               "The timezone is kept too, because that history is: a reset does not\n"
+               "move the device, and clearing the zone would leave the one thing\n"
+               "deliberately preserved rendering its dates in the wrong one. Use\n"
+               "\"time\" to change it.\n"
+               "\n"
                "Run \"factory-reset yes\" to confirm.\n");
         return 0;
     }
@@ -1109,6 +1269,14 @@ static int cmd_factory_reset(int argc, char **argv)
     // sent away for repair or handed on should not carry on shipping its log to
     // somebody's old collector. The WAN settings go for the stronger version
     // of the same reason - they contain another network's WiFi password.
+    //
+    // clock_cfg is the one configuration namespace deliberately NOT erased, and
+    // it is kept for the same reason the reset history is. That history survives
+    // a factory reset because it is evidence rather than configuration; its
+    // dates are rendered through this zone; so erasing the zone would leave the
+    // one thing this command promises to preserve displaying its dates hours
+    // out. A timezone is also not a secret and not stale on a device that
+    // changed hands - the box did not move.
     esp_err_t err1 = erase_nvs_namespace("wifi_config");
     esp_err_t err2 = erase_nvs_namespace("auth_cfg");
     esp_err_t err3 = erase_nvs_namespace("dhcp_leases");
@@ -1214,6 +1382,19 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&kick_cmd));
 
+    time_args.tz = arg_str0(NULL, NULL, "<zone>", "IANA name or POSIX TZ string, e.g. America/Chicago");
+    time_args.list = arg_lit0("l", "list", "list the built-in zones");
+    time_args.end = arg_end(2);
+    const esp_console_cmd_t time_cmd = {
+        .command = "time",
+        .help = "Show the clock and the timezone it is rendered in, or set the timezone. "
+                "The clock itself comes from NTP over the WAN and cannot be set by hand.",
+        .hint = NULL,
+        .func = &cmd_time,
+        .argtable = &time_args,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&time_cmd));
+
     const esp_console_cmd_t resets_cmd = {
         .command = "resets",
         .help = "List why this device restarted, most recent first. Kept in flash across "
@@ -1263,7 +1444,9 @@ static void register_commands(void)
         .help = "Show or set WiFi as WAN, which routes LAN clients out through "
                 "another WiFi network with NAT. No args shows the state and counters. Only the "
                 "listed ports can be reached through it (2101 is the usual NTRIP caster port); "
-                "everything else, in both directions, is dropped. An entry is a port number, "
+                "everything else, in both directions, is dropped, except DNS to the resolver the "
+                "upstream network hands out and NTP on 123/udp, which are always allowed and do "
+                "not belong on the list. An entry is a port number, "
                 "optionally suffixed /tcp or /udp; bare means TCP. Changing --ports takes "
                 "effect immediately; changing the network, password or on/off reboots. Note the "
                 "device has one radio: while the WAN is up, this bridge's own WiFi is forced "

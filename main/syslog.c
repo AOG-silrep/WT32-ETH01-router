@@ -195,15 +195,18 @@ static void sanitize_msg(char *s)
 
 // timeQuality is RFC 5424 section 7.1's reserved SD-ID - used without an
 // enterprise number - and it is the standards-blessed way to say "this device
-// has no synchronised clock and does not know its timezone", which is the entire
-// reason TIMESTAMP is the NILVALUE. It costs 38 bytes to make that self-
+// is not stamping these against a synchronised clock", which is the entire
+// reason TIMESTAMP is the NILVALUE. Still accurate now that a WAN can supply a
+// clock: these lines are deliberately not dated from it (see syslog.h), so
+// isSynced="0" is the honest claim about this datagram whatever the device
+// happens to know. It costs 38 bytes to make that self-
 // explaining to a collector operator who never read this firmware's README.
 //
 // aog@32473 uses PEN 32473, the enterprise number IANA documents for examples
 // and private use (RFC 5612). up_ms is the ring's own millisecond stamp, seq is
 // the ring sequence number, boot is the boot counter. Together they order every
-// line the collector ever receives from this device, across reboots, with no
-// clock anywhere in the system.
+// line the collector ever receives from this device, across reboots, without
+// depending on a clock at either end.
 //
 // boot duplicates PROCID deliberately: PROCID is where a collector indexes it,
 // this is where a person reads it, next to the two numbers it is only meaningful

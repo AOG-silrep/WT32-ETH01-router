@@ -110,6 +110,7 @@
 <table>
   <tbody>
     <tr><th>Uptime</th><td id="sys-uptime">&hellip;</td></tr>
+    <tr id="sys-clock-row" style="display: none"><th title="The wall-clock time, learned from an NTP server over the WAN and shown in the timezone set on the Admin page. This device has no battery-backed clock, so it has no time at all until the WAN comes up and loses it again on a power cut — which is why boots that ran without a WAN are never dated in the reboot history.">Clock</th><td id="sys-clock">&hellip;</td></tr>
     <tr><th>Free heap</th><td id="sys-heap">&hellip;</td></tr>
     <tr><th>CPU (core 0 / 1)</th><td id="sys-cpu">&hellip;</td></tr>
     <tr><th title="Measured from the CPU cycle counter timed against esp_timer_get_time(), independent of the configured clock setting.">CPU speed</th><td id="sys-cpu-freq" title="Measured from the CPU cycle counter timed against esp_timer_get_time(), independent of the configured clock setting.">&hellip;</td></tr>
@@ -664,7 +665,25 @@ function resetText(s) {
     text += ' after more than ' + formatShort(s.boot_prev_uptime_s);
   }
 
-  return { text: text + ' — boot #' + s.boot_seq, fault };
+  // The date, where the boot had a clock to know it by. Appended rather than
+  // leading, because "why" is what this row is for and "when" is the
+  // qualifier - and because most devices will have no date here at all.
+  let tail = ' \u2014 boot #' + s.boot_seq;
+  if (s.boot_when !== null) {
+    tail += ', ' + s.boot_when;
+  }
+  return { text: text + tail, fault };
+}
+
+// The device sends the rendered time; this only decides what to say around it.
+// "carried" is worth naming because it is the surprising case - the clock is
+// right, nothing synced it this boot, and the reason is that the reset did not
+// cut power, which is itself a fact about the reset.
+function formatClock(s) {
+  let t = s.now + (s.now_zone ? ' ' + s.now_zone : '');
+  if (s.clock_stale) t += ' (drifting)';
+  else if (s.clock_source === 'carried') t += ' (carried over)';
+  return t;
 }
 
 async function refreshSystem() {
@@ -682,6 +701,23 @@ async function refreshSystem() {
   const dropsEl = document.getElementById('sys-drops');
   dropsEl.textContent = s.traffic_drops;
   dropsEl.classList.toggle('warn', s.traffic_drops > 0);
+
+  // The row appears only once there is a clock. On a device with no WAN there
+  // never will be, and a permanent "unknown" in the System panel would read as a
+  // fault rather than as a capability this deployment does not use.
+  const clockRow = document.getElementById('sys-clock-row');
+  if (s.now === null) {
+    clockRow.style.display = 'none';
+  } else {
+    clockRow.style.display = '';
+    // Rendered by the device, in the device's timezone - see the note in
+    // resets.html's addRow() for why this is not formatted here.
+    const clockEl = document.getElementById('sys-clock');
+    clockEl.textContent = formatClock(s);
+    // Only the drifting case is a caveat worth colouring; "carried over" is a
+    // perfectly good clock that happens to have an interesting provenance.
+    clockEl.classList.toggle('warn', s.clock_stale);
+  }
 
   // Plain text, with no link of its own: the header carries the one link to
   // /resets, and a second one inside the row bought nothing but width.
@@ -801,7 +837,15 @@ function renderFacts(d) {
   rows.push(['NAT', d.napt ? 'enabled' : 'not enabled']);
   // The blocked counters are what an operator needs when their software
   // mysteriously cannot connect, so they are shown even at zero.
-  rows.push(['Out', d.tx_allowed + ' allowed, ' + d.tx_blocked + ' blocked by the port list']);
+  //
+  // The parenthesis is worded exactly as the console's "wan" command words the
+  // same counter, because it answers the question this number provokes: an
+  // operator watching it climb while their caster fails will otherwise conclude
+  // the list is the cause and start adding rules to it - and the two things
+  // most likely to be missing, a name lookup and a clock, are the two this
+  // counter never counts.
+  rows.push(['Out', d.tx_allowed + ' allowed, ' + d.tx_blocked +
+             ' blocked by the port list (DNS and NTP bypass it)']);
   rows.push(['In', d.rx_allowed + ' allowed, ' + d.rx_blocked + ' blocked']);
   rows.push(['Connects', d.connects + ' up, ' + d.disconnects + ' down (last reason ' + d.last_reason + ')']);
 

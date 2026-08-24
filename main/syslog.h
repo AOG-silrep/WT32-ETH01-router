@@ -26,9 +26,14 @@ extern "C" {
 // could tell it. `sent` below means "handed to the network" and nothing more.
 //
 // TIMESTAMP is the RFC 5424 NILVALUE, so the collector stamps on receipt. There
-// is no clock here to do better with - no RTC battery, no SNTP uplink, and
-// esp_timer restarts at zero every boot. See the same argument for the reset
-// history in reset_log.h.
+// is usually no clock here to do better with - no RTC battery, and esp_timer
+// restarts at zero every boot. A WAN can now supply one (clock_time.h), but
+// deliberately not to this: a log ring whose lines are relative for the first
+// forty seconds of a boot and absolute afterwards is harder to read than one
+// that is consistently relative, and the collector's receipt stamp is already
+// better than either for lines that reach it. What the clock did get used for
+// is the reset history, where each record is a single dated event rather than a
+// stream - see reset_log.h.
 
 typedef struct {
     bool     enabled;     // configuration says on

@@ -33,8 +33,10 @@
   .panel { border: 2px solid #888; border-radius: 4px; padding: 0.8em; margin-top: 1em; }
   .panel h2 { margin-top: 0; font-size: 1.05em; }
   label { display: block; margin-top: 0.8em; font-size: 0.9em; }
-  input { width: 100%; box-sizing: border-box; padding: 0.4em; margin-top: 0.2em; font-size: 1em; }
+  input, select { width: 100%; box-sizing: border-box; padding: 0.4em; margin-top: 0.2em; font-size: 1em; }
   button { margin-top: 1em; padding: 0.5em 1.2em; font-size: 1em; }
+  /* Same metrics as wan.html's, so a hint reads identically on both pages. */
+  .hint { margin: 0.4em 0 0 0; font-size: 0.88em; color: #5c5a55; max-width: 68ch; }
   /* Picking a file and flashing it are one action, so they share a line rather
      than sitting a full input's width apart. Wraps rather than overflowing once
      the panel is narrower than the two controls together. */
@@ -45,12 +47,12 @@
   .file-row button { margin-top: 0; white-space: nowrap; }
   #ota-progress { width: 100%; margin-top: 0.8em; height: 1.2em; display: none; }
   #ota-progress.show { display: block; }
-  #ota-msg { margin-top: 0.6em; font-size: 0.9em; }
-  #ota-msg.error { color: #b00020; }
-  #ota-msg.ok { color: #0a7a2f; }
-  #admin-msg { margin-top: 0.6em; font-size: 0.9em; }
-  #admin-msg.error { color: #b00020; }
-  #admin-msg.ok { color: #0a7a2f; }
+  /* One status line per form, differing only in which form it sits under, so
+     the rules are shared rather than written out once per form. They were
+     written out three times; a fourth form would have made it four. */
+  #clock-msg, #ota-msg, #admin-msg { margin-top: 0.6em; font-size: 0.9em; }
+  #clock-msg.error, #ota-msg.error, #admin-msg.error { color: #b00020; }
+  #clock-msg.ok, #ota-msg.ok, #admin-msg.ok { color: #0a7a2f; }
   #forced-banner { display: none; background: #b00020; color: #fff; padding: 0.6em 1em; border-radius: 4px; margin: 1em 0; }
   #forced-banner.show { display: block; }
 </style>
@@ -99,6 +101,24 @@
 </form>
 </div>
 
+<div class="panel" id="clock-panel">
+<h2>Clock</h2>
+<p class="hint" id="clock-now">Loading&hellip;</p>
+<form id="clock-form">
+  <label for="clock-zone">Timezone</label>
+  <select id="clock-zone"></select>
+
+  <label for="clock-custom" id="clock-custom-label">POSIX TZ string</label>
+  <input type="text" id="clock-custom" maxlength="39" autocomplete="off"
+         placeholder="CST6CDT,M3.2.0,M11.1.0">
+
+  <p class="hint">This only changes how times are displayed &mdash; it takes effect immediately and does not restart the bridge. The clock itself comes from an NTP server over the WAN and cannot be set by hand: with no battery-backed clock, this device learns the time when the WAN comes up and forgets it on a power cut. Boots that ran without a working WAN are never dated in the <a href="/resets">reboot history</a>.</p>
+
+  <button type="submit">Save</button>
+  <div id="clock-msg"></div>
+</form>
+</div>
+
 <script>
 if (new URLSearchParams(location.search).get('forced') === '1') {
   document.getElementById('forced-banner').classList.add('show');
@@ -117,6 +137,9 @@ if (new URLSearchParams(location.search).get('forced') === '1') {
   // served at all so the password can be changed. Don't offer a control the
   // server is going to refuse.
   document.getElementById('ota-panel').style.display = 'none';
+  // Same reasoning as the OTA panel above: /api/time answers 403 while the
+  // password is still the default, so the form would only produce a refusal.
+  document.getElementById('clock-panel').style.display = 'none';
 }
 
 document.getElementById('ota-file').addEventListener('change', (e) => {
@@ -191,6 +214,137 @@ document.getElementById('ota-form').addEventListener('submit', (e) => {
 
   xhr.send(file);
 });
+
+// The zone menu is built from what the device sends rather than hard-coded here,
+// so this page and the console's "time" command cannot come to offer different
+// lists. "Custom" is the escape hatch for anywhere the list does not cover.
+const CUSTOM = '\u0000custom';
+
+function renderClock(d) {
+  const now = document.getElementById('clock-now');
+  if (d.now === null) {
+    now.textContent = 'The clock is not set. This device learns the time from an ' +
+                      'NTP server once the WAN is up; until then there is nothing ' +
+                      'to show and nothing a timezone would change.';
+  } else {
+    now.textContent = 'Now: ' + d.now + ' ' + d.zone +
+      (d.source === 'carried'
+        ? ' \u2014 carried through from an earlier boot, since the last reset did not cut power.'
+        : '.') +
+      (d.stale
+        ? ' Nothing has corrected it in over a day, and it runs on an internal RC ' +
+          'oscillator rather than a crystal, so the seconds are no longer reliable.'
+        : '');
+  }
+
+  const sel = document.getElementById('clock-zone');
+  if (!sel.options.length) {
+    d.zones.forEach(z => {
+      const o = document.createElement('option');
+      o.value = z.tz;
+      o.textContent = z.label;
+      sel.appendChild(o);
+    });
+    const o = document.createElement('option');
+    o.value = CUSTOM;
+    o.textContent = 'Custom\u2026';
+    sel.appendChild(o);
+  }
+
+  // Only tracks the device while the user has not started editing, for the same
+  // reason 46dde5b gave on the other forms: a poll that overwrites a half-typed
+  // field is a bug the user experiences as the page fighting them.
+  if (!sel.dataset.touched) {
+    const known = d.zones.some(z => z.tz === d.tz);
+    sel.value = known ? d.tz : CUSTOM;
+    document.getElementById('clock-custom').value = known ? '' : d.tz;
+    syncCustom();
+  }
+}
+
+function syncCustom() {
+  const custom = document.getElementById('clock-zone').value === CUSTOM;
+  document.getElementById('clock-custom').style.display = custom ? '' : 'none';
+  document.getElementById('clock-custom-label').style.display = custom ? '' : 'none';
+}
+
+document.getElementById('clock-zone').addEventListener('change', (e) => {
+  e.target.dataset.touched = '1';
+  syncCustom();
+});
+document.getElementById('clock-custom').addEventListener('input', () => {
+  document.getElementById('clock-zone').dataset.touched = '1';
+});
+
+// The same helper every other polling page on this device uses. A plain fetch()
+// has no timeout at all, so a bridge that accepts the connection and then stops
+// answering leaves this poll outstanding for as long as the browser feels like
+// waiting - and the 10s interval below then stacks a second one on top of it.
+const AUTH_ERROR = new Error('auth');
+const SETUP_ERROR = new Error('setup');
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    if (res.status === 401) throw AUTH_ERROR;
+    if (res.status === 403) throw SETUP_ERROR;
+    return res;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function refreshClock() {
+  try {
+    const res = await fetchWithTimeout('/api/time', {}, 2000);
+    if (!res.ok) return;
+    renderClock(await res.json());
+  } catch (err) {
+    // A lapsed session is the one failure worth acting on: without this the
+    // panel just stops updating and looks like a stopped clock rather than a
+    // page that needs logging into again. Everything else - a timeout, a
+    // dropped link - is transient, and the next tick picks it up.
+    if (err === AUTH_ERROR || err === SETUP_ERROR) {
+      location.reload();
+    }
+  }
+}
+
+document.getElementById('clock-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = document.getElementById('clock-msg');
+  msg.textContent = '';
+  msg.className = '';
+  const sel = document.getElementById('clock-zone');
+  const tz = sel.value === CUSTOM ? document.getElementById('clock-custom').value.trim() : sel.value;
+  try {
+    const res = await fetch('/api/time', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tz: tz })
+    });
+    if (res.ok) {
+      msg.textContent = 'Saved.';
+      msg.className = 'ok';
+      delete sel.dataset.touched;
+      refreshClock();
+    } else {
+      msg.textContent = (await res.text()) || 'Failed to save';
+      msg.className = 'error';
+    }
+  } catch (err) {
+    msg.textContent = 'Could not reach the bridge';
+    msg.className = 'error';
+  }
+});
+
+if (document.getElementById('clock-panel').style.display !== 'none') {
+  refreshClock();
+  // Slow on purpose. The only thing that moves here is the wall clock, and the
+  // httpd has a single worker task shared with everything else on this page.
+  setInterval(refreshClock, 10000);
+}
 
 document.getElementById('admin-form').addEventListener('submit', async (e) => {
   e.preventDefault();

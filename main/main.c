@@ -35,6 +35,8 @@
 #include "syslog_cfg.h"
 #include "wan.h"
 #include "wan_cfg.h"
+#include "clock_cfg.h"
+#include "clock_time.h"
 
 static const char *TAG = "AOG-BRIDGE";
 
@@ -338,6 +340,26 @@ void app_main(void)
     // off. An error here means a mutex or a task could not be created, which is
     // the class of failure that check exists for.
     ESP_ERROR_CHECK(syslog_init(br_netif));
+
+    // Timezone cache. Same placement reasoning as syslog_cfg_init() above - the
+    // web server and the console both read and write it - and it must precede
+    // clock_time_init() below, which renders times in whatever zone this
+    // applied.
+    ESP_ERROR_CHECK(clock_cfg_init());
+
+    // The clock. Must follow esp_netif_init() (it registers an SNTP handler on
+    // an IP event) and clock_cfg_init(), and must precede wan_init() below,
+    // whose GOT_IP handler is what actually starts the client.
+    //
+    // Not ESP_ERROR_CHECK'd, for the same reason reset_log_init() is not: a
+    // device that cannot find out what time it is has lost a diagnostic, not a
+    // function, and must still bridge. Note that reset_log_init() ran long
+    // before this and already stamped this boot's record if a clock survived the
+    // reset - that path needs nothing from here.
+    esp_err_t clock_ret = clock_time_init();
+    if (clock_ret != ESP_OK) {
+        ESP_LOGW(TAG, "clock unavailable: %s", esp_err_to_name(clock_ret));
+    }
 
     // WAN settings cache. Same placement reasoning as
     // syslog_cfg_init() above: the web server and the console both read and

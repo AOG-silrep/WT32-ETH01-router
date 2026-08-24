@@ -11,6 +11,8 @@
 #include "sys_monitor.h"
 #include "eth_link.h"
 #include "reset_log.h"
+#include "clock_time.h"
+#include "clock_cfg.h"
 #include "log_buf.h"
 #include "syslog.h"
 #include "syslog_cfg.h"
@@ -1002,6 +1004,26 @@ static esp_err_t clients_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// Renders a time_t as a quoted JSON string, or the literal `null` when the
+// device has no time to put there. `out` must be JSON_TIME_MAX bytes.
+//
+// Null rather than an empty string, and factored out rather than repeated,
+// because the rule is easy to get subtly wrong in one of several places: a
+// reader must not be able to mistake "this boot never had a clock" for a time
+// that failed to render. Same reasoning as ip_or_empty() above, and the same
+// shape the reset-history fields (`reached_ready`, `rail_held`) already use.
+#define JSON_TIME_MAX (CLOCK_TIME_STR_MAX + 2)
+static void json_time_or_null(char *out, size_t outsz, bool have, time_t t)
+{
+    if (!have) {
+        strlcpy(out, "null", outsz);
+        return;
+    }
+    char rendered[CLOCK_TIME_STR_MAX];
+    clock_time_format(t, rendered, sizeof(rendered));
+    snprintf(out, outsz, "\"%s\"", rendered);
+}
+
 // Renders an address for JSON, but as an empty string when it is 0. A lease
 // this server never handed out, or a mapping never committed to flash, is an
 // absent address rather than 0.0.0.0 - emitting the sentinel would make the
@@ -1134,6 +1156,13 @@ static esp_err_t leases_get_handler(httpd_req_t *req)
 // rather than a reading. A client that ignores the window and reads uptime_s
 // alone will understate a duration, never overstate one, which is why zero is a
 // safe value to send there: it means "under uptime_max_s", not "no time at all".
+//
+// when/when_epoch are the wall-clock instant the boot OPENED BY this record
+// started, and are null together on any record whose boot never had a
+// trustworthy clock - see RESET_LOG_F_BOOT_TIME. A client must treat them as
+// extra evidence rather than as the record's identity: the ordering and the
+// durations are complete on their own and are all that most records will ever
+// carry.
 static esp_err_t resets_get_handler(httpd_req_t *req)
 {
     if (!check_admin_auth(req)) {
@@ -1148,13 +1177,16 @@ static esp_err_t resets_get_handler(httpd_req_t *req)
     reset_log_entry_t recs[RESET_LOG_MAX_RECORDS];
     int count = reset_log_get(recs, RESET_LOG_MAX_RECORDS);
 
-    // 265 bytes is a measured worst-case entry with an empty version - the
+    // 329 bytes is a measured worst-case entry with an empty version - the
     // longest reason and intent tokens, seq and uptimes at 10 digits, and the
-    // keys - so 288 still leaves room, but less than it looks: it was 198 before
-    // uptime_approx, 220 before uptime_max_s (which used up the old 240), and
-    // 246 before rail_held added "rail_held":false and its comma. Recheck this
-    // rather than assume it when adding the next one; the next field but one
-    // will not fit.
+    // keys - so 352 still leaves room, but less than it looks: it was 198 before
+    // uptime_approx, 220 before uptime_max_s (which used up the old 240), 246
+    // before rail_held added "rail_held":false and its comma, and 265 before the
+    // two timestamp fields took 64 between them ("when" at a 19-character
+    // rendering plus quotes, "when_epoch" budgeted for a signed 64-bit value
+    // rather than the 10 digits it will hold for the next eighty years).
+    // Recheck this rather than assume it when adding the next one; the previous
+    // allowance had run out and this one is not generous either.
     // The measurement caps reason_code at 3 digits because it is a uint8_t. On top
     // of that the 6x
     // expansion of JSON-escaping a version string: that string was written by a
@@ -1162,7 +1194,7 @@ static esp_err_t resets_get_handler(httpd_req_t *req)
     // device-supplied side of json_append_escaped()'s rule even though nothing
     // on the network chose it. Static because the httpd worker's 8KB stack is
     // shared with the OTA path, same as the other list endpoints here.
-    static char resp[RESET_LOG_MAX_RECORDS * 288 +
+    static char resp[RESET_LOG_MAX_RECORDS * 352 +
                      RESET_LOG_MAX_RECORDS * 6 * RESET_LOG_VERSION_MAX + 96];
     int off = resp_append(resp, sizeof(resp), 0,
                            "{\"max\":%d,\"count\":%d,\"resets\":[",
@@ -1205,6 +1237,27 @@ static esp_err_t resets_get_handler(httpd_req_t *req)
             rail_str = (e->flags & RESET_LOG_F_RAIL_HELD) ? "true" : "false";
         }
 
+        // Two fields for one fact, and the split is deliberate. "when" is
+        // rendered here because the device owns the timezone and a browser
+        // cannot parse a POSIX TZ string, so letting the client format would put
+        // the web page in a different zone from the console on the same device.
+        // "when_epoch" is for arithmetic only - the gap between two boots, which
+        // is the same number in every zone - so a client never has to parse the
+        // string back to compute one.
+        //
+        // Null on both when the record has no time, which is every record
+        // written before this firmware and every boot that never reached an NTP
+        // server. Null rather than an empty string, matching reached_ready and
+        // rail_held: the reader must not be able to mistake "no clock" for a
+        // time it failed to read.
+        bool have_when = (e->flags & RESET_LOG_F_BOOT_TIME) != 0;
+        char when_str[JSON_TIME_MAX];
+        json_time_or_null(when_str, sizeof(when_str), have_when, (time_t)e->boot_epoch);
+        char when_epoch_str[24] = "null";
+        if (have_when) {
+            snprintf(when_epoch_str, sizeof(when_epoch_str), "%lld", (long long)e->boot_epoch);
+        }
+
         // reason_code carries the raw esp_reset_reason_t beside the token, so a
         // value this build's switch does not enumerate - a newer IDF, or a record
         // written by a later firmware into the same struct version - is still
@@ -1214,6 +1267,7 @@ static esp_err_t resets_get_handler(httpd_req_t *req)
                            "\"intent\":\"%s\",\"uptime_s\":%s,\"uptime_approx\":%s,"
                            "\"uptime_max_s\":%s,\"reached_ready\":%s,"
                            "\"rail_held\":%s,"
+                           "\"when\":%s,\"when_epoch\":%s,"
                            "\"ota_pending\":%s,\"rollback\":%s,"
                            "\"partition\":\"%s\",\"version\":\"",
                            i == 0 ? "" : ",",
@@ -1222,6 +1276,7 @@ static esp_err_t resets_get_handler(httpd_req_t *req)
                            reset_log_intent_name(e->intent),
                            uptime_str, approx ? "true" : "false", uptime_max_str, ready_str,
                            rail_str,
+                           when_str, when_epoch_str,
                            (e->flags & RESET_LOG_F_OTA_PENDING) ? "true" : "false",
                            (e->flags & RESET_LOG_F_ROLLBACK) ? "true" : "false",
                            // A partition-table label, a build artefact of this
@@ -1442,15 +1497,51 @@ static esp_err_t system_get_handler(httpd_req_t *req)
     uint32_t q_up = 0, q_down = 0;
     client_track_get_quarantine_drops(&q_up, &q_down);
 
-    // 1024 rather than 768. Measured worst case - every %u at ten digits, the
-    // longest reason and intent tokens, and a full 31-character version - is 930
-    // bytes with the boot_* and ip_conflict_* fields and 622 without, so 768 was
-    // not merely tight, it was 162 bytes short. The old figure was measured
+    // This boot's start time, and the state of the clock that produced it. Note
+    // boot_when comes off the RECORD rather than being recomputed from the
+    // uptime: they agree to within a second, and using the record means the
+    // dashboard cannot disagree with the /resets row for the same boot.
+    char boot_when_str[JSON_TIME_MAX];
+    json_time_or_null(boot_when_str, sizeof(boot_when_str),
+                      have_boot && (boot.flags & RESET_LOG_F_BOOT_TIME),
+                      (time_t)boot.boot_epoch);
+    // The rendered string only, unlike /api/resets, which sends an epoch beside
+    // it. That endpoint needs one because the page does arithmetic on it - the
+    // dark gap between two boots is a subtraction - and this one has no
+    // arithmetic to do. Every consumer of these fields either displays them or
+    // tests them for null, and the string answers both.
+    char now_str[JSON_TIME_MAX];
+    char now_zone[16] = "";
+    time_t clock_now = 0;
+    bool have_now = clock_time_now(&clock_now);
+    json_time_or_null(now_str, sizeof(now_str), have_now, clock_now);
+    if (have_now) {
+        strlcpy(now_zone, clock_time_zone_abbrev(clock_now), sizeof(now_zone));
+    }
+
+    // Counted, not estimated. This buffer has twice been set to a figure that
+    // looked comfortable and was not: 768 when the real worst case was 930, then
+    // 1024 when boot_rail_held took it to 954 and left no room for the clock
+    // fields at all. Both figures were estimates, and the second was measured
     // against a short "1.3.0" when esp_app_desc_t.version holds 32 characters.
-    // boot_rail_held took it to 954. Overflow is caught (resp_send_json sends a
-    // 500, and smoke.sh runs this endpoint through jq -e) but it shouldn't be
-    // run this close.
-    char resp[1024];
+    //
+    // The count, for the format string immediately below: 667 fixed characters,
+    // 22 %u at ten digits, one %llu at twenty, and 18 %s worst cases summing to
+    // 182 - the longest reason ("deep-sleep") and intent ("factory-reset")
+    // tokens, three ten-digit uptimes, two quoted 19-character times, a
+    // 15-character zone abbreviation and a 31-character version. That is 1089.
+    // Recount when a field is added; adding one is what invalidated the last two
+    // figures.
+    //
+    // 1536 rather than 1280, which would fit. Overflow is caught rather than
+    // silent - resp_send_json() sends a 500, and smoke.sh runs this endpoint
+    // through jq -e - but a 500 on the endpoint the dashboard polls is a poor
+    // way to find out, and the margin is what has been wrong here twice.
+    //
+    // Static, like the list endpoints above, rather than another 1.5KB on the
+    // httpd worker's 8KB stack that the OTA path shares. esp_http_server
+    // services every socket from one task, so there is no second caller to race.
+    static char resp[1536];
     int len = resp_append(resp, sizeof(resp), 0,
                           "{\"uptime_s\":%llu,\"free_heap\":%u,\"min_free_heap\":%u,"
                           "\"cpu_pct\":[%u,%u],\"cpu_freq_mhz\":%u,\"net_rx_bps\":%u,\"net_tx_bps\":%u,"
@@ -1467,6 +1558,9 @@ static esp_err_t system_get_handler(httpd_req_t *req)
                           "\"boot_prev_uptime_s\":%s,\"boot_prev_uptime_approx\":%s,"
                           "\"boot_prev_uptime_max_s\":%s,\"boot_prev_ready\":%s,"
                           "\"boot_rail_held\":%s,\"boot_rollback\":%s,"
+                          "\"boot_when\":%s,"
+                          "\"now\":%s,\"now_zone\":\"%s\","
+                          "\"clock_source\":\"%s\",\"clock_stale\":%s,"
                           "\"version\":\"%s\"}",
                           (unsigned long long)(esp_timer_get_time() / 1000000ULL),
                           (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(),
@@ -1496,6 +1590,10 @@ static esp_err_t system_get_handler(httpd_req_t *req)
                           boot_uptime_str, boot_uptime_approx ? "true" : "false",
                           boot_uptime_max_str, boot_ready_str, boot_rail_str,
                           (have_boot && (boot.flags & RESET_LOG_F_ROLLBACK)) ? "true" : "false",
+                          boot_when_str,
+                          now_str, now_zone,
+                          clock_time_source(),
+                          clock_time_stale() ? "true" : "false",
                           app_desc->version);
     if (!resp_send_json(req, resp, len, sizeof(resp))) {
         return ESP_FAIL;
@@ -2046,6 +2144,132 @@ static esp_err_t syslog_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// The timezone setting, the live clock, and where that clock came from - one
+// object, so the admin page renders its Clock section in a single fetch.
+//
+// The zone list ships with the response rather than being hard-coded in the
+// page, for the reason reset_log_reason_name() exists: the console offers the
+// same menu, and two copies of a list like this drift. What a caller does with
+// "zones" is offer them; "tz" is the only field that decides anything.
+static esp_err_t time_get_handler(httpd_req_t *req)
+{
+    if (!check_admin_auth(req)) {
+        send_auth_error(req);
+        return ESP_OK;
+    }
+    if (auth_cfg_password_is_default()) {
+        send_setup_required(req);
+        return ESP_OK;
+    }
+
+    clock_cfg_t cfg;
+    clock_cfg_get(&cfg);
+
+    char now_str[JSON_TIME_MAX];
+    char abbrev[16] = "";
+    time_t now = 0;
+    bool have_now = clock_time_now(&now);
+    json_time_or_null(now_str, sizeof(now_str), have_now, now);
+    if (have_now) {
+        strlcpy(abbrev, clock_time_zone_abbrev(now), sizeof(abbrev));
+    }
+
+    // 0 is the "never synced this power-cycle" sentinel rather than a time, so
+    // it is the gate here - see clock_time_last_sync().
+    char sync_str[JSON_TIME_MAX];
+    time_t last = clock_time_last_sync();
+    json_time_or_null(sync_str, sizeof(sync_str), last != 0, last);
+
+    // 2048 against a measured worst case of 1828. The zone table is the bulk of
+    // it - 1454 bytes for the 28 entries as JSON, counted rather than estimated,
+    // because a first guess of "~40 bytes each" was low by a third and would
+    // have sized this buffer under the response it has to hold. It is a
+    // compiled-in literal, so it only grows when somebody adds a zone to
+    // k_zones[] in clock_cfg.c: check this figure when they do. The remaining
+    // 374 is the fixed keys, two 19-character times, the zone abbreviation, and
+    // the stored tz, which is user-supplied and goes through
+    // json_append_escaped() - that can expand any byte to \uXXXX, so 39
+    // characters can reach 234 on their own.
+    static char resp[2048];
+    int off = resp_append(resp, sizeof(resp), 0, "{\"tz\":\"");
+    off = json_append_escaped(resp, sizeof(resp), off, cfg.tz);
+    off = resp_append(resp, sizeof(resp), off,
+                      "\",\"now\":%s,\"zone\":\"%s\",\"source\":\"%s\","
+                      "\"stale\":%s,\"last_sync\":%s,\"zones\":[",
+                      now_str, abbrev, clock_time_source(),
+                      clock_time_stale() ? "true" : "false", sync_str);
+
+    const char *label, *tz;
+    for (int i = 0; clock_cfg_zone(i, &label, &tz); i++) {
+        // Both are compiled-in literals from clock_cfg.c, so no escaping is
+        // needed - that helper is for device-supplied strings.
+        off = resp_append(resp, sizeof(resp), off, "%s{\"label\":\"%s\",\"tz\":\"%s\"}",
+                          i == 0 ? "" : ",", label, tz);
+    }
+    off = resp_append(resp, sizeof(resp), off, "]}");
+
+    if (!resp_send_json(req, resp, off, sizeof(resp))) {
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+// Takes effect immediately and deliberately does not reboot, unlike the WiFi
+// and WAN saves: a timezone changes how times are rendered and nothing about
+// how the device is on the network, so there is nothing to tear down. The next
+// poll of any page shows the new zone.
+static esp_err_t time_post_handler(httpd_req_t *req)
+{
+    if (!check_admin_auth(req)) {
+        send_auth_error(req);
+        return ESP_OK;
+    }
+    if (auth_cfg_password_is_default()) {
+        send_setup_required(req);
+        return ESP_OK;
+    }
+    if (!csrf_check(req, "application/json")) {
+        return ESP_FAIL;
+    }
+
+    char buf[128];
+    if (recv_body(req, buf, sizeof(buf)) < 0) {
+        return ESP_FAIL;
+    }
+
+    // Starts from what is saved, so a caller that omits the field keeps the
+    // current value - the same contract wifi_post_handler() follows.
+    clock_cfg_t cfg;
+    clock_cfg_get(&cfg);
+    char want[CLOCK_CFG_TZ_MAX_LEN];
+    if (!json_get_string(buf, "tz", want, sizeof(want))) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing \"tz\"");
+        return ESP_FAIL;
+    }
+    // An IANA label is accepted here as well as a POSIX string, so this endpoint
+    // takes the same words the console's "time" command does. Without it a
+    // caller posting "America/Chicago" would get no error and a clock in UTC -
+    // newlib parses what it recognises and silently treats the rest as UTC, so
+    // the mistake surfaces hours later as a wrong timestamp rather than as a
+    // rejected request. The web form itself always posts the POSIX string.
+    const char *resolved = clock_cfg_zone_from_label(want);
+    strlcpy(cfg.tz, resolved ? resolved : want, sizeof(cfg.tz));
+
+    const char *err_msg = NULL;
+    if (!clock_cfg_validate(&cfg, &err_msg)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, err_msg);
+        return ESP_FAIL;
+    }
+    if (clock_cfg_save(&cfg) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save the timezone");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 static esp_err_t wan_get_handler(httpd_req_t *req)
 {
     if (!check_admin_auth(req)) {
@@ -2346,10 +2570,13 @@ static esp_err_t logs_download_get_handler(httpd_req_t *req)
         off = resp_append(chunk, sizeof(chunk), off, "syslog          disabled\n");
     }
     off = resp_append(chunk, sizeof(chunk), off,
-                      "timestamps      milliseconds since this boot started. This device has no\n"
-                      "                clock: no RTC battery, no SNTP uplink, and a transparent\n"
-                      "                bridge has no reliable time source. Nothing here can be\n"
-                      "                dated.\n"
+                      "timestamps      milliseconds since this boot started, deliberately, even\n"
+                      "                when the device does know the wall-clock time. There is no\n"
+                      "                RTC battery here, so a clock exists only while the WAN can\n"
+                      "                reach an NTP server - and a log whose lines are relative\n"
+                      "                for the first part of a boot and absolute afterwards is\n"
+                      "                harder to read than one that is consistently relative. The\n"
+                      "                reboot history at /resets IS dated where it can be.\n"
                       "\n");
     // Built from the same field widths as LOGS_DL_LINE_FMT rather than written
     // out as a literal, so the two cannot drift apart - the first attempt was a
@@ -2479,6 +2706,8 @@ httpd_handle_t web_server_start(void)
     const httpd_uri_t status_uri = {.uri = "/api/status", .method = HTTP_GET, .handler = status_get_handler};
     const httpd_uri_t wifi_uri = {.uri = "/api/wifi", .method = HTTP_POST, .handler = wifi_post_handler};
     const httpd_uri_t admin_uri = {.uri = "/api/admin", .method = HTTP_POST, .handler = admin_post_handler};
+    const httpd_uri_t time_get_uri = {.uri = "/api/time", .method = HTTP_GET, .handler = time_get_handler};
+    const httpd_uri_t time_post_uri = {.uri = "/api/time", .method = HTTP_POST, .handler = time_post_handler};
     const httpd_uri_t clients_uri = {.uri = "/api/clients", .method = HTTP_GET, .handler = clients_get_handler};
     const httpd_uri_t history_uri = {.uri = "/api/client/history", .method = HTTP_GET, .handler = client_history_get_handler};
     const httpd_uri_t kick_uri = {.uri = "/api/clients/kick", .method = HTTP_POST, .handler = kick_post_handler};
@@ -2525,6 +2754,8 @@ httpd_handle_t web_server_start(void)
     httpd_register_uri_handler(server, &lan_page_uri);
     httpd_register_uri_handler(server, &wan_get_uri);
     httpd_register_uri_handler(server, &wan_post_uri);
+    httpd_register_uri_handler(server, &time_get_uri);
+    httpd_register_uri_handler(server, &time_post_uri);
 
     ESP_LOGI(TAG, "Web server started");
     return server;

@@ -9,6 +9,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
+#include "clock_time.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -20,7 +21,7 @@ static const char *TAG = "reset_log";
 #define NVS_RING_KEY  "ring"
 #define NVS_CKPT_KEY  "upck"
 #define STORE_MAGIC   0x474C5352  // 'RSLG'
-#define STORE_VERSION 1
+#define STORE_VERSION 2
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -29,31 +30,68 @@ typedef struct __attribute__((packed)) {
     uint32_t next_seq;  // boot_seq to hand the next record
 } stored_hdr_t;
 
-// Constant at version 1, unlike dhcp_server.c's, which already has a version to
-// be older than. Kept in the same shape anyway, because it marks the seam: the
-// load path reads the version out of a prefix before trusting the rest of the
-// header, so a version 2 that grows this struct has somewhere to grow into
-// without a flag day.
+// The header has not needed to grow yet - version 2 added a field to the record
+// rather than to this - but the seam is what made that possible without a flag
+// day, so it stays: the load path reads the version out of a prefix before
+// trusting the rest of the header.
 #define STORED_HDR_LEN(ver) (sizeof(stored_hdr_t))
 
+// Version 1's record, frozen. Kept as a declaration rather than reconstructed
+// with offset arithmetic in the load path, because a layout whose whole job is
+// to never change again is clearer stated than computed - and because the
+// arithmetic version would silently follow RESET_LOG_VERSION_MAX if anyone ever
+// moved it, which is exactly the bug this guards against.
 typedef struct __attribute__((packed)) {
     uint32_t boot_seq;
     uint32_t uptime_s;
     uint8_t  reason;
     uint8_t  intent;
     uint8_t  flags;
-    uint8_t  rsvd;    // 0; keeps the struct 4-aligned and gives version 2 a byte
+    uint8_t  rsvd;
     char     version[RESET_LOG_VERSION_MAX];
     char     part[RESET_LOG_PART_MAX];
+} stored_rec_v1_t;
+
+// Version 2 appends the wall-clock instant the boot started, gated by
+// RESET_LOG_F_BOOT_TIME in flags. Appended rather than fitted into the spare
+// byte the version-1 comment offered: that byte was sized for a flag, and this
+// is a time.
+//
+// int64_t rather than the uint32_t that would have fitted the spare space
+// better. A 32-bit epoch stops in 2038, which for a device that goes on a
+// machine and stays there is a date this firmware could plausibly still be
+// running on, and a boot history that starts lying about the year is worse than
+// one that never claimed to know it. Eight bytes takes the blob from 716 to 844,
+// which the constraint below absorbs without noticing.
+typedef struct __attribute__((packed)) {
+    uint32_t boot_seq;
+    uint32_t uptime_s;
+    uint8_t  reason;
+    uint8_t  intent;
+    uint8_t  flags;
+    uint8_t  rsvd;    // 0; keeps the fixed part 4-aligned
+    char     version[RESET_LOG_VERSION_MAX];
+    char     part[RESET_LOG_PART_MAX];
+    int64_t  boot_epoch;
 } stored_rec_t;
 
-// 12 + 16 * 44 = 716 bytes, comfortably inside NVS's 1984-byte single-page blob
+// A record's size depends on the version that wrote it, which is the whole
+// reason a version-1 ring can still be read. Everything walking a stored blob
+// must size its stride with this and never with sizeof(stored_rec_t) - that
+// constant is this build's layout, not the blob's.
+#define STORED_REC_LEN(ver) ((ver) >= 2 ? sizeof(stored_rec_t) : sizeof(stored_rec_v1_t))
+
+// 12 + 16 * 52 = 844 bytes, comfortably inside NVS's 1984-byte single-page blob
 // chunk, so the blob never splits across pages of the 24KB partition (see
-// partitions.csv) that wifi_config, auth_cfg and dhcp_leases already share.
+// partitions.csv) that wifi_config, auth_cfg and dhcp_leases already share. It
+// was 716 at version 1; the timestamp field cost 128 and the margin is still
+// better than two to one.
 //
-// This blob is written once per boot and never at runtime, which is what keeps
-// the uptime checkpoint below cheap: rewriting 716 bytes on every checkpoint
-// would cost 23 NVS entries a time instead of one. Sixteen records is chosen
+// This blob is written once per boot, and at most once more at runtime - see
+// reset_log_note_time(), which is capped at one write per boot and only on a
+// boot that had no clock until SNTP handed it one. That cap is what keeps the
+// uptime checkpoint below cheap: rewriting 844 bytes on every checkpoint would
+// cost 27 NVS entries a time instead of one. Sixteen records is chosen
 // against the reader, not the flash: someone diagnosing a device that keeps
 // restarting needs enough rows to see whether the pattern repeats, and sixteen
 // shows that while still fitting one screen and one response buffer.
@@ -268,16 +306,23 @@ static void load_from_nvs(void)
     }
 
     size_t hdr_len = STORED_HDR_LEN(hdr.version);
+    size_t rec_len = STORED_REC_LEN(hdr.version);
     if (hdr.count > RESET_LOG_MAX_RECORDS ||
-        len < hdr_len + (size_t)hdr.count * sizeof(stored_rec_t)) {
+        len < hdr_len + (size_t)hdr.count * rec_len) {
         ESP_LOGW(TAG, "saved reset history claims %u records in %u bytes - starting over",
                  (unsigned)hdr.count, (unsigned)len);
         return;
     }
 
     for (int i = 0; i < hdr.count; i++) {
-        stored_rec_t s;
-        memcpy(&s, buf + hdr_len + (size_t)i * sizeof(stored_rec_t), sizeof(s));
+        const uint8_t *at = buf + hdr_len + (size_t)i * rec_len;
+        // The fixed part is byte-identical across both versions, so it is read
+        // through the version-1 layout whatever wrote it, and version 2's
+        // addition is picked up separately below. Reading a version-1 blob
+        // through the version-2 struct would walk off the end of the last
+        // record, which is why the stride and the layout are both versioned.
+        stored_rec_v1_t s;
+        memcpy(&s, at, sizeof(s));
         s_ring[i].boot_seq = s.boot_seq;
         s_ring[i].prev_uptime_s = s.uptime_s;
         s_ring[i].reason = s.reason;
@@ -290,6 +335,19 @@ static void load_from_nvs(void)
         // possibly written by a different firmware image.
         s_ring[i].version[RESET_LOG_VERSION_MAX - 1] = '\0';
         s_ring[i].part[RESET_LOG_PART_MAX - 1] = '\0';
+
+        s_ring[i].boot_epoch = 0;
+        if (hdr.version >= 2) {
+            stored_rec_t s2;
+            memcpy(&s2, at, sizeof(s2));
+            s_ring[i].boot_epoch = s2.boot_epoch;
+        } else {
+            // A version-1 record cannot carry a time, so the flag cannot be set
+            // on one. Cleared rather than trusted: 0x80 was unused at version 1
+            // and every writer left it clear, but this is a value off flash and
+            // the cost of not assuming is one AND.
+            s_ring[i].flags &= (uint8_t)~RESET_LOG_F_BOOT_TIME;
+        }
     }
     s_count = hdr.count;
     s_next_seq = hdr.next_seq ? hdr.next_seq : 1;
@@ -297,7 +355,12 @@ static void load_from_nvs(void)
     ESP_LOGI(TAG, "restored %d reset record%s from flash", s_count, s_count == 1 ? "" : "s");
 }
 
-static void save_to_nvs(void)
+// seed_checkpoint is false for the one caller that rewrites the ring after
+// startup - reset_log_note_time(). Seeding there would reset this boot's uptime
+// checkpoint to zero part-way through the boot, and the next boot would then
+// read that as "ended inside ten seconds" for a device that had been up for
+// hours. The seed belongs to the once-per-boot write and nothing else.
+static void save_to_nvs(bool seed_checkpoint)
 {
     uint8_t buf[STORED_BLOB_MAX];
     stored_hdr_t hdr = {
@@ -316,6 +379,7 @@ static void save_to_nvs(void)
         s.reason = s_ring[i].reason;
         s.intent = s_ring[i].intent;
         s.flags = s_ring[i].flags;
+        s.boot_epoch = s_ring[i].boot_epoch;
         memcpy(s.version, s_ring[i].version, RESET_LOG_VERSION_MAX);
         memcpy(s.part, s_ring[i].part, RESET_LOG_PART_MAX);
         memcpy(buf + off, &s, sizeof(s));
@@ -326,7 +390,7 @@ static void save_to_nvs(void)
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
     if (err == ESP_OK) {
         err = nvs_set_blob(h, NVS_RING_KEY, buf, off);
-        if (err == ESP_OK) {
+        if (err == ESP_OK && seed_checkpoint) {
             // This boot's uptime checkpoint, seeded at zero, riding the same
             // commit because both are once-per-boot writes to the same handle.
             // Tied to the ring on purpose: if the blob did not land, the next
@@ -493,6 +557,29 @@ esp_err_t reset_log_init(reset_rail_t rail)
 
     reset_log_entry_t rec = { 0 };
     rec.reason = (uint8_t)reason;
+
+    // The clock, if this reset left one standing. A trustworthy clock this early
+    // means it came through RTC memory from an earlier boot, which is only
+    // possible for a reset that preserved the RTC domain - so this arm covers
+    // panics, watchdogs, software resets and OTA restarts, and costs nothing:
+    // the stamp rides the ring write happening a few lines below.
+    //
+    // A power-on gets nothing here, because a power-on is exactly what wipes the
+    // registers IDF keeps the clock in. Those boots are stamped later, by
+    // reset_log_note_time(), if the WAN ever finds an NTP server.
+    //
+    // clock_time_now() is safe to call before clock_time_init(): it reads the
+    // RTC block and the system clock, both of which are standing by the time
+    // app_main runs, and its validity gate does not depend on that module having
+    // been started. Which matters, because this runs at main.c's third statement
+    // and the clock module needs esp_netif, which does not exist yet.
+    time_t now;
+    if (clock_time_now(&now)) {
+        int64_t up_s = esp_timer_get_time() / 1000000;
+        rec.boot_epoch = (int64_t)now - up_s;
+        rec.flags |= RESET_LOG_F_BOOT_TIME;
+    }
+
     if (prev_valid) {
         rec.flags |= RESET_LOG_F_PREV_STATE;
         rec.prev_uptime_s = prev_uptime;
@@ -583,7 +670,7 @@ esp_err_t reset_log_init(reset_rail_t rail)
     }
     s_ring[s_count++] = rec;
     s_have_current = true;
-    save_to_nvs();
+    save_to_nvs(true);
     xSemaphoreGive(s_mutex);
 
     const esp_timer_create_args_t args = {
@@ -686,6 +773,35 @@ void reset_log_checkpoint_tick(void)
     // is a truer statement than the ">20s" the table would have given - the same
     // reason tick_cb() samples esp_timer instead of incrementing a counter.
     save_checkpoint(up);
+}
+
+void reset_log_note_time(time_t boot_started_at)
+{
+    if (s_mutex == NULL) {
+        return;   // init never ran, or failed; nothing to stamp
+    }
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool write = false;
+    if (s_have_current && s_count > 0 &&
+        !(s_ring[s_count - 1].flags & RESET_LOG_F_BOOT_TIME)) {
+        s_ring[s_count - 1].boot_epoch = (int64_t)boot_started_at;
+        s_ring[s_count - 1].flags |= RESET_LOG_F_BOOT_TIME;
+        write = true;
+    }
+    if (write) {
+        // False: this is the runtime rewrite, and re-seeding the checkpoint here
+        // would tell the next boot this one ended in under ten seconds. See the
+        // note on save_to_nvs().
+        save_to_nvs(false);
+    }
+    xSemaphoreGive(s_mutex);
+
+    if (write) {
+        char when[CLOCK_TIME_STR_MAX];
+        clock_time_format(boot_started_at, when, sizeof(when));
+        ESP_LOGI(TAG, "this boot started at %s", when);
+    }
 }
 
 int reset_log_get(reset_log_entry_t *out, int max)

@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <time.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -18,17 +19,34 @@ extern "C" {
 // which is never true of the boot that actually mattered. A device installed in
 // a field erases its own evidence every time it comes back up.
 //
-// Nothing here is timestamped, and nothing here can be. This device cannot
-// measure elapsed time across a reboot: esp_timer_get_time() restarts at 0 every
-// boot, RTC memory is wiped by power-on, there is no RTC battery, and a
-// transparent L2 bridge has no uplink it can count on for SNTP. dhcp_server.c
-// states the same constraint for lease generations, and the consequence is the
-// same here - a board unplugged for a month and one power-cycled a second ago
-// produce identical records. What is recoverable is the *order* of resets and
-// the *duration* of the boot each one ended, and those two turn out to be what
-// the diagnosis actually needs: "panicked three times, each about ninety
-// seconds in" is a finding. "Panicked at 4:12am" would be nicer and is not on
-// offer.
+// Most of what is here is not timestamped, and the ordering-and-duration model
+// below is what this module is built on. The reason it was built that way: this
+// device cannot measure elapsed time across a reboot on its own.
+// esp_timer_get_time() restarts at 0 every boot, RTC memory is wiped by
+// power-on, and there is no RTC battery. dhcp_server.c states the same
+// constraint for lease generations, and the consequence was the same here - a
+// board unplugged for a month and one power-cycled a second ago produced
+// identical records. What is always recoverable is the *order* of resets and
+// the *duration* of the boot each one ended, and those two turn out to be most
+// of what the diagnosis needs: "panicked three times, each about ninety seconds
+// in" is a finding.
+//
+// "Panicked at 4:12am" used to be the thing that would be nicer and was not on
+// offer. It is now on offer some of the time, which is why every surface has to
+// be careful about which rows have it. The fourth reason in the original list -
+// that a transparent L2 bridge has no uplink it can count on for SNTP - stopped
+// being true when the WAN landed, and clock_time.h is the consequence. When a
+// boot has a trustworthy clock, its record carries the wall-clock instant the
+// boot started, under RESET_LOG_F_BOOT_TIME.
+//
+// What that does NOT change is any of the machinery below. A timestamp is an
+// extra fact about a record, never a replacement for its duration or its place
+// in the order: the clock is only present when the WAN was up and working, which
+// on most devices is some boots and on many is none. Every record already in
+// flash has no timestamp and cannot acquire one. So the ordering-and-duration
+// reading has to stay complete and correct on its own, and the date is
+// additional evidence layered on top of it - not a better version of it that the
+// surfaces can prefer.
 //
 // Duration comes from a counter in RTC slow memory, refreshed once a second at
 // runtime and costing nothing to keep. It survives software resets, panics,
@@ -156,6 +174,49 @@ typedef enum {
 #define RESET_LOG_F_RAIL_KNOWN 0x20
 #define RESET_LOG_F_RAIL_HELD  0x40
 
+// boot_epoch holds the wall-clock instant this boot STARTED - not the instant
+// the reset happened, though the two are within a second or so of each other,
+// and not the instant the clock arrived, which on a power-on boot is however
+// long the WAN took to associate and is sometimes minutes.
+//
+// Which boot it describes is worth being exact about, because the two halves of
+// this record describe two different boots. It is the LATER one: the boot this
+// record opened, the same boot boot_seq counts and version/part describe. The
+// previous boot's ending is derivable from it - subtract nothing, since the
+// reset is what started this boot - and the previous boot's START is this
+// instant minus prev_uptime_s, which inherits that figure's precision exactly:
+// exact under F_PREV_STATE, a floor under F_PREV_UPTIME_MIN, unavailable under
+// neither. A surface that derives it must carry the same marks.
+//
+// Set on one of two paths, and the record does not record which:
+//
+//   - The clock was already good when the record was written. That means it
+//     came through RTC memory from an earlier boot, so this reset preserved the
+//     RTC domain - a panic, a watchdog, a software reset, an OTA restart. Costs
+//     nothing; it rides the ring write that was happening anyway.
+//   - The clock arrived later, from SNTP, and reset_log_note_time() wrote it
+//     back. That is the power-on path, and the only case that spends a second
+//     flash write on a boot.
+//
+// A clear flag means the boot had no trustworthy clock at any point it could
+// have written one - no WAN, or a WAN that never reached an NTP server, or
+// firmware that predates this field. It does NOT mean the record is old or
+// unreliable in any other respect.
+//
+// What the flag does NOT carry, and the limit to know: how good the clock was
+// when it was read. The RTC runs on the internal RC oscillator
+// (CONFIG_RTC_CLK_SRC_INT_RC), so a device that synced, then ran a month with
+// the WAN down, then panicked, stamps its next record from a clock that has
+// drifted - of the order of a minute per day, temperature-dependent. The record
+// keeps no measure of that, so a stamp is worth trusting to the hour and to the
+// day, and not to the second, on any boot that did not sync recently.
+// clock_time_stale() answers the same question about the LIVE clock and is what
+// the surfaces disclose; it cannot answer it about a record written months ago.
+// Storing a staleness bit per record would fix that and is deliberately not
+// done here: it would put a second gate on every surface to qualify a figure
+// whose usable precision is a whole reset apart either way.
+#define RESET_LOG_F_BOOT_TIME  0x80
+
 // One reset event, written at the start of the boot that followed it. The two
 // halves describe different boots on purpose: reason, intent and prev_uptime_s
 // are how the PREVIOUS boot ended, version and part are what came up afterwards.
@@ -166,6 +227,7 @@ typedef struct {
     uint32_t prev_uptime_s;                  // exact under F_PREV_STATE, a floor
                                              // under F_PREV_UPTIME_MIN, and
                                              // meaningless under neither
+    int64_t  boot_epoch;                     // meaningful only under F_BOOT_TIME
     uint8_t  reason;                         // esp_reset_reason_t, stored raw
     uint8_t  intent;                         // reset_intent_t
     uint8_t  flags;                          // RESET_LOG_F_*
@@ -239,6 +301,24 @@ uint32_t reset_log_uptime_ceiling(uint32_t floor_s);
 // counter the whole module is built on, to record a duration less accurately.
 // Harmless before reset_log_init(), or after one that failed; it does nothing.
 void reset_log_checkpoint_tick(void);
+
+// Records the wall-clock instant this boot started, into this boot's record,
+// and rewrites the ring. Call once per boot, from an ordinary task, after the
+// clock first becomes trustworthy - clock_time_tick() is the only caller and
+// works out the instant by subtracting the uptime from the time it was handed.
+//
+// Ignored when the record already carries a time, which is the RTC-carried case
+// described at RESET_LOG_F_BOOT_TIME, and ignored on a later re-sync. That
+// once-only rule is deliberate and is the reason the flash budget survives this
+// feature: the note at the top of reset_log.c argues the ring is written once
+// per boot and never at runtime, and that argument sizes the whole wear
+// calculation. This makes it at most twice, capped, rather than once per sync -
+// so a WAN that flaps all day costs one extra write, not one per flap. What is
+// given up is correcting a timestamp by the few seconds a re-sync would move
+// it, which is not worth a flash write and not worth losing the invariant.
+//
+// Like everything else here, a failed write is logged and swallowed.
+void reset_log_note_time(time_t boot_started_at);
 
 // Copies up to max records, NEWEST FIRST, and returns the number written.
 // Thread-safe; intended for the HTTP server and console tasks.

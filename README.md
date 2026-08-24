@@ -67,8 +67,15 @@ anything that opens a socket means raising this number in the same change.
 
 The [WAN](#wan) deliberately adds none: NAPT lives inside
 `ip4_input`/`ip4_forward`, the station's DHCP client uses lwIP's raw `udp_pcb` API, and the
-packet filter is a pair of `netif` function pointers. A DNS relay or an NTP client would be
-the thing that breaks this budget, which is why neither is here.
+packet filter is a pair of `netif` function pointers.
+
+The NTP client is the case that looks like it should break this and does not, which
+is worth writing down because the reasoning is not visible from the call site. lwIP's SNTP
+client allocates a raw `udp_pcb` (`udp_new_ip_type()` in `sntp.c`), not a socket, and name
+resolution goes through `netconn_gethostbyname()`, which passes a `dns_api_msg` to the tcpip
+thread and waits on a semaphore — also no descriptor. So `getaddrinfo()` in `clock_time.c`
+costs nothing from this budget despite looking like ordinary socket code. A DNS *relay*, which
+would have to bind and listen, still would.
 
 Getting it wrong does not fail at startup, which is what makes it worth writing down. The
 new socket opens fine — there are only four in use while the device is booting — and the
@@ -149,10 +156,12 @@ circulation forever only makes the table harder to read.
 That it counts boots rather than hours is a deliberate choice on two counts. The lease is
 two hours, so expiring reservations with it would mean a laptop closed overnight loses its
 address on every reboot — precisely what this feature exists to prevent. And the device
-cannot measure elapsed time anyway: `esp_timer_get_time()` restarts at zero each boot,
-RTC memory is wiped by power-on, there is no RTC battery, and a transparent bridge has no
-uplink it can count on for SNTP. A board unplugged for a month is indistinguishable from
-one power-cycled a second ago.
+cannot be relied on to measure elapsed time anyway: `esp_timer_get_time()` restarts at zero
+each boot, RTC memory is wiped by power-on, and there is no RTC battery. A board unplugged
+for a month is indistinguishable from one power-cycled a second ago. A configured WAN can
+now supply a wall clock, and deliberately does not change this — a reservation table that
+expired by date on the devices with an uplink and by generation on the ones without would
+behave differently in two deployments of the same firmware.
 
 Counting *boots* does survive, though. Each save stamps the table with a generation
 number; an entry carries the generation it was last heard from in. The `SEEN` column
@@ -415,8 +424,13 @@ Both the form and the console reject one, and say why.
 **Timestamps are the RFC 5424 NILVALUE (`-`), and the collector stamps on receipt.** This is
 the same missing clock that makes the DHCP reservations count
 [boots rather than hours](#reservations-are-counted-out-in-boots-not-hours): no RTC battery,
-no SNTP uplink, and `esp_timer` restarts at zero every boot. The device will not write a
-timestamp it invented. What it does know rides along in the structured data instead:
+and `esp_timer` restarts at zero every boot. The device will not write a timestamp it
+invented. A configured WAN can supply a real clock, and these lines are still deliberately
+not dated from it — a log whose lines are relative for the first part of a boot and absolute
+after it is harder to read than one that is consistently relative, and for lines that arrive
+the collector's own receipt stamp is better than either. The reboot history *is* dated where
+it can be, because each record there is a single event rather than a stream. What this
+sender does know rides along in the structured data instead:
 
 ```
 <190>1 - wt32-bridge-4dab94 wifi 12 - [timeQuality tzKnown="0" isSynced="0"][aog@32473 up_ms="12481" seq="417" boot="12"] station 3c:71:bf:aa:bb:cc joined, AID 1
@@ -542,6 +556,8 @@ Every route returns JSON except `/api/logs/download`, which returns `text/plain`
 | `/api/logs?since=` | GET | `since` optional | log lines newer than the cursor, plus the `syslog_*` counters |
 | `/api/logs/download` | GET | — | the whole ring as `text/plain`, with a diagnostics header |
 | `/api/logs/level` | POST | `{"level":"info"}` | sets the capture level |
+| `/api/time` | GET | — | `{tz, now, zone, source, stale, last_sync, zones[]}` — the clock and the timezone it renders in |
+| `/api/time` | POST | `{"tz":"CST6CDT,M3.2.0,M11.1.0"}` | saves the timezone. Takes effect immediately — **no reboot** |
 | `/api/syslog` | GET | — | syslog settings and counters, plus `subnet` |
 | `/api/syslog` | POST | `{"enabled":1,"server":…,"port":…,"facility":…,"min_severity":…,"hostname":…}` | saves; omitted fields keep their value. `enabled` is `1`/`0`, not `true`/`false` |
 | `/api/wan` | GET | — | WAN settings, state, and the filter counters. Never returns the password |
@@ -582,16 +598,25 @@ and `restarted` when the device rebooted under your cursor.
 | `boot_prev_ready` | whether the previous boot finished starting, or `null` if unrecoverable |
 | `boot_rail_held` | the 3.3 V rail survived the reset, so it was an `EN`-pin reset rather than a power event; `null` if nothing measured it |
 | `boot_rollback` | the bootloader reverted a failed OTA image to reach this boot |
+| `boot_when` | when this boot started, rendered in the configured timezone, or `null` if it never had a clock |
+| `now`, `now_zone` | the current time and its zone abbreviation, or `null`/`""` with no clock |
+| `clock_source` | `ntp` (synced this boot), `carried` (inherited through RTC from an earlier boot), or `none` |
+| `clock_stale` | nothing has corrected the clock in over a day, so its seconds are no longer reliable |
 | `version` | contents of `version.txt` at build time |
 
 The `boot_*` fields summarise the newest entry in the reboot history; `/api/resets` and the
 `resets` console command carry the whole ring, and `/resets` renders it. Seven things about it
 are easy to get wrong:
 
-- **Nothing is timestamped, and nothing can be.** `esp_timer` restarts at 0 each boot, RTC
-  memory is wiped by power-on, there is no RTC battery, and a transparent bridge has no
-  reliable SNTP uplink. Resets can be ordered and each boot's *duration* measured; a board
-  unplugged for a month and one power-cycled a second ago produce identical records.
+- **Ordering and duration always; a date only sometimes.** `esp_timer` restarts at 0 each
+  boot, RTC memory is wiped by power-on, and there is no RTC battery — so resets are ordered
+  and each boot's *duration* measured, and that reading is complete on its own. A boot that
+  had a working WAN also gets `when`: the wall-clock instant it started, from NTP, in the
+  timezone set on `/admin`. A boot that did not have one shows no date and never will, which
+  includes every record written before this firmware. Two undated records still cannot be
+  told apart — a board unplugged for a month and one power-cycled a second ago produce
+  identical ones — but two *dated* ones bound the gap between them, which is what the `When`
+  column's tooltip reports.
 - **`power-on` and a hard power loss are the same record.** A dip the brownout detector
   catches while the chip is still running reports honestly as `brownout`, with its uptime
   intact. A rail that collapses past the chip's own reset threshold does not. The diagnosis is
@@ -780,9 +805,10 @@ list; the main ones:
 | `leases` | List DHCP leases and the MAC → IP reservations kept in flash — see [Clients keep their address across a reboot](#clients-keep-their-address-across-a-reboot). |
 | `loglevel [none\|error\|warn\|info\|debug\|verbose]` | Show or set how much log output reaches this serial console. Raises the web log page's capture level too, if that is what's holding the output back — see [Device log](#device-log). |
 | `syslog [on\|off] [-s <ip>] [-p <port>] [-f <facility>] [-l <severity>] [-n <name>]` | Show or set the remote syslog client. No args shows the settings and counters. The collector must be on the bridge's own subnet. Takes effect immediately — no reboot. See [Sending the log to a syslog server](#sending-the-log-to-a-syslog-server). |
-| `wan [on\|off] [-s <ssid>] [-p <password>] [--ports <list>]` | Show or set WiFi as WAN. No args shows the state and counters. Only the listed TCP ports can be reached through it. `--ports` takes effect immediately; changing the network, password or on/off reboots. See [WAN](#wan). |
+| `wan [on\|off] [-s <ssid>] [-p <password>] [--ports <list>]` | Show or set WiFi as WAN. No args shows the state and counters. Only the listed ports can be reached through it, plus DNS and NTP, which are always allowed. `--ports` takes effect immediately; changing the network, password or on/off reboots. See [WAN](#wan). |
 | `reboot` | Restart the device. |
-| `factory-reset yes` | Erase saved WiFi and admin credentials, the saved DHCP reservations, the remote syslog settings, and the WAN settings, restoring compiled-in defaults (WiFi `AOG hub`/`password`; admin `admin`/`admin`), then reboot. Clients are given fresh addresses and the device stops shipping its log anywhere. Bare `factory-reset` (no `yes`) just prints this warning and changes nothing. |
+| `time [<zone>] [-l]` | Show the clock and the timezone it is rendered in, or set the zone by IANA name (`America/Chicago`) or POSIX TZ string. `-l` lists the built-in zones. The clock itself comes from NTP over the WAN and cannot be set by hand. |
+| `factory-reset yes` | Erase saved WiFi and admin credentials, the saved DHCP reservations, the remote syslog settings, and the WAN settings, restoring compiled-in defaults (WiFi `AOG hub`/`password`; admin `admin`/`admin`), then reboot. The reboot history and the timezone are kept. Clients are given fresh addresses and the device stops shipping its log anywhere. Bare `factory-reset` (no `yes`) just prints this warning and changes nothing. |
 
 **Locked out of the web UI?** Connect over serial and run `factory-reset yes`. The device
 reboots with the default WiFi AP and `admin`/`admin` web login restored.
@@ -852,12 +878,25 @@ carries a protocol per rule rather than being the TCP-only list it started as. R
 use.
 
 Everything outside the list is still blocked, which is the point on a metered hotspot: browsers,
-Windows Update and telemetry have nowhere to go. Three things are exempt, and they have to be:
+Windows Update and telemetry have nowhere to go. Four things are exempt, and they have to be:
 
 - **ARP**, or the station never resolves its own gateway.
 - **DHCP** (UDP 68 → 67), or the station never gets an address.
 - **DNS**, but only to the resolver the upstream network handed us — not to any resolver of a
   client's choosing. Casters are named by hostname, so without this the feature does not work.
+- **NTP** (UDP 123), to any server. Unlike DNS this one is not narrowed to a single address,
+  and the reason is that it is not only for the bridge. A tablet behind this bridge has the
+  same missing clock the bridge does and worse consequences from it: TLS certificate
+  validation fails outright on a clock that is wrong by enough, and token auth against a
+  caster rejects stale requests. This bridge is the only route those clients have out, so
+  pinning the rule to one server would have meant nothing on the LAN could set its clock.
+  Because the filter runs after NAT it cannot tell the bridge's own packets from a client's,
+  so narrowing it was never going to protect the LAN from itself either — see
+  [What it costs](#what-it-costs).
+
+Do **not** add `123/udp` to the allowlist. It is already open, and the list is capped at
+twelve rules on the reasoning that a list long enough to need scrolling is a list nobody
+audits — a rule that changes nothing is one fewer for something that does.
 
 Everything else is dropped silently, with no RST and no ICMP error, so a blocked connection
 looks like a timeout rather than a refusal. `tx_blocked` on `/api/wan` (and in the web panel)
@@ -922,6 +961,14 @@ entry), claimed on the first `esp_netif_napt_enable()` and never given back. NAP
 deliberately never disabled on a WAN flap: `ip_napt_enable_netif(netif, 0)` frees the
 table, and `ip_napt_init()` guards its allocation with `assert()`, so toggling it would mean
 re-allocating 8 KB on a fragmented heap behind an abort.
+
+**The open NTP rule is a concession, and it is worth naming.** "What leaves this device is
+enumerable" now enumerates one more thing: UDP 123, to anywhere, from the bridge or from any
+LAN client. That is a low-bandwidth channel for anyone determined enough to tunnel over it —
+strictly less than the DNS exemption above already concedes, and bought for a clock that
+everything behind the bridge needs. It adds no inbound exposure at all: `ingress_allowed()`
+still admits only NAT return traffic in the `IP_NAPT_PORT_RANGE_*` window, so nothing on the
+upstream network can reach port 123 on this bridge or on anything behind it.
 
 **The L2 bridged path costs nothing.** `bridgeif_input()` forwards a unicast frame whose
 destination is not a local bridge MAC straight to `bridgeif_send_to_ports()` and frees it; it

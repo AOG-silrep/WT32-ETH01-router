@@ -178,14 +178,17 @@ static int s_restored_count;
 
 // This boot's generation number, one past whatever was last written to flash.
 //
-// Reservations are never expired by elapsed time, because this device cannot
-// measure it: esp_timer_get_time() restarts at 0 every boot, RTC memory is
-// wiped by power-on, there is no RTC battery, and a transparent L2 bridge has
-// no uplink it can count on for SNTP - a board unplugged for a month is
-// indistinguishable from one power-cycled a second ago. Reclaiming under
-// pressure needs only *ordering*, though, and that much is persistable: an
-// entry stamped with an older generation than another was seen longer ago,
-// whatever the wall-clock gap between them was.
+// Reservations are never expired by elapsed time, because this device cannot be
+// relied on to measure it: esp_timer_get_time() restarts at 0 every boot, RTC
+// memory is wiped by power-on, and there is no RTC battery - a board unplugged
+// for a month is indistinguishable from one power-cycled a second ago. A WAN
+// can now supply a wall clock (clock_time.h), and deliberately does not change
+// this: a reservation table that expires by date on the devices that have an
+// uplink and by generation on the ones that do not would behave differently in
+// two deployments of the same firmware, for a gain nothing here needs.
+// Reclaiming under pressure needs only *ordering*, though, and that much is
+// persistable: an entry stamped with an older generation than another was seen
+// longer ago, whatever the wall-clock gap between them was.
 //
 // It advances only on a boot that writes the table, which is exactly a boot
 // that changed something - so this costs no extra flash writes. Two quiet
