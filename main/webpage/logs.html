@@ -55,13 +55,25 @@
   .panel { border: 2px solid #888; border-radius: 4px; padding: 0.8em; margin-top: 1em; }
   .controls { display: flex; flex-wrap: wrap; gap: 1.2em; align-items: center; font-size: 0.9em; }
   .controls .spacer { flex: 1; }
-  #log-scroll { height: 65vh; overflow-y: auto; margin-top: 0.8em; border-top: 1px solid #ddd; }
+  /* overflow-x is stated rather than left to the spec's coercion - a box with
+     one axis set to something other than visible computes the other to auto,
+     so this pane always could scroll sideways. It never did, because the
+     message column wrapped (see td.m) and so was never wider than the pane. */
+  #log-scroll { height: 65vh; overflow-x: auto; overflow-y: auto; margin-top: 0.8em;
+                border-top: 1px solid #ddd; }
   table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
   th, td { text-align: left; padding: 0.25em 0.5em; border-bottom: 1px solid #eee; vertical-align: top; }
   th { position: sticky; top: 0; background: #fff; border-bottom: 1px solid #ddd; }
   td.n, td.t { font-family: monospace; color: #898781; white-space: nowrap; text-align: right; }
   td.g { font-family: monospace; white-space: nowrap; }
-  td.m { font-family: monospace; white-space: pre-wrap; word-break: break-word; width: 100%; }
+  /* pre, not pre-wrap: one log line is one row, and the pane scrolls sideways
+     to reach the end of a long one. Wrapping cost more than it saved on the
+     screen it was meant to help - the three columns to the left are all nowrap
+     and the tag alone can be 24 characters, so on a phone the message was left
+     a strip barely wide enough to break words in, and one line became six.
+     Runs of spaces are still preserved, as pre-wrap did; log_buf.c folds
+     interior newlines to spaces, so there are none here to honour. */
+  td.m { font-family: monospace; white-space: pre; width: 100%; }
   .badge { display: inline-block; min-width: 4.2em; text-align: center; padding: 0.1em 0.4em;
            border-radius: 3px; font-size: 0.85em; color: #fff; }
   .badge.E { background: #b00020; }
