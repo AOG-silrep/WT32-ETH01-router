@@ -43,8 +43,23 @@ code() { curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$@"; }
 echo "smoke: ${HOST} as ${USER}"
 
 # --- pages ------------------------------------------------------------------
+# One fetch per page, checked twice. The second check is on the sidebar: the nav
+# is pasted into all eight pages and only one line differs between them - the
+# entry for the page itself, which is a label rather than a link. An href on it
+# means clicking the page you are already on reloads it, losing the scroll
+# position and restarting the poll, and that is exactly the line a ninth page
+# would be copied with.
 for path in / /admin /wan /ports /lan /logs /leases /resets; do
-  check "GET ${path}" 200 "$(code "${AUTH[@]}" "http://${HOST}${path}")"
+  body=$(curl -s --max-time 10 -w '\n%{http_code}' "${AUTH[@]}" "http://${HOST}${path}")
+  check "GET ${path}" 200 "${body##*$'\n'}"
+
+  here=$(grep -o '<a[^>]*class="here"[^>]*>' <<<"$body")
+  case "$here" in
+    '')      got="no current entry" ;;
+    *href=*) got="still a link" ;;
+    *)       got=ok ;;
+  esac
+  check "nav ${path} entry is inert" ok "$got"
 done
 
 # --- JSON endpoints ---------------------------------------------------------

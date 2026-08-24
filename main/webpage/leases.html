@@ -13,9 +13,16 @@
   .sidenav { flex: 0 0 11em; box-sizing: border-box; position: sticky; top: 2em; font-size: 0.9em;
              border-right: 1px solid #ddd; padding-right: 1em; }
   .sidenav a { display: block; padding: 0.35em 0.5em; color: #2a78d6; text-decoration: none; border-radius: 3px; }
-  .sidenav a:hover { background: #eef4fc; }
+  .sidenav a[href]:hover { background: #eef4fc; }
   /* The current page stays in the list so the list keeps its shape, but it is
-     a label rather than a destination - hence text colour, not link colour. */
+     a label rather than a destination - hence text colour, not link colour, and
+     hence no href on it either. Without that it was still a destination: a
+     click reloaded the page you were already on, throwing away the scroll
+     position and restarting the poll. An <a> with no href is not a link, so the
+     click does nothing, it leaves the tab order, and no pointer cursor appears
+     over it - while every rule here still matches, since they select on the
+     element type. The hover rule above is scoped to [href] for the same
+     reason. */
   .sidenav a.here { color: #222; font-weight: 600; background: #f0efec; }
   /* Without min-width a wide table inside a flex item refuses to shrink and
      shoves the sidebar off-screen rather than scrolling itself. */
@@ -84,7 +91,7 @@
 <a href="/wan">WAN</a>
 <a href="/ports">Port Whitelist</a>
 <a href="/lan">LAN</a>
-<a href="/leases" class="here">DHCP leases</a>
+<a class="here" aria-current="page">DHCP leases</a>
 <a href="/logs">Device log</a>
 <a href="/resets">Reboot history</a>
 <a href="/admin">Admin</a>
