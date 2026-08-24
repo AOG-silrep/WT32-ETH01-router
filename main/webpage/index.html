@@ -122,7 +122,7 @@
     <tr><th>Free heap</th><td id="sys-heap">&hellip;</td></tr>
     <tr><th>CPU (core 0 / 1)</th><td id="sys-cpu">&hellip;</td></tr>
     <tr><th title="Measured from the CPU cycle counter timed against esp_timer_get_time(), independent of the configured clock setting.">CPU speed</th><td id="sys-cpu-freq" title="Measured from the CPU cycle counter timed against esp_timer_get_time(), independent of the configured clock setting.">&hellip;</td></tr>
-    <tr><th>Network (up / down)</th><td id="sys-net">&hellip;</td></tr>
+    <tr><th title="Bytes a second across the bridge, both directions summed over every client. Bytes, not bits - the Ethernet row's link speed is in bits, so the two are a factor of eight apart.">Bytes (up / down)</th><td id="sys-net" title="Bytes a second across the bridge, both directions summed over every client. Bytes, not bits - the Ethernet row's link speed is in bits, so the two are a factor of eight apart.">&hellip;</td></tr>
     <tr><th title="Frames/sec, all protocols (TCP, UDP, ARP, etc.) combined.">Packets (up / down)</th><td id="sys-pps" title="Frames/sec, all protocols (TCP, UDP, ARP, etc.) combined.">&hellip;</td></tr>
   </tbody>
 </table>
@@ -186,15 +186,39 @@
 // on the first request and attaches them to every request after that, so
 // there's no client-side login code here at all.
 
+// Decimal, not binary: a thousand steps to the next designator. Throughput is
+// quoted decimally everywhere a reader will have met it - the Ethernet row's
+// 100 Mbit, the figures on a hotspot's data plan - and it puts the two rate
+// rows of the System panel on the same ladder. Lower-case k with it, which is
+// what the decimal prefix is.
+//
+// formatBytes() below deliberately keeps 1024 and KB. That one measures heap,
+// and memory really is binary.
+//
+// The second step is not redundant. Picking the unit before rounding is the
+// obvious way to write this and prints "1000.0 kB/s" for 999,999 B/s, because
+// toFixed(1) rounds 999.999 up after the unit has already been chosen. The old
+// 1024-based version had the same fault at 1048575. So the mantissa is checked
+// once more against what it will actually render as.
+function formatScaled(n, units) {
+  let i = 0;
+  while (i < units.length - 1 && n >= 1000) { n /= 1000; i++; }
+  if (i < units.length - 1 && Number(n.toFixed(1)) >= 1000) { n /= 1000; i++; }
+  // Whole units are counts and print as they are; anything scaled gets one
+  // decimal, so "1.5 kBps" rather than "1.5000000001 kBps".
+  return (i === 0 ? n : n.toFixed(1)) + '\u00A0' + units[i];
+}
+
+// "kBps", not "kB/s". The System panel puts the two directions on one line
+// separated by a slash, and "12.4 kB/s / 3.1 kB/s" gives a reader three slashes
+// to sort out before the pair reads as a pair. The capital B still says bytes -
+// lower-case "bps" is bits, which these are not.
 function formatRate(bytesPerSec) {
-  if (bytesPerSec >= 1024 * 1024) return (bytesPerSec / (1024 * 1024)).toFixed(1) + '\u00A0MB/s';
-  if (bytesPerSec >= 1024) return (bytesPerSec / 1024).toFixed(1) + '\u00A0KB/s';
-  return bytesPerSec + '\u00A0B/s';
+  return formatScaled(bytesPerSec, ['Bps', 'kBps', 'MBps']);
 }
 
 function formatPps(n) {
-  if (n >= 1000) return (n / 1000).toFixed(1) + '\u00A0Kpps';
-  return n + '\u00A0pps';
+  return formatScaled(n, ['pps', 'kpps']);
 }
 
 function formatBytes(bytes) {
@@ -703,14 +727,17 @@ async function refreshSystem() {
     formatBytes(s.free_heap) + '<br>(min\u00A0' + formatBytes(s.min_free_heap) + ')';
   document.getElementById('sys-cpu').textContent = s.cpu_pct[0] + '% / ' + s.cpu_pct[1] + '%';
   document.getElementById('sys-cpu-freq').textContent = s.cpu_freq_mhz ? s.cpu_freq_mhz + ' MHz' : '…';
-  document.getElementById('sys-net').innerHTML =
-    formatRate(s.net_tx_bps) + '<br>' + formatRate(s.net_rx_bps);
+  // One line, matching the packets row below and the CPU row above. Both keep
+  // their own unit for the reason that row gives: the directions scale
+  // independently, so an upload in MBps beside a download in kBps is ordinary.
+  document.getElementById('sys-net').textContent =
+    formatRate(s.net_tx_bps) + ' / ' + formatRate(s.net_rx_bps);
   // One line, slashed the way the CPU row above separates its two cores - the
   // header already says which figure is which, and two short numbers did not
   // need two rows of height.
   //
   // Both keep their unit rather than sharing one at the end. The directions
-  // scale independently, so an upload in Kpps beside a download in pps is
+  // scale independently, so an upload in kpps beside a download in pps is
   // ordinary here, and "1.2 K / 800 pps" would read as a pair of figures in the
   // same unit when it is not. textContent rather than innerHTML now that there
   // is no markup left in it.
