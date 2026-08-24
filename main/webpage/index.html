@@ -87,6 +87,10 @@
   #traffic-canvas { width: 100%; height: 160px; display: block; margin-top: 0.4em; cursor: crosshair; }
   #chart-tooltip { font-size: 0.85em; color: var(--chart-muted); height: 1.2em; margin-top: 0.2em; }
   td.warn { color: #b00020; font-weight: 600; }
+  /* "Nothing to report", as against td.warn's "something is wrong". The grey
+     this file already uses for dl.facts dt and the version stamp, and the same
+     one resets.html gives its unknown cells. */
+  td.na { color: #898781; }
   /* Short enough to never need the panel's full width, so pinning it to one
      line cannot push the table wider than the panel on a phone. */
   #eth-flaps { white-space: nowrap; }
@@ -118,7 +122,7 @@
 <table>
   <tbody>
     <tr><th>Uptime</th><td id="sys-uptime">&hellip;</td></tr>
-    <tr id="sys-clock-row" style="display: none"><th title="The wall-clock time, learned from an NTP server over the WAN and shown in the timezone set on the Admin page. This device has no battery-backed clock, so it has no time at all until the WAN comes up and loses it again on a power cut — which is why boots that ran without a WAN are never dated in the reboot history.">Clock</th><td id="sys-clock">&hellip;</td></tr>
+    <tr><th id="sys-clock-label" title="The wall-clock time, learned from an NTP server over the WAN and shown in the timezone set on the Admin page. This device has no battery-backed clock, so it has no time at all until the WAN comes up and loses it again on a power cut — which is why boots that ran without a WAN are never dated in the reboot history.">Clock</th><td id="sys-clock">&hellip;</td></tr>
     <tr><th>Free heap</th><td id="sys-heap">&hellip;</td></tr>
     <tr><th>CPU (core 0 / 1)</th><td id="sys-cpu">&hellip;</td></tr>
     <tr><th title="Measured from the CPU cycle counter timed against esp_timer_get_time(), independent of the configured clock setting.">CPU speed</th><td id="sys-cpu-freq" title="Measured from the CPU cycle counter timed against esp_timer_get_time(), independent of the configured clock setting.">&hellip;</td></tr>
@@ -712,8 +716,11 @@ function resetText(s) {
 // "carried" is worth naming because it is the surprising case - the clock is
 // right, nothing synced it this boot, and the reason is that the reset did not
 // cut power, which is itself a fact about the reset.
+// The zone is not here - it is on the heading, set in the poll. What stays is
+// the reading and any caveat about believing it, which is a different kind of
+// thing from the unit it is expressed in.
 function formatClock(s) {
-  let t = s.now + (s.now_zone ? ' ' + s.now_zone : '');
+  let t = s.now;
   if (s.clock_stale) t += ' (drifting)';
   else if (s.clock_source === 'carried') t += ' (carried over)';
   return t;
@@ -747,22 +754,34 @@ async function refreshSystem() {
   // formatPps() puts before its unit.
   document.getElementById('sys-pps').textContent =
     formatPps(s.net_tx_pps) + ' / ' + formatPps(s.net_rx_pps);
-  // The row appears only once there is a clock. On a device with no WAN there
-  // never will be, and a permanent "unknown" in the System panel would read as a
-  // fault rather than as a capability this deployment does not use.
-  const clockRow = document.getElementById('sys-clock-row');
-  if (s.now === null) {
-    clockRow.style.display = 'none';
-  } else {
-    clockRow.style.display = '';
-    // Rendered by the device, in the device's timezone - see the note in
-    // resets.html's addRow() for why this is not formatted here.
-    const clockEl = document.getElementById('sys-clock');
-    clockEl.textContent = formatClock(s);
-    // Only the drifting case is a caveat worth colouring; "carried over" is a
-    // perfectly good clock that happens to have an interesting provenance.
-    clockEl.classList.toggle('warn', s.clock_stale);
-  }
+  // The zone rides in the heading, the way "(core 0 / 1)" and "(up / down)"
+  // do on the rows around it - the cell was wrapping onto a second line, and
+  // the zone was the four characters doing it. Written here rather than fixed
+  // in the markup because it is not fixed: it changes at a DST boundary and
+  // whenever the timezone is changed on /admin.
+  document.getElementById('sys-clock-label').textContent =
+    s.now_zone ? 'Clock (' + s.now_zone + ')' : 'Clock';
+
+  // The row used to hide itself when there was no clock, on the reasoning that
+  // a device with no WAN will never have one and a permanent "unknown" would
+  // read as a fault rather than as a capability this deployment does not use.
+  // A row that is sometimes simply absent turned out to be worse: it leaves the
+  // reader nothing to ask about. So it always shows, and that concern is
+  // answered by how it shows instead - N/A in the same grey as any other
+  // unknown rather than in the red of a fault, with the heading's tooltip
+  // explaining that this device has no clock until the WAN reaches an NTP
+  // server.
+  //
+  // The time itself is rendered by the device, in the device's timezone - see
+  // the note in resets.html's addRow() for why it is not formatted here.
+  const clockEl = document.getElementById('sys-clock');
+  const noClock = (s.now === null);
+  clockEl.textContent = noClock ? 'N/A' : formatClock(s);
+  clockEl.classList.toggle('na', noClock);
+  // Only the drifting case is a caveat worth colouring; "carried over" is a
+  // perfectly good clock that happens to have an interesting provenance. It
+  // cannot collide with .na above: a clock that does not exist cannot drift.
+  clockEl.classList.toggle('warn', s.clock_stale);
 
   // Plain text, with no link of its own: the header carries the one link to
   // /resets, and a second one inside the row bought nothing but width.
