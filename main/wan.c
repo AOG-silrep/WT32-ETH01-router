@@ -100,6 +100,12 @@ static void publish_rules(bool up, uint32_t dns_ip)
 }
 
 // ---------------------------------------------------------------------------
+// Shared by both drop loggers below. One gap for the pair rather than one each,
+// so a device dropping in both directions cannot produce twice the output of one
+// dropping in a single direction - the reader wants to know it is happening, not
+// to be given a packet trace on the console.
+#define REFUSED_LOG_GAP_MS 10000
+
 // The filter
 // ---------------------------------------------------------------------------
 
@@ -269,7 +275,6 @@ static bool egress_allowed(const wan_frame_t *f, const wan_rules_t *r)
 // nothing else legitimately does.
 static bool ingress_allowed(const wan_frame_t *f, const wan_rules_t *r)
 {
-    (void)r;
 
     if (f->eth->type == PP_HTONS(ETHTYPE_ARP)) {
         return true;
@@ -299,11 +304,116 @@ static bool ingress_allowed(const wan_frame_t *f, const wan_rules_t *r)
         if (dport == 68) {
             return true;  // our own DHCP client's offer/ack
         }
+        // Replies to the one thing this device is allowed to send for ITSELF.
+        //
+        // These are needed because the NAT-window rule below does not cover
+        // locally-originated traffic, and the reason is easy to miss: NAPT only
+        // rewrites FORWARDED packets, so a request the bridge sent on its own
+        // behalf keeps whatever local port lwIP gave it and the reply lands on
+        // that port - which is usually not in the NAT window, and was therefore
+        // dropped.
+        // Observed as "dropped inbound UDP from <resolver>:53 to our port 19153":
+        // the resolver was answering the whole time and this filter was eating
+        // the answer, which presents as DNS being broken on the bridge while
+        // every LAN client resolves fine.
+        //
+        // Matched on the SOURCE port rather than ours, for the same reason the
+        // egress rules match on destination: it is the half that identifies the
+        // service and the half translation leaves alone. It is additionally
+        // pinned to the resolver we are permitted to query, so this admits
+        // exactly the answers to the questions egress_allowed() lets out.
+        if (IPH_PROTO(f->ip) == IP_PROTO_UDP && sport == 53 &&
+            r->dns_ip != 0 && f->ip->src.addr == r->dns_ip) {
+            return true;
+        }
+        // What is left is the NAT return window, and it covers FORWARDED traffic
+        // and only that: ip_napt_new_port() can only ever hand out a port inside
+        // [IP_NAPT_PORT_RANGE_START, IP_NAPT_PORT_RANGE_END], so every
+        // translated reply lands in it and nothing else legitimately does.
+        //
+        // It does NOT cover this device's own traffic, which is what the rule
+        // above is for. An earlier version of this comment claimed it did, on
+        // the reasoning that lwIP draws local UDP ports from
+        // UDP_LOCAL_PORT_RANGE_START (0xc000) - the same 49152 this window
+        // starts at - so a reply to a locally-originated request would land
+        // inside it anyway. That is true of udp_new_port(). DNS does not use it.
+        //
+        // lwIP randomises the DNS source port deliberately, as cache-poisoning
+        // defence: LWIP_DNS_SECURE defaults to including
+        // LWIP_DNS_SECURE_RAND_SRC_PORT (nothing in IDF or our sdkconfig
+        // overrides it), and dns_alloc_random_port() then draws esp_random() and
+        // binds it if it is >= 1024. The query therefore leaves from anywhere in
+        // [1024, 65535], and the 19153 above was an ordinary draw rather than an
+        // anomaly.
+        //
+        // That pcb is allocated once and reused for the life of the boot, which
+        // is what made the old behaviour so unpleasant to diagnose. The draw
+        // either landed in this window or it did not, and DNS then worked, or
+        // was dead, for that entire boot. The window is 12288 of the 64512
+        // allowed ports, so roughly one boot in five resolved names perfectly
+        // and the other four could not resolve at all - which reads as a flaky
+        // network rather than as a filter bug.
+        //
+        // Which leaves one imprecision, for any future local traffic with no
+        // rule above: udp_new_port() runs to 0xffff while this window stops at
+        // 61439, so a device that has allocated more than about twelve thousand
+        // UDP ports since boot starts drawing ports this rule refuses. Nothing
+        // here comes close, but a feature that churns sockets would meet it as
+        // sporadic, self-healing packet loss, which is a horrible thing to debug
+        // without having read this.
         return dport >= IP_NAPT_PORT_RANGE_START && dport <= IP_NAPT_PORT_RANGE_END;
 
     default:
         return false;
     }
+}
+
+// The inbound mirror of log_refused(), and the more important of the two: an
+// egress refusal is usually policy working as intended, while an ingress
+// refusal of a reply to something this device asked for is a fault. The rule
+// below admits only the NAT return window, so anything legitimate that comes
+// back on a port outside it is silently lost - and the symptom is a feature
+// that "just does not work" with a counter climbing and nothing naming it.
+//
+// Deliberately quiet about the ordinary case. An upstream network sprays
+// broadcast and scan traffic at every address on it, all of which this filter
+// correctly drops, and logging that would bury the one line worth reading. So
+// only unicast frames addressed to this station are reported: those are either
+// a reply to something we sent, or someone probing us directly.
+static void log_dropped_in(const wan_frame_t *f)
+{
+    static int64_t s_last_us;
+
+    if (f->eth->type != PP_HTONS(ETHTYPE_IP) || f->ip == NULL) {
+        return;
+    }
+    // Broadcast and multicast are noise by definition here; only what was aimed
+    // at this station says anything.
+    struct netif *nif = (struct netif *)esp_netif_get_netif_impl(s_sta_netif);
+    if (nif == NULL || f->ip->dest.addr != netif_ip4_addr(nif)->addr) {
+        return;
+    }
+
+    int64_t now = esp_timer_get_time();
+    if (s_last_us != 0 && (now - s_last_us) < (int64_t)REFUSED_LOG_GAP_MS * 1000) {
+        return;
+    }
+    s_last_us = now;
+
+    esp_ip4_addr_t src = { .addr = f->ip->src.addr };
+    uint16_t sport, dport;
+    uint8_t proto = IPH_PROTO(f->ip);
+    if ((proto == IP_PROTO_UDP || proto == IP_PROTO_TCP) && l4_ports(f, &sport, &dport)) {
+        ESP_LOGW(TAG, "dropped inbound %s from " IPSTR ":%u to our port %u - only NAT "
+                      "replies (ports %u-%u) and DHCP are admitted. If this was a reply "
+                      "to something this bridge asked for, that request's source port "
+                      "fell outside the NAT window.",
+                 proto == IP_PROTO_UDP ? "UDP" : "TCP", IP2STR(&src), (unsigned)sport,
+                 (unsigned)dport,
+                 (unsigned)IP_NAPT_PORT_RANGE_START, (unsigned)IP_NAPT_PORT_RANGE_END);
+        return;
+    }
+    ESP_LOGW(TAG, "dropped inbound IP protocol %u from " IPSTR, (unsigned)proto, IP2STR(&src));
 }
 
 static err_t sta_input_wrapper(struct pbuf *p, struct netif *inp)
@@ -314,6 +424,7 @@ static err_t sta_input_wrapper(struct pbuf *p, struct netif *inp)
 
     if (frame_window(p, scratch, &f) && !ingress_allowed(&f, r)) {
         s_status.rx_blocked++;
+        log_dropped_in(&f);
         // Both drivers free the pbuf themselves when input returns anything but
         // ERR_OK, so this frees and reports success instead, keeping them on the
         // path they take for a frame that was delivered - see the same note in
@@ -325,6 +436,59 @@ static err_t sta_input_wrapper(struct pbuf *p, struct netif *inp)
     return s_sta_orig_input(p, inp);
 }
 
+// Names what the port list just refused, at most once every REFUSED_LOG_GAP_MS.
+//
+// tx_blocked on its own is a number that says "something you wanted did not
+// happen" without saying what, and the two commonest causes are invisible from
+// it: a port that is simply not on the list, and a client using its own DNS
+// server rather than the one this bridge handed it - which the rule above
+// refuses deliberately, and which looks to the user like DNS being broken
+// rather than like policy. One line naming the destination and port turns a
+// support question into a reading.
+//
+// Rate-limited hard because this runs in the WiFi driver task on the transmit
+// path: a blocked flow retries, and an unthrottled log here would cost more
+// than the traffic it is describing. Static, unlocked, and racy by design -
+// the worst a lost race does is print twice.
+
+static void log_refused(const wan_frame_t *f)
+{
+    static int64_t s_last_us;
+    int64_t now = esp_timer_get_time();
+    if (s_last_us != 0 && (now - s_last_us) < (int64_t)REFUSED_LOG_GAP_MS * 1000) {
+        return;
+    }
+    s_last_us = now;
+
+    if (f->eth->type != PP_HTONS(ETHTYPE_IP) || f->ip == NULL) {
+        ESP_LOGW(TAG, "port list refused a non-IPv4 frame (ethertype 0x%04x) - only IPv4 "
+                      "is routed out the WAN", (unsigned)PP_NTOHS(f->eth->type));
+        return;
+    }
+
+    esp_ip4_addr_t dst = { .addr = f->ip->dest.addr };
+    uint16_t sport, dport;
+    uint8_t proto = IPH_PROTO(f->ip);
+    if ((proto == IP_PROTO_UDP || proto == IP_PROTO_TCP) && l4_ports(f, &sport, &dport)) {
+        // DNS to the wrong resolver is called out by name, because it is the one
+        // refusal that presents as a broken network rather than as a blocked
+        // port, and the fix is on the client rather than in the port list.
+        if (dport == 53) {
+            ESP_LOGW(TAG, "port list refused DNS to " IPSTR " - this bridge only allows DNS "
+                          "to the resolver the upstream network handed out. A client with "
+                          "its own DNS server set will not resolve names; set it to DHCP.",
+                     IP2STR(&dst));
+            return;
+        }
+        ESP_LOGW(TAG, "port list refused %s to " IPSTR ":%u - add \"%u%s\" on the WAN page "
+                      "if that is wanted",
+                 proto == IP_PROTO_UDP ? "UDP" : "TCP", IP2STR(&dst), (unsigned)dport,
+                 (unsigned)dport, proto == IP_PROTO_UDP ? "/udp" : "");
+        return;
+    }
+    ESP_LOGW(TAG, "port list refused IP protocol %u to " IPSTR, (unsigned)proto, IP2STR(&dst));
+}
+
 static err_t sta_output_wrapper(struct netif *netif, struct pbuf *p)
 {
     uint8_t scratch[WAN_HDR_WINDOW];
@@ -333,6 +497,7 @@ static err_t sta_output_wrapper(struct netif *netif, struct pbuf *p)
 
     if (frame_window(p, scratch, &f) && !egress_allowed(&f, r)) {
         s_status.tx_blocked++;
+        log_refused(&f);
         // No pbuf_free() here, unlike the RX side: linkoutput never owns what it
         // is handed.
         return ERR_OK;
@@ -506,6 +671,11 @@ static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
 
     publish_rules(true, dns_ip);
     napt_ensure();
+    // Started only now, not at boot: before there is a route, every SNTP poll
+    // would be refused by this device's own egress filter and land on
+    // tx_blocked, which the WAN panel presents as evidence that the port list is
+    // wrong. Ordered after publish_rules() so the filter is already open when
+    // the first packet goes.
 
     ESP_LOGI(TAG, "uplink up: " IPSTR " via " IPSTR ", DNS " IPSTR,
              IP2STR(&evt->ip_info.ip), IP2STR(&evt->ip_info.gw), IP2STR(&s_status.dns));
@@ -537,6 +707,9 @@ static void on_sta_disconnected(void *arg, esp_event_base_t base, int32_t id, vo
     s_status.ip.addr = 0;
     s_status.dns.addr = 0;
     publish_rules(false, 0);
+    // Also here, not only in on_lost_ip(): whether losing the association posts
+    // a LOST_IP depends on how the netif goes down, and the clock going quiet is
+    // not something to leave to that. The call is idempotent.
 
     // A conflict has already scheduled its own long retry and said why; letting
     // the ordinary backoff below overwrite that would turn a clear diagnosis
