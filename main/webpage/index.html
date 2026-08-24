@@ -116,7 +116,6 @@
     <tr><th title="Measured from the CPU cycle counter timed against esp_timer_get_time(), independent of the configured clock setting.">CPU speed</th><td id="sys-cpu-freq" title="Measured from the CPU cycle counter timed against esp_timer_get_time(), independent of the configured clock setting.">&hellip;</td></tr>
     <tr><th>Network (up / down)</th><td id="sys-net">&hellip;</td></tr>
     <tr><th title="Frames/sec, all protocols (TCP, UDP, ARP, etc.) combined.">Packets (up / down)</th><td id="sys-pps" title="Frames/sec, all protocols (TCP, UDP, ARP, etc.) combined.">&hellip;</td></tr>
-    <tr><th title="Missed bandwidth samples since boot — a rising count means traffic accounting is falling behind under load. Does not mean the bridge is dropping network packets; 'Frames dropped' in the Diagnostics panel is that number.">Unreported traffic</th><td id="sys-drops" title="Missed bandwidth samples since boot — a rising count means traffic accounting is falling behind under load. Does not mean the bridge is dropping network packets; 'Frames dropped' in the Diagnostics panel is that number.">&hellip;</td></tr>
   </tbody>
 </table>
 </div>
@@ -128,7 +127,8 @@
     <tr><th title="Why this device last started up, and how long it had been running before that. A panic, watchdog, or brownout is a fault. A power-on is normal on a device that gets switched off, and is indistinguishable from a hard power loss — the full history shows whether there is a pattern. &quot;Reset without power cycle&quot; means the 3.3 V rail never dropped, so a serial adapter or a reset button did it rather than the power going away; &quot;Cold boot after power loss&quot; means the rail really did drop. &quot;during startup&quot; means it never finished booting, which is a boot loop.">Last restart</th><td id="sys-restart" title="Why this device last started up, and how long it had been running before that. A panic, watchdog, or brownout is a fault. A power-on is normal on a device that gets switched off, and is indistinguishable from a hard power loss — the full history shows whether there is a pattern. &quot;Reset without power cycle&quot; means the 3.3 V rail never dropped, so a serial adapter or a reset button did it rather than the power going away; &quot;Cold boot after power loss&quot; means the rail really did drop. &quot;during startup&quot; means it never finished booting, which is a boot loop.">&hellip;</td></tr>
     <tr><th title="What the Ethernet port negotiated with whatever is plugged into it. 100 Mbit full duplex is normal — a 10 Mbit or half-duplex link still passes traffic, but slowly, and usually means a damaged, miswired, or over-long cable rather than a WiFi problem.">Ethernet port</th><td id="eth-link" title="What the Ethernet port negotiated with whatever is plugged into it. 100 Mbit full duplex is normal — a 10 Mbit or half-duplex link still passes traffic, but slowly, and usually means a damaged, miswired, or over-long cable rather than a WiFi problem.">&hellip;</td></tr>
     <tr><th title="How many times the Ethernet link has dropped since boot, and how long it has held its current state. A count that keeps climbing points at a loose connector or a cable working itself apart under vibration.">Link changes</th><td id="eth-flaps" title="How many times the Ethernet link has dropped since boot, and how long it has held its current state. A count that keeps climbing points at a loose connector or a cable working itself apart under vibration.">&hellip;</td></tr>
-    <tr><th title="Frames this device took in and then could not pass on — either the bridge's input queue was full, or the port it was headed out of had no buffer left. A few under heavy load are normal and cost nothing visible; a count climbing while you watch it means the bridge is shedding traffic. This is the forwarding counter — 'Unreported traffic' in the System panel is not.">Frames dropped</th><td id="fwd-drops" title="Frames this device took in and then could not pass on — either the bridge's input queue was full, or the port it was headed out of had no buffer left. A few under heavy load are normal and cost nothing visible; a count climbing while you watch it means the bridge is shedding traffic. This is the forwarding counter — 'Unreported traffic' in the System panel is not.">&hellip;</td></tr>
+    <tr><th title="Frames this device took in and then could not pass on — either the bridge's input queue was full, or the port it was headed out of had no buffer left. A few under heavy load are normal and cost nothing visible; a count climbing while you watch it means the bridge is shedding traffic. This is the forwarding counter — 'Unreported traffic' below it is not.">Frames dropped</th><td id="fwd-drops" title="Frames this device took in and then could not pass on — either the bridge's input queue was full, or the port it was headed out of had no buffer left. A few under heavy load are normal and cost nothing visible; a count climbing while you watch it means the bridge is shedding traffic. This is the forwarding counter — 'Unreported traffic' below it is not.">&hellip;</td></tr>
+    <tr><th title="Missed bandwidth samples since boot — a rising count means traffic accounting is falling behind under load. An accounting counter, not a network one: nothing was lost on the wire, only left out of the rates in the System panel. 'Frames dropped' above is the row that means frames really were dropped.">Unreported traffic</th><td id="sys-drops" title="Missed bandwidth samples since boot — a rising count means traffic accounting is falling behind under load. An accounting counter, not a network one: nothing was lost on the wire, only left out of the rates in the System panel. 'Frames dropped' above is the row that means frames really were dropped.">&hellip;</td></tr>
     <tr><th title="Two devices found using one IP address — almost always a static address set by hand inside the DHCP range. Whichever device was on the address first keeps it; the other has its traffic dropped, so the fault shows up as one dead device rather than two that intermittently half-work. DHCP is still carried to the cut-off device, so setting it back to DHCP fixes it by itself. The leases page names both devices, and the serial console's &quot;quarantine&quot; command can override it.">Duplicate addresses</th><td id="ip-conflicts" title="Two devices found using one IP address — almost always a static address set by hand inside the DHCP range. Whichever device was on the address first keeps it; the other has its traffic dropped, so the fault shows up as one dead device rather than two that intermittently half-work. DHCP is still carried to the cut-off device, so setting it back to DHCP fixes it by itself. The leases page names both devices, and the serial console's &quot;quarantine&quot; command can override it.">&hellip;</td></tr>
     <tr><th title="Frames handed to the WiFi radio since boot, and how many of those it gave up on after exhausting its 802.11 retries. Those are lost on air, and no other counter can see them — nothing above the driver is told a frame failed. A rising share points at range, interference, or a client that has gone away.">Radio delivery</th><td id="wifi-tx" title="Frames handed to the WiFi radio since boot, and how many of those it gave up on after exhausting its 802.11 retries. Those are lost on air, and no other counter can see them — nothing above the driver is told a frame failed. A rising share points at range, interference, or a client that has gone away.">&hellip;</td></tr>
   </tbody>
@@ -581,7 +581,7 @@ const fwdDropLegs = [
   ['fwd_drop_wifi_out', 'to WiFi'],
 ];
 
-// Both rows below warn on movement between polls, not on the since-boot total.
+// The rows below warn on movement between polls, not on the since-boot total.
 // A total would be wrong twice over: bench/07 recorded 69 forwarding drops
 // during a perfectly healthy 27.9 Mbit/s uplink, which would leave the row red
 // for the rest of the uptime over something nothing noticed, and by the time
@@ -589,6 +589,7 @@ const fwdDropLegs = [
 // Null until the first sample, so a fresh page never warns on its own baseline.
 let prevFwdDrops = null;
 let prevWifiTxFailed = null;
+let prevTrafficDrops = null;
 
 // Mirrors whatHappened() in resets.html and reset_what_happened() in
 // serial_console.c - one sentence, in the order the reader cares about rather
@@ -698,10 +699,6 @@ async function refreshSystem() {
     formatRate(s.net_tx_bps) + '<br>' + formatRate(s.net_rx_bps);
   document.getElementById('sys-pps').innerHTML =
     formatPps(s.net_tx_pps) + '<br>' + formatPps(s.net_rx_pps);
-  const dropsEl = document.getElementById('sys-drops');
-  dropsEl.textContent = s.traffic_drops;
-  dropsEl.classList.toggle('warn', s.traffic_drops > 0);
-
   // The row appears only once there is a clock. On a device with no WAN there
   // never will be, and a permanent "unknown" in the System panel would read as a
   // fault rather than as a capability this deployment does not use.
@@ -747,11 +744,22 @@ async function refreshSystem() {
   fwdEl.classList.toggle('warn', prevFwdDrops !== null && fwdTotal > prevFwdDrops);
   prevFwdDrops = fwdTotal;
 
-  // Deliberately not the movement test the two rows around it use. Those count
-  // events since boot, where a total says nothing about now; this is a count of
-  // conflicts that exist *at this moment*, and it goes back to zero by itself
-  // when the fault is fixed. So warning whenever it is above zero is right, the
-  // same way the Ethernet link row warns on its current state.
+  // Movement, on the same reasoning as the row above and for the same reason a
+  // total is the wrong test: accounting falls behind under momentary load on any
+  // bridge that has ever been busy, so a count standing at some number says only
+  // that it happened once. Whether it is happening now is the question the row
+  // exists to answer.
+  const dropsEl = document.getElementById('sys-drops');
+  dropsEl.textContent = s.traffic_drops;
+  dropsEl.classList.toggle('warn', prevTrafficDrops !== null && s.traffic_drops > prevTrafficDrops);
+  prevTrafficDrops = s.traffic_drops;
+
+  // Deliberately not the movement test the since-boot counters in this panel
+  // use. Those count events, where a total says nothing about now;
+  // this is a count of conflicts that exist *at this moment*, and it goes back
+  // to zero by itself when the fault is fixed. So warning whenever it is above
+  // zero is right, the same way the Ethernet link row warns on its current
+  // state.
   const conflictEl = document.getElementById('ip-conflicts');
   if (s.ip_conflicts > 0) {
     conflictEl.textContent = s.ip_conflicts + (s.ip_conflicts === 1 ? ' address' : ' addresses') +
