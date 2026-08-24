@@ -565,6 +565,7 @@ Every route returns JSON except `/api/logs/download`, which returns `text/plain`
 | Route | Method | Body / query | Returns |
 | --- | --- | --- | --- |
 | `/` `/admin` `/wan` `/ports` `/lan` `/logs` `/leases` `/resets` | GET | — | the eight HTML pages |
+| `/favicon.ico` | GET | — | the tab icon, as PNG. Authenticated like everything else, so a browser that has not logged in yet gets a 401 on its first probe |
 | `/api/status` | GET | — | `{ssid, channel}` |
 | `/api/system` | GET | — | see the table below |
 | `/api/clients` | GET | — | array, one object per client |
@@ -857,6 +858,11 @@ reboots with the default WiFi AP and `admin`/`admin` web login restored.
 - `main/webpage/wan.html` — the `/wan` WAN page: the uplink's on/off, SSID and password
 - `main/webpage/ports.html` — the `/ports` Port Whitelist page
 - `main/webpage/lan.html` — the `/lan` page: the access point's SSID, password and channel
+- `main/webpage/favicon.png` — the tab icon, 32×32, embedded with `EMBED_FILES` rather than
+  `EMBED_TXTFILES` because the latter appends a NUL and a NUL on the end of a PNG is a corrupt
+  PNG. It renders from `docs/page-icon.svg`, the master:
+  `inkscape docs/page-icon.svg -o main/webpage/favicon.png -w 32 -h 32`. The arcs in the
+  master are drawn heavy on purpose — thinner ones break up into specks at 32×32
 - `scripts/` — measurement gate, smoke tests, OTA helper (see [Diagnostics harness](#diagnostics-harness))
 - `bench/` — recorded gate runs; `00-baseline` is the reference
 

@@ -42,6 +42,8 @@ extern const uint8_t resets_html_end[] asm("_binary_resets_html_end");
 extern const uint8_t wan_html_start[] asm("_binary_wan_html_start");
 extern const uint8_t ports_html_start[] asm("_binary_ports_html_start");
 extern const uint8_t ports_html_end[] asm("_binary_ports_html_end");
+extern const uint8_t favicon_png_start[] asm("_binary_favicon_png_start");
+extern const uint8_t favicon_png_end[] asm("_binary_favicon_png_end");
 extern const uint8_t wan_html_end[] asm("_binary_wan_html_end");
 extern const uint8_t lan_html_start[] asm("_binary_lan_html_start");
 extern const uint8_t lan_html_end[] asm("_binary_lan_html_end");
@@ -1717,6 +1719,43 @@ static esp_err_t ports_page_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// The tab icon. At /favicon.ico because that is the path a browser probes on its
+// own, but every page also links it explicitly - and the link is what makes it
+// work, not the path.
+//
+// This was tried the other way first, on the reasoning that the implicit probe
+// made a <link rel="icon"> in each of eight pages so many wasted bytes of flash.
+// It does not survive authentication: the probe is not a subresource of any
+// document, so it does not reliably carry the Basic credentials the browser is
+// holding, and what it gets instead is the 401 below - which the browser then
+// caches as "this origin has no icon" and stops asking. Linked from a page the
+// browser has already authenticated for, the fetch carries credentials like any
+// other subresource. The eight links cost 552 bytes.
+//
+// The .ico path carries PNG bytes, which is what every browser has expected for
+// years - the Content-Type below decides it, not the extension.
+//
+// Authenticated like everything else here, which costs nothing real: the 401 it
+// returns to a stranger already names the device in its WWW-Authenticate realm,
+// so the icon discloses nothing that refusing it does not.
+static esp_err_t favicon_get_handler(httpd_req_t *req)
+{
+    if (!check_admin_auth(req)) {
+        send_auth_error(req);
+        return ESP_OK;
+    }
+
+    // No -1: EMBED_FILES does not append the NUL that EMBED_TXTFILES does, and
+    // dropping the last byte of a PNG loses the end of its IEND chunk.
+    httpd_resp_set_type(req, "image/png");
+    // A week. The icon can only change with the firmware, and an OTA is not
+    // something the browser needs a fresh copy of the tab icon to notice.
+    httpd_resp_set_hdr(req, "Cache-Control", "max-age=604800");
+    httpd_resp_send(req, (const char *)favicon_png_start,
+                    favicon_png_end - favicon_png_start);
+    return ESP_OK;
+}
+
 static esp_err_t lan_page_get_handler(httpd_req_t *req)
 {
     if (!check_admin_auth(req)) {
@@ -2754,6 +2793,7 @@ httpd_handle_t web_server_start(void)
     const httpd_uri_t wan_page_uri = {.uri = "/wan", .method = HTTP_GET, .handler = wan_page_get_handler};
     const httpd_uri_t lan_page_uri = {.uri = "/lan", .method = HTTP_GET, .handler = lan_page_get_handler};
     const httpd_uri_t ports_page_uri = {.uri = "/ports", .method = HTTP_GET, .handler = ports_page_get_handler};
+    const httpd_uri_t favicon_uri = {.uri = "/favicon.ico", .method = HTTP_GET, .handler = favicon_get_handler};
     const httpd_uri_t wan_get_uri = {.uri = "/api/wan", .method = HTTP_GET, .handler = wan_get_handler};
     const httpd_uri_t wan_post_uri = {.uri = "/api/wan", .method = HTTP_POST, .handler = wan_post_handler};
 
@@ -2782,6 +2822,7 @@ httpd_handle_t web_server_start(void)
     httpd_register_uri_handler(server, &wan_page_uri);
     httpd_register_uri_handler(server, &lan_page_uri);
     httpd_register_uri_handler(server, &ports_page_uri);
+    httpd_register_uri_handler(server, &favicon_uri);
     httpd_register_uri_handler(server, &wan_get_uri);
     httpd_register_uri_handler(server, &wan_post_uri);
     httpd_register_uri_handler(server, &time_get_uri);

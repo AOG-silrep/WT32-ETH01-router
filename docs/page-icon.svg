@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <!-- rows dissolve into haze as they approach the horizon -->
+    <linearGradient id="fade" gradientUnits="userSpaceOnUse" x1="0" y1="1024.0" x2="0" y2="360.0">
+      <stop offset="0.00" stop-color="#fff" stop-opacity="1"/>
+      <stop offset="0.55" stop-color="#fff" stop-opacity="1"/>
+      <stop offset="0.75" stop-color="#fff" stop-opacity="0.78"/>
+      <stop offset="0.88" stop-color="#fff" stop-opacity="0.38"/>
+      <stop offset="0.96" stop-color="#fff" stop-opacity="0.1"/>
+      <stop offset="1.00" stop-color="#fff" stop-opacity="0"/>
+    </linearGradient>
+    <mask id="rowfade"><rect width="1024" height="1024" fill="url(#fade)"/></mask>
+    <!-- the fan dissolves out towards the edges, so it reads as a field and not a starburst -->
+    <radialGradient id="vig" gradientUnits="userSpaceOnUse" cx="512.0" cy="1024.0" r="717"
+                    fx="512.0" fy="1024.0" gradientTransform="matrix(1 0 0 1.7 0 -716.8)">
+      <stop offset="0.00" stop-color="#fff" stop-opacity="1"/>
+      <stop offset="0.55" stop-color="#fff" stop-opacity="1"/>
+      <stop offset="0.80" stop-color="#fff" stop-opacity="0.8"/>
+      <stop offset="0.94" stop-color="#fff" stop-opacity="0.45"/>
+      <stop offset="1.00" stop-color="#fff" stop-opacity="0.25"/>
+    </radialGradient>
+    <mask id="vignette"><rect width="1024" height="1024" fill="url(#vig)"/></mask>
+    <!-- soft band of distance sitting on the horizon -->
+    <linearGradient id="haze" gradientUnits="userSpaceOnUse" x1="0" y1="240.0" x2="0" y2="510.0">
+      <stop offset="0" stop-color="#247c26" stop-opacity="0"/>
+      <stop offset="0.45" stop-color="#247c26" stop-opacity="0.09"/>
+      <stop offset="1" stop-color="#247c26" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1024" height="1024" fill="#fcfcfc"/>
+  <rect x="0" y="240.0" width="1024" height="270" fill="url(#haze)"/>
+
+  <g mask="url(#vignette)">
+    <g fill="#247c26" mask="url(#rowfade)">
+      <polygon points="512.0,360.0 -1310.5,1024.0 -1165.5,1024.0"/>
+      <polygon points="512.0,360.0 -1060.5,1024.0 -915.5,1024.0"/>
+      <polygon points="512.0,360.0 -810.5,1024.0 -665.5,1024.0"/>
+      <polygon points="512.0,360.0 -560.5,1024.0 -415.5,1024.0"/>
+      <polygon points="512.0,360.0 -310.5,1024.0 -165.5,1024.0"/>
+      <polygon points="512.0,360.0 -60.5,1024.0 84.5,1024.0"/>
+      <polygon points="512.0,360.0 189.5,1024.0 334.5,1024.0"/>
+      <polygon points="512.0,360.0 439.5,1024.0 584.5,1024.0"/>
+      <polygon points="512.0,360.0 689.5,1024.0 834.5,1024.0"/>
+      <polygon points="512.0,360.0 939.5,1024.0 1084.5,1024.0"/>
+      <polygon points="512.0,360.0 1189.5,1024.0 1334.5,1024.0"/>
+      <polygon points="512.0,360.0 1439.5,1024.0 1584.5,1024.0"/>
+      <polygon points="512.0,360.0 1689.5,1024.0 1834.5,1024.0"/>
+      <polygon points="512.0,360.0 1939.5,1024.0 2084.5,1024.0"/>
+      <polygon points="512.0,360.0 2189.5,1024.0 2334.5,1024.0"/>
+    </g>
+  </g>
+
+  <g fill="none" stroke="#fcfcfc" stroke-width="54" stroke-linecap="round">
+      <path d="M433.97,289.74 A105.00,105.00 0 0 1 590.03,289.74"/>
+      <path d="M374.52,236.21 A185.00,185.00 0 0 1 649.48,236.21"/>
+      <path d="M315.07,182.68 A265.00,265.00 0 0 1 708.93,182.68"/>
+  </g>
+  <g fill="none" stroke="#247c26" stroke-width="54" stroke-linecap="round">
+      <path d="M433.97,289.74 A105.00,105.00 0 0 1 590.03,289.74"/>
+      <path d="M374.52,236.21 A185.00,185.00 0 0 1 649.48,236.21"/>
+      <path d="M315.07,182.68 A265.00,265.00 0 0 1 708.93,182.68"/>
+  </g>
+  <circle cx="512.0" cy="360.0" r="38" fill="#247c26"/>
+</svg>

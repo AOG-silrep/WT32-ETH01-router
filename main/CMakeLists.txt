@@ -4,5 +4,10 @@ idf_component_register(SRCS "serial_console.c" "web_server.c" "client_track.c" "
                                    "webpage/leases.html" "webpage/resets.html"
                                    "webpage/wan.html" "webpage/lan.html"
                                    "webpage/ports.html"
+                    # EMBED_FILES, not EMBED_TXTFILES: the latter appends a NUL
+                    # so the HTML above can be sent as a C string, and a NUL
+                    # glued to the end of a PNG is a corrupt PNG. The length is
+                    # therefore end - start here, with no -1.
+                    EMBED_FILES "webpage/favicon.png"
                     REQUIRES esp_http_server nvs_flash esp_wifi esp_netif esp_eth lwip
                              esp_driver_gpio esp_timer app_update console)

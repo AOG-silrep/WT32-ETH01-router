@@ -60,7 +60,36 @@ for path in / /admin /wan /ports /lan /logs /leases /resets; do
     *)       got=ok ;;
   esac
   check "nav ${path} entry is inert" ok "$got"
+
+  # The tab icon needs this link on every page. The browser's own /favicon.ico
+  # probe is not a subresource of any document, so behind Basic auth it gets a
+  # 401 and caches "no icon" - which is how this shipped broken once already.
+  case "$body" in
+    *'rel="icon"'*) check "${path} links the favicon" ok ok ;;
+    *)              check "${path} links the favicon" ok missing ;;
+  esac
 done
+
+# --- favicon ----------------------------------------------------------------
+# The tab icon is the one embedded asset that is not text. EMBED_TXTFILES would
+# append a NUL to it and the handler's length would drop the last byte of IEND,
+# and either mistake produces a file that still transfers with a 200 and simply
+# does not decode - so the check is that the PNG is whole at both ends, not that
+# the request succeeded.
+fav=$(mktemp)
+favcode=$(curl -s --max-time 10 "${AUTH[@]}" -o "$fav" -w '%{http_code}' "http://${HOST}/favicon.ico")
+check "GET /favicon.ico" 200 "$favcode"
+if head -c 8 "$fav" | od -An -tx1 | tr -d ' \n' | grep -qi '^89504e470d0a1a0a'; then
+  check "favicon starts with the PNG magic" ok ok
+else
+  check "favicon starts with the PNG magic" ok bad
+fi
+if tail -c 12 "$fav" | od -An -tx1 | tr -d ' \n' | grep -qi '49454e44ae426082$'; then
+  check "favicon ends with a whole IEND" ok ok
+else
+  check "favicon ends with a whole IEND" ok bad
+fi
+rm -f "$fav"
 
 # --- JSON endpoints ---------------------------------------------------------
 # Piped through jq -e, so malformed JSON fails here rather than silently in a
