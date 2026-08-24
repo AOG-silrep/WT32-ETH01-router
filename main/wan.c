@@ -101,11 +101,29 @@ static void publish_rules(bool up, uint32_t dns_ip)
 }
 
 // ---------------------------------------------------------------------------
-// Shared by both drop loggers below. One gap for the pair rather than one each,
-// so a device dropping in both directions cannot produce twice the output of one
-// dropping in a single direction - the reader wants to know it is happening, not
-// to be given a packet trace on the console.
-#define REFUSED_LOG_GAP_MS 10000
+// How often each drop logger below is allowed a line. Separate windows rather
+// than one shared between them, which is what an earlier version of this comment
+// claimed and would have been the wrong design: an egress refusal is policy
+// working as intended and arrives constantly, while an inbound drop is a fault,
+// and a shared window would let the routine noise starve the fault of the line
+// that reports it.
+//
+// Neither logger loses anything to its window. Both carry a count of what they
+// suppressed and print it on the next line they do emit, the way
+// log_auth_failure() in web_server.c does - so the reader is told the rate
+// without being given a packet trace.
+//
+// A minute for egress. One LAN client retrying a blocked port produces a refusal
+// every few seconds forever - ZeroTier on 9993/udp is the case that prompted
+// this - and at the ten seconds this used to be, that alone filled the 128-line
+// ring in about twenty minutes and pushed everything else off the log page. A
+// diagnostic that evicts the log is worse than no diagnostic.
+#define REFUSED_LOG_GAP_MS 60000
+
+// Ten seconds for ingress, unchanged: this one reports a fault, it is rare when
+// things are working, and it is the line somebody is waiting for when they are
+// not.
+#define DROPPED_IN_LOG_GAP_MS 10000
 
 // The filter
 // ---------------------------------------------------------------------------
@@ -429,6 +447,7 @@ static bool ingress_allowed(const wan_frame_t *f, const wan_rules_t *r)
 static void log_dropped_in(const wan_frame_t *f)
 {
     static int64_t s_last_us;
+    static uint32_t s_unreported;
 
     if (f->eth->type != PP_HTONS(ETHTYPE_IP) || f->ip == NULL) {
         return;
@@ -440,26 +459,37 @@ static void log_dropped_in(const wan_frame_t *f)
         return;
     }
 
+    // Counted only once the frame is known to have been aimed at this station,
+    // so the broadcast noise the check above discards never reaches the total.
+    s_unreported++;
     int64_t now = esp_timer_get_time();
-    if (s_last_us != 0 && (now - s_last_us) < (int64_t)REFUSED_LOG_GAP_MS * 1000) {
+    if (s_last_us != 0 && (now - s_last_us) < (int64_t)DROPPED_IN_LOG_GAP_MS * 1000) {
         return;
     }
     s_last_us = now;
+
+    char more[24] = "";
+    if (s_unreported > 1) {
+        snprintf(more, sizeof(more), " (+%u more)", (unsigned)(s_unreported - 1));
+    }
+    s_unreported = 0;
 
     esp_ip4_addr_t src = { .addr = f->ip->src.addr };
     uint16_t sport, dport;
     uint8_t proto = IPH_PROTO(f->ip);
     if ((proto == IP_PROTO_UDP || proto == IP_PROTO_TCP) && l4_ports(f, &sport, &dport)) {
-        ESP_LOGW(TAG, "dropped inbound %s from " IPSTR ":%u to our port %u - only NAT "
-                      "replies (ports %u-%u) and DHCP are admitted. If this was a reply "
-                      "to something this bridge asked for, that request's source port "
-                      "fell outside the NAT window.",
+        // Kept inside LOG_BUF_MSG_MAX (144) so the web log page shows all of it.
+        // What it means, and why a reply can land outside the window at all, is
+        // in ingress_allowed() above rather than repeated on every line.
+        ESP_LOGW(TAG, "dropped inbound %s from " IPSTR ":%u to our port %u - not a NAT "
+                      "reply (%u-%u) or DHCP%s",
                  proto == IP_PROTO_UDP ? "UDP" : "TCP", IP2STR(&src), (unsigned)sport,
                  (unsigned)dport,
-                 (unsigned)IP_NAPT_PORT_RANGE_START, (unsigned)IP_NAPT_PORT_RANGE_END);
+                 (unsigned)IP_NAPT_PORT_RANGE_START, (unsigned)IP_NAPT_PORT_RANGE_END, more);
         return;
     }
-    ESP_LOGW(TAG, "dropped inbound IP protocol %u from " IPSTR, (unsigned)proto, IP2STR(&src));
+    ESP_LOGW(TAG, "dropped inbound IP protocol %u from " IPSTR "%s",
+             (unsigned)proto, IP2STR(&src), more);
 }
 
 static err_t sta_input_wrapper(struct pbuf *p, struct netif *inp)
@@ -500,15 +530,29 @@ static err_t sta_input_wrapper(struct pbuf *p, struct netif *inp)
 static void log_refused(const wan_frame_t *f)
 {
     static int64_t s_last_us;
+    static uint32_t s_unreported;
+
+    s_unreported++;
     int64_t now = esp_timer_get_time();
     if (s_last_us != 0 && (now - s_last_us) < (int64_t)REFUSED_LOG_GAP_MS * 1000) {
         return;
     }
     s_last_us = now;
 
+    // Short, because it has to fit inside what the log ring keeps: LOG_BUF_MSG_MAX
+    // is 144 and a message longer than that is cut on the web log page, though not
+    // on the serial console. Counted from the last line printed rather than over a
+    // fixed minute, so a burst that stops mid-window is still reported by whatever
+    // refusal comes next instead of being dropped for want of an occasion.
+    char more[24] = "";
+    if (s_unreported > 1) {
+        snprintf(more, sizeof(more), " (+%u more)", (unsigned)(s_unreported - 1));
+    }
+    s_unreported = 0;
+
     if (f->eth->type != PP_HTONS(ETHTYPE_IP) || f->ip == NULL) {
         ESP_LOGW(TAG, "port list refused a non-IPv4 frame (ethertype 0x%04x) - only IPv4 "
-                      "is routed out the WAN", (unsigned)PP_NTOHS(f->eth->type));
+                      "is routed out the WAN%s", (unsigned)PP_NTOHS(f->eth->type), more);
         return;
     }
 
@@ -520,19 +564,19 @@ static void log_refused(const wan_frame_t *f)
         // refusal that presents as a broken network rather than as a blocked
         // port, and the fix is on the client rather than in the port list.
         if (dport == 53) {
-            ESP_LOGW(TAG, "port list refused DNS to " IPSTR " - this bridge only allows DNS "
-                          "to the resolver the upstream network handed out. A client with "
-                          "its own DNS server set will not resolve names; set it to DHCP.",
-                     IP2STR(&dst));
+            ESP_LOGW(TAG, "port list refused DNS to " IPSTR " - only the resolver the WAN "
+                          "handed out is allowed; set the client back to DHCP%s",
+                     IP2STR(&dst), more);
             return;
         }
         ESP_LOGW(TAG, "port list refused %s to " IPSTR ":%u - add \"%u%s\" on the WAN page "
-                      "if that is wanted",
+                      "if that is wanted%s",
                  proto == IP_PROTO_UDP ? "UDP" : "TCP", IP2STR(&dst), (unsigned)dport,
-                 (unsigned)dport, proto == IP_PROTO_UDP ? "/udp" : "");
+                 (unsigned)dport, proto == IP_PROTO_UDP ? "/udp" : "", more);
         return;
     }
-    ESP_LOGW(TAG, "port list refused IP protocol %u to " IPSTR, (unsigned)proto, IP2STR(&dst));
+    ESP_LOGW(TAG, "port list refused IP protocol %u to " IPSTR "%s",
+             (unsigned)proto, IP2STR(&dst), more);
 }
 
 static err_t sta_output_wrapper(struct netif *netif, struct pbuf *p)
