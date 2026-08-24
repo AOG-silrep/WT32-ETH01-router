@@ -46,6 +46,15 @@
   .panel { border: 2px solid #888; border-radius: 4px; padding: 0.8em; margin-top: 1em; }
   table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
   th, td { text-align: left; padding: 0.4em 0.5em; border-bottom: 1px solid #ddd; white-space: nowrap; }
+  /* Every cell on this table is nowrap by the rule above, one column is a
+     150px bar and two more are monospace - a 19-character date and a firmware
+     string - so the row has no narrow form to fall back to and cannot fit a
+     phone. Without this the table widened the panel, the panel widened the
+     flex item, and the whole document scrolled sideways; the same fault
+     271d86a fixed on the dashboard, and the same .table-scroll used there and
+     on leases.html. The footer and the empty-state line stay outside the
+     wrapper so they do not slide away from the table they describe. */
+  .table-scroll { overflow-x: auto; }
   th { border-bottom: 1px solid #bbb; }
   td.num { text-align: right; font-family: monospace; }
   td.fw { font-family: monospace; }
@@ -146,6 +155,7 @@
 <h1>Reboot history</h1>
 
 <div class="panel">
+  <div class="table-scroll">
   <table id="reset-table">
     <thead>
       <tr><th title="Counts boots that got as far as starting the firmware. A boot the bootloader rejected outright never gets a record, so the numbers are consecutive but do not count every power-up.">Boot</th>
@@ -156,6 +166,7 @@
     </thead>
     <tbody id="reset-body"></tbody>
   </table>
+  </div>
   <div id="empty">Loading&hellip;</div>
   <div id="footer"></div>
 </div>
