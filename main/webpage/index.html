@@ -705,8 +705,21 @@ async function refreshSystem() {
   document.getElementById('sys-cpu-freq').textContent = s.cpu_freq_mhz ? s.cpu_freq_mhz + ' MHz' : '…';
   document.getElementById('sys-net').innerHTML =
     formatRate(s.net_tx_bps) + '<br>' + formatRate(s.net_rx_bps);
-  document.getElementById('sys-pps').innerHTML =
-    formatPps(s.net_tx_pps) + '<br>' + formatPps(s.net_rx_pps);
+  // One line, slashed the way the CPU row above separates its two cores - the
+  // header already says which figure is which, and two short numbers did not
+  // need two rows of height.
+  //
+  // Both keep their unit rather than sharing one at the end. The directions
+  // scale independently, so an upload in Kpps beside a download in pps is
+  // ordinary here, and "1.2 K / 800 pps" would read as a pair of figures in the
+  // same unit when it is not. textContent rather than innerHTML now that there
+  // is no markup left in it.
+  //
+  // The space either side of the slash is an ordinary one so a narrow panel can
+  // still break the line there; each figure holds together on the NBSP
+  // formatPps() puts before its unit.
+  document.getElementById('sys-pps').textContent =
+    formatPps(s.net_tx_pps) + ' / ' + formatPps(s.net_rx_pps);
   // The row appears only once there is a clock. On a device with no WAN there
   // never will be, and a permanent "unknown" in the System panel would read as a
   // fault rather than as a capability this deployment does not use.
