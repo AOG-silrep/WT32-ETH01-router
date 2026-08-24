@@ -759,8 +759,8 @@ static void note_wired_range_full(const uint8_t mac[6])
     esp_ip4_addr_t s = { .addr = s_wired_start }, e = { .addr = s_wired_end };
     esp_ip4addr_ntoa(&s, start_str, sizeof(start_str));
     esp_ip4addr_ntoa(&e, end_str, sizeof(end_str));
-    ESP_LOGW(TAG, "the wired range %s - %s is full - %02x:%02x:%02x:%02x:%02x:%02x asked over "
-                  "the cable and is being served from the general pool instead",
+    ESP_LOGW(TAG, "wired range %s - %s is full - %02x:%02x:%02x:%02x:%02x:%02x served from "
+                  "the general pool instead",
              start_str, end_str, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
@@ -1413,9 +1413,12 @@ esp_err_t dhcp_server_start(esp_netif_t *br_netif,
             char s_str[16], e_str[16];
             esp_ip4addr_ntoa(&wired_start, s_str, sizeof(s_str));
             esp_ip4addr_ntoa(&wired_end, e_str, sizeof(e_str));
-            ESP_LOGE(TAG, "wired range %s - %s overlaps the pool or the bridge, runs backwards, "
-                          "or is off-subnet - ignoring it and serving one range to every port, "
-                          "fix ETH_DHCP_START/ETH_DHCP_END in main.c", s_str, e_str);
+            // Condensed to fit LOG_BUF_MSG_MAX (144), which the web log page cuts
+            // at; the three ways a range can be unusable are named in the checks
+            // immediately above, and main.c is where the fix goes.
+            ESP_LOGE(TAG, "wired range %s - %s is unusable (overlaps, backwards or "
+                          "off-subnet) - one pool for every port; fix it in main.c",
+                     s_str, e_str);
             s_wired_start = 0;
             s_wired_end = 0;
         }

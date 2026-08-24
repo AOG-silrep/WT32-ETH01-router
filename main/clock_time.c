@@ -256,9 +256,12 @@ static void log_servers(const char *why)
     }
     const char *n0 = esp_sntp_getservername(0);
     bool from_dhcp = (n0 == NULL || n0[0] == '\0') && server_desc(0, (char[48]){0}, 48) != NULL;
-    ESP_LOGI(TAG, "%s: %s (slot 0 %s; r is lwIP's reachability register)", why, line,
-             from_dhcp ? "offered by the upstream network"
-                       : "built-in default, none offered");
+    // r= is lwIP's reachability register: a shift register of the last eight
+    // polls, so 0 means nothing has been heard from that server and 255 means
+    // all eight answered. Explained here rather than on the line, which has to
+    // fit LOG_BUF_MSG_MAX (144) and was losing its tail to this.
+    ESP_LOGI(TAG, "%s: %s (slot 0 %s)", why, line,
+             from_dhcp ? "from DHCP" : "built-in");
 }
 
 // Runs in the tcpip task. Everything expensive is deferred to clock_time_tick():
@@ -347,15 +350,19 @@ static void resolve_task(void *arg)
         struct sockaddr_in *sa = (struct sockaddr_in *)res->ai_addr;
         esp_ip4_addr_t a = { .addr = sa->sin_addr.s_addr };
         esp_ip4addr_ntoa(&a, ip, sizeof(ip));
-        ESP_LOGI(TAG, "%s resolves to %s (%ld ms) - name resolution works, so a clock "
-                      "that still does not set means NTP itself is being dropped upstream",
+        // Kept under LOG_BUF_MSG_MAX (144) so the web log page shows the whole
+        // line. It used to run to about 150 and lost its tail there, silently
+        // before log_buf.c started marking the cut - and the tail is the half
+        // that says what the result means.
+        ESP_LOGI(TAG, "%s resolves to %s (%ld ms) - DNS works, so a clock that still "
+                      "does not set means NTP is dropped upstream",
                  NTP_FALLBACK, ip, ms);
         freeaddrinfo(res);
     } else {
-        ESP_LOGW(TAG, "cannot resolve %s (error %d after %ld ms) - this network's resolver "
-                      "is not answering. The clock falls back to %s, which needs no DNS, so "
-                      "it should still set; anything else on the LAN that resolves names "
-                      "will not work until the upstream resolver does.",
+        // Same cap. This one was about 280 characters and lost half of itself; the
+        // reasoning it used to spell out is in the NTP_FALLBACK_IP comment above.
+        ESP_LOGW(TAG, "cannot resolve %s (err %d, %ld ms) - resolver not answering; "
+                      "clock falls back to %s, LAN names will not resolve",
                  NTP_FALLBACK, err, ms, NTP_FALLBACK_IP);
     }
     vTaskDelete(NULL);
