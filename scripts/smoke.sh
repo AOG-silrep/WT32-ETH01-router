@@ -42,6 +42,21 @@ code() { curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$@"; }
 
 echo "smoke: ${HOST} as ${USER}"
 
+# Every check below is authenticated, so a login the device refuses is not one
+# failure but fifty - and not obviously about the login, because most of them
+# report a missing field rather than a 401. Named here instead, once, with the
+# three answers separated: /api/status returns 401 for a bad login, 403 while
+# the device is still on its default password and has not been set up, and 200
+# when there is something worth testing.
+PRE=$(code "${AUTH[@]}" "http://${HOST}/api/status")
+case "$PRE" in
+  200) ;;
+  401) echo "  FAIL  credentials rejected by ${HOST} - set BRIDGE_USER/BRIDGE_PASS"; exit 1 ;;
+  403) echo "  FAIL  ${HOST} is still on its default password; set one at /admin first"; exit 1 ;;
+  000) echo "  FAIL  no answer from ${HOST} - wrong host, or the device is down"; exit 1 ;;
+  *)   echo "  FAIL  ${HOST} answered ${PRE} to GET /api/status; nothing below would mean much"; exit 1 ;;
+esac
+
 # --- pages ------------------------------------------------------------------
 # One fetch per page, checked twice. The second check is on the sidebar: the nav
 # is pasted into all eight pages and only one line differs between them - the
@@ -94,11 +109,19 @@ rm -f "$fav"
 # --- JSON endpoints ---------------------------------------------------------
 # Piped through jq -e, so malformed JSON fails here rather than silently in a
 # browser. This is the check that would catch a response-buffer overflow.
+#
+# The status code is checked as well as the body, and that is not belt and
+# braces: this device answers a refusal in JSON too, so `{"ok":false,"error":
+# "Authentication required"}` parses perfectly and every endpoint here reported
+# ok while the device was serving nothing but 401s. A check that passes when the
+# request failed is worse than no check.
 for path in /api/status /api/clients /api/system /api/leases /api/resets "/api/logs?since=0" /api/syslog /api/wan /api/time; do
-  if curl -s --max-time 10 "${AUTH[@]}" "http://${HOST}${path}" | jq -e . >/dev/null 2>&1; then
+  body=$(curl -s --max-time 10 -w '\n%{http_code}' "${AUTH[@]}" "http://${HOST}${path}")
+  jcode="${body##*$'\n'}"
+  if [[ "$jcode" == 200 ]] && jq -e . >/dev/null 2>&1 <<<"${body%$'\n'*}"; then
     check "GET ${path} parses" ok ok
   else
-    check "GET ${path} parses" ok bad
+    check "GET ${path} parses" ok "bad (${jcode})"
   fi
 done
 
@@ -270,11 +293,13 @@ fi
 MAC="$(curl -s --max-time 10 "${AUTH[@]}" "http://${HOST}/api/clients" \
        | jq -r '.[0].mac // empty')"
 if [[ -n "$MAC" ]]; then
-  if curl -s --max-time 10 "${AUTH[@]}" \
-       "http://${HOST}/api/client/history?mac=${MAC}" | jq -e . >/dev/null 2>&1; then
+  hbody=$(curl -s --max-time 10 -w '\n%{http_code}' "${AUTH[@]}" \
+          "http://${HOST}/api/client/history?mac=${MAC}")
+  hcode="${hbody##*$'\n'}"
+  if [[ "$hcode" == 200 ]] && jq -e . >/dev/null 2>&1 <<<"${hbody%$'\n'*}"; then
     check "GET /api/client/history parses" ok ok
   else
-    check "GET /api/client/history parses" ok bad
+    check "GET /api/client/history parses" ok "bad (${hcode})"
   fi
 else
   echo "  skip  /api/client/history            (no clients listed)"
