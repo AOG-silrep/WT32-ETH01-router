@@ -121,6 +121,7 @@ fi
 # assertion here than it would be for leases or clients.
 if curl -s --max-time 10 "${AUTH[@]}" "http://${HOST}/api/resets" \
      | jq -e '(.max|type=="number") and (.count|type=="number")
+              and (.current_uptime_s|type=="number")
               and (.resets|type=="array") and (.resets|length > 0)
               and (.resets|all(has("seq") and has("reason") and has("partition")
                               and has("uptime_s") and has("uptime_approx")

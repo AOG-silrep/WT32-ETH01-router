@@ -570,7 +570,7 @@ Every route returns JSON except `/api/logs/download`, which returns `text/plain`
 | `/api/system` | GET | — | see the table below |
 | `/api/clients` | GET | — | array, one object per client |
 | `/api/leases` | GET | — | `{max, restored, leases[]}` — the DHCP table, live and as saved |
-| `/api/resets` | GET | — | `{max, count, resets[]}` — why this device restarted, newest first |
+| `/api/resets` | GET | — | `{max, count, current_uptime_s, resets[]}` — why this device restarted, newest first |
 | `/api/client/history?mac=&since=` | GET | `mac` required, `since` optional | fine-grained traffic history |
 | `/api/logs?since=` | GET | `since` optional | log lines newer than the cursor, plus the `syslog_*` counters |
 | `/api/logs/download` | GET | — | the whole ring as `text/plain`, with a diagnostics header |
@@ -624,9 +624,18 @@ and `restarted` when the device rebooted under your cursor.
 | `version` | contents of `version.txt` at build time |
 
 The `boot_*` fields summarise the newest entry in the reboot history; `/api/resets` and the
-`resets` console command carry the whole ring, and `/resets` renders it. Seven things about it
+`resets` console command carry the whole ring, and `/resets` renders it. Eight things about it
 are easy to get wrong:
 
+- **One record describes two boots, and the surfaces split it back apart.** `boot_seq`, `when`,
+  `version` and `partition` are the boot the record *opened*; `uptime_s`, `reason`, `intent`,
+  `reached_ready` and `rail_held` are how the boot *before* it ended — nothing can record its
+  own ending. So `/resets` and `resets` show one row per **boot**: the row's own record gives
+  its number, its start and its firmware, and the record *above* it gives how long it ran and
+  how it ended. The newest row is the boot running now, which has no ending and no final
+  length — it shows `current_uptime_s`, how long it has been up so far, and says so where a
+  reason would go. Reading both halves of one record onto a single row is how every duration
+  ends up reported against the boot that did not run it.
 - **Ordering and duration always; a date only sometimes.** `esp_timer` restarts at 0 each
   boot, RTC memory is wiped by power-on, and there is no RTC battery — so resets are ordered
   and each boot's *duration* measured, and that reading is complete on its own. A boot that

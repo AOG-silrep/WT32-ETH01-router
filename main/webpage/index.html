@@ -688,11 +688,17 @@ function resetText(s) {
     text += ', during startup';
   }
 
+  // Which boot the duration belongs to: the one BELOW this record's number,
+  // since a boot's length is only recorded by the boot that follows it. null on
+  // the first boot, where nothing ran before this one - the early return in
+  // describe_reset() is the same case.
+  const ended = s.boot_seq > 1 ? s.boot_seq - 1 : null;
+
   // Only when there is something real to say: null means the device cannot say,
   // and no clause is better than a wrong one. The approximate figure comes off
   // the flash checkpoint after a power event and is a window, so it is rendered
   // as one rather than dressed up as the exact reading beside it.
-  if (s.boot_prev_uptime_s === null) {
+  if (ended === null || s.boot_prev_uptime_s === null) {
     // nothing to add
   } else if (!s.boot_prev_uptime_approx) {
     text += ' after ' + formatRan(s.boot_prev_uptime_s);
@@ -703,12 +709,22 @@ function resetText(s) {
     text += ' after more than ' + formatShort(s.boot_prev_uptime_s);
   }
 
-  // The date, where the boot had a clock to know it by. Appended rather than
-  // leading, because "why" is what this row is for and "when" is the
-  // qualifier - and because most devices will have no date here at all.
-  let tail = ' \u2014 boot #' + s.boot_seq;
+  // Two boots, named separately, because the sentence is about two: everything
+  // above describes the boot that ENDED, and the date is when the boot running
+  // now started. Under one number the duration reads as this boot's, which is
+  // the reading it must not have.
+  //
+  // The date is appended rather than leading, because "why" is what this row is
+  // for and "when" is the qualifier - and because most devices will have no
+  // date here at all.
+  let tail = 'now on #' + s.boot_seq;
   if (s.boot_when !== null) {
-    tail += ', ' + s.boot_when;
+    tail += ' since ' + s.boot_when;
+  }
+  if (ended !== null) {
+    tail = ' (boot #' + ended + ') \u2014 ' + tail;
+  } else {
+    tail = ' \u2014 ' + tail;
   }
   return { text: text + tail, fault };
 }

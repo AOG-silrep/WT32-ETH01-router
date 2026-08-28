@@ -160,9 +160,9 @@
   <table id="reset-table">
     <thead>
       <tr><th title="Counts boots that got as far as starting the firmware. A boot the bootloader rejected outright never gets a record, so the numbers are consecutive but do not count every power-up.">Boot</th>
-          <th>What happened</th>
+          <th title="How this boot ended. Nothing can record its own ending, so this comes off the record the NEXT boot wrote on its way up - which is why the newest row, the boot running right now, has none to show and says so instead.">What happened</th>
           <th class="when" title="When this boot started, which is within a second or so of the reset that caused it. Shown in the timezone set on the Admin page. The device only knows the time while the WAN can reach an NTP server, and forgets it on a power cut - so a boot that ran without one is never dated, and never can be. That is not a fault and does not affect the order or the durations.">When</th>
-          <th class="dur" title="How long the device had been running before this reset. Measured, not derived from the dates in the When column - this is a duration the device counts for itself, and it is present on every record whether or not that boot ever knew what time it was. A &gt; or &lt; means the figure was recovered from the periodic checkpoint in flash after a power event, and is a bound rather than a reading; hover a row for both ends of it. The bars are on a logarithmic scale from ten seconds to a year, so they are comparable at a glance but their lengths are not in proportion to the durations - read the figures for that. A frayed end means the bar is a bound and the real run was longer.">Ran for</th>
+          <th class="dur" title="How long this boot ran, from its start to the reset that ended it. Measured, not derived from the dates in the When column - this is a duration the device counts for itself, and it is present on every record whether or not that boot ever knew what time it was. A &gt; or &lt; means the figure was recovered from the periodic checkpoint in flash after a power event, and is a bound rather than a reading; hover a row for both ends of it. The bars are on a logarithmic scale from ten seconds to a year, so they are comparable at a glance but their lengths are not in proportion to the durations - read the figures for that. A frayed end means the bar is a bound and the real run was longer, which is also how the newest row is drawn - that boot has not ended and its figure is still climbing.">Ran for</th>
           <th title="The firmware that came up after this reset, and which of the two OTA slots it booted from.">Firmware</th></tr>
     </thead>
     <tbody id="reset-body"></tbody>
@@ -409,33 +409,57 @@ function darkTime(r, older) {
 // Every cell is filled with textContent rather than innerHTML. The version
 // string is the one field here written by a different firmware image than the
 // one running, so it is treated as data, not markup.
-function addRow(r, older) {
+//
+// One row is one BOOT, and describing a boot takes two records. r gives its
+// number, its start and its firmware; ender - the record written by the boot
+// AFTER it - gives how long it ran and how it ended, because nothing can record
+// its own ending. ender is null on the newest row, where the boot has not ended
+// and upSoFar carries the live figure instead.
+function addRow(r, older, ender, upSoFar) {
   const row = body.insertRow();
+  const running = ender === null && upSoFar !== null;
 
   const seq = row.insertCell();
   seq.className = 'num';
   seq.textContent = '#' + r.seq;
 
-  const what = whatHappened(r);
   const whatCell = row.insertCell();
-  if (what.fault) whatCell.className = 'fault';
-  whatCell.textContent = what.text;
-  if (r.reason === 'power-on') {
-    whatCell.title = 'A power-on and a hard power loss are indistinguishable on ' +
-                     'this device: both cut the supply before anything can be ' +
-                     'recorded. A dip that the brownout detector catches while ' +
-                     'the chip is still running is reported as a brownout instead.';
-    if (r.rail_held === true) {
-      whatCell.title += ' The Ethernet PHY kept a marker written before the ' +
-                        'reset, so the 3.3 V rail never dropped — the chip was ' +
-                        'reset at its EN pin, which is what a serial adapter or ' +
-                        'a reset button does. A sag deep enough to reset the ' +
-                        'chip but not the PHY would look the same, so this is ' +
-                        'strong evidence rather than proof.';
-    } else if (r.rail_held === false) {
-      whatCell.title += ' The Ethernet PHY came up cleared, so the 3.3 V rail ' +
-                        'really did drop — this was a power event and not a ' +
-                        'reset at the EN pin.';
+  if (running) {
+    whatCell.className = 'unknown';
+    whatCell.textContent = 'Still running';
+    whatCell.title = 'The boot this device is on now. Nothing has ended it, so ' +
+                     'there is no reason to report and no final length — the ' +
+                     'figure beside it is how long it has been up so far.';
+  } else if (!ender) {
+    // The boot after this one is missing, so its ending is unrecorded rather
+    // than unknowable. Distinct from the "unknown" in the duration column,
+    // which is a record that IS here and carries no checkpoint.
+    whatCell.className = 'unknown';
+    whatCell.textContent = 'unknown';
+    whatCell.title = 'How a boot ended is recorded by the boot that follows it, ' +
+                     'and that record is not here — either it has aged out of ' +
+                     'the ring, or its one write to flash failed.';
+  } else {
+    const what = whatHappened(ender);
+    if (what.fault) whatCell.className = 'fault';
+    whatCell.textContent = what.text;
+    if (ender.reason === 'power-on') {
+      whatCell.title = 'A power-on and a hard power loss are indistinguishable on ' +
+                       'this device: both cut the supply before anything can be ' +
+                       'recorded. A dip that the brownout detector catches while ' +
+                       'the chip is still running is reported as a brownout instead.';
+      if (ender.rail_held === true) {
+        whatCell.title += ' The Ethernet PHY kept a marker written before the ' +
+                          'reset, so the 3.3 V rail never dropped — the chip was ' +
+                          'reset at its EN pin, which is what a serial adapter or ' +
+                          'a reset button does. A sag deep enough to reset the ' +
+                          'chip but not the PHY would look the same, so this is ' +
+                          'strong evidence rather than proof.';
+      } else if (ender.rail_held === false) {
+        whatCell.title += ' The Ethernet PHY came up cleared, so the 3.3 V rail ' +
+                          'really did drop — this was a power event and not a ' +
+                          'reset at the EN pin.';
+      }
     }
   }
 
@@ -466,7 +490,23 @@ function addRow(r, older) {
 
   const ran = row.insertCell();
   ran.className = 'dur';
-  if (r.uptime_s === null) {
+  if (running) {
+    // Drawn as the bound it is: this boot has been up at least this long and
+    // the figure is still climbing, which is the same claim a checkpoint floor
+    // makes, so it gets the same frayed end rather than a shape of its own.
+    // The label stays the bare figure - "so far" belongs in the tooltip, where
+    // it cannot push a 13-character string out of a 150px track.
+    drawBar(ran, formatUptime(upSoFar), upSoFar, true);
+    ran.title = 'So far. This boot has not ended, so the figure is a floor ' +
+                'under whatever its final length turns out to be, and it grows ' +
+                'each time the page refreshes.';
+  } else if (!ender) {
+    ran.classList.add('unknown');
+    ran.textContent = 'unknown';
+    ran.title = 'How long a boot ran is recorded by the boot that follows it, ' +
+                'and that record is not here — either it has aged out of the ' +
+                'ring, or its one write to flash failed.';
+  } else if (ender.uptime_s === null) {
     ran.classList.add('unknown');
     ran.textContent = 'unknown';
     ran.title = 'No record of how long this boot ran. Every boot saves a ' +
@@ -474,28 +514,28 @@ function addRow(r, older) {
                 'firmware from before that existed, or its one write to flash ' +
                 'failed. It does not mean the boot was short — a boot that ends ' +
                 'quickly has a checkpoint of its own that says so.';
-  } else if (r.uptime_approx) {
+  } else if (ender.uptime_approx) {
     // Rendered as the window it is, never as a reading. The device saved this
     // figure to flash during the boot and then lost power without another
     // chance to update it, so the truth sits between it and the next write
     // that was due.
-    drawBar(ran, formatBound(r.uptime_s, r.uptime_max_s), r.uptime_s, true);
+    drawBar(ran, formatBound(ender.uptime_s, ender.uptime_max_s), ender.uptime_s, true);
     // The cell shows one end; the full window lives here. uptime_max_s is null
     // once the schedule has run out, which is a boot that had been up over a
     // year — there genuinely is no upper end to give.
-    ran.title = (r.uptime_s === 0
-                  ? 'Under ' + formatUptime(r.uptime_max_s) + '. '
-                  : r.uptime_max_s === null
-                    ? 'At least ' + formatUptime(r.uptime_s) + ', with no upper ' +
+    ran.title = (ender.uptime_s === 0
+                  ? 'Under ' + formatUptime(ender.uptime_max_s) + '. '
+                  : ender.uptime_max_s === null
+                    ? 'At least ' + formatUptime(ender.uptime_s) + ', with no upper ' +
                       'bound — the device stops checkpointing after a year. '
-                    : 'Between ' + formatUptime(r.uptime_s) + ' and ' +
-                      formatUptime(r.uptime_max_s) + '. ') +
+                    : 'Between ' + formatUptime(ender.uptime_s) + ' and ' +
+                      formatUptime(ender.uptime_max_s) + '. ') +
                 'A power-on wipes the memory this device counts uptime in, so ' +
                 'this comes from the copy it saves to flash on a fixed schedule ' +
                 '— ten seconds, twenty, thirty, out to a year, roughly doubling ' +
                 'along the way — and the boot ended before the next save was due.';
   } else {
-    drawBar(ran, formatUptime(r.uptime_s), r.uptime_s, false);
+    drawBar(ran, formatUptime(ender.uptime_s), ender.uptime_s, false);
   }
 
   const fw = row.insertCell();
@@ -525,9 +565,19 @@ function render(data) {
   body.textContent = '';
   const anyWhen = data.resets.some(r => r.when !== null);
   document.getElementById('reset-table').classList.toggle('no-when', !anyWhen);
-  // Newest first from the server; each row is handed the record below it so it
-  // can spot a firmware change across the boundary.
-  data.resets.forEach((r, i) => addRow(r, data.resets[i + 1]));
+  // Newest first from the server, and one row per BOOT rather than one per
+  // record. Each row is handed the record below it, for the firmware diff and
+  // the dark gap, and the record ABOVE it - written by the boot that followed,
+  // and so the only one that knows how this boot ended.
+  data.resets.forEach((r, i) => {
+    const newer = data.resets[i - 1];
+    // Only where the two are genuinely consecutive. A boot whose record never
+    // reached flash would otherwise hand its predecessor's row an ending that
+    // belongs to a different boot - the same off-by-one this arrangement is
+    // here to prevent, reintroduced at the seam.
+    const ender = (newer && newer.seq === r.seq + 1) ? newer : null;
+    addRow(r, data.resets[i + 1], ender, i === 0 ? data.current_uptime_s : null);
+  });
 
   emptyMsg.textContent = 'No reset history yet — this is the first boot since ' +
                          'this firmware was installed.';
@@ -549,8 +599,8 @@ function render(data) {
     note.textContent = 'These are ordered, not timestamped. This device has no ' +
                        'battery-backed clock, and none of these boots had a working ' +
                        'WAN to ask a time server through — so it can say one reset ' +
-                       'happened before another and how long the boot before it ' +
-                       'lasted, but not on what date. Set up a WAN and later boots ' +
+                       'happened before another and how long each boot lasted, ' +
+                       'but not on what date. Set up a WAN and later boots ' +
                        'will be dated. Only the most recent ' + data.max + ' are kept.';
   } else if (anyUndated) {
     note.textContent = 'Ordered first, dated where possible. This device has no ' +

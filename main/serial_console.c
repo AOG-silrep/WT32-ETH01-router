@@ -168,11 +168,12 @@ static int cmd_sysinfo(int argc, char **argv)
     // hours, and last time it was a panic".
     reset_log_entry_t cur;
     if (reset_log_get_current(&cur)) {
-        // 160, not 112: the longest wording is a 63-character "what happened",
-        // " after " , a 23-character duration and the parenthesised boot number
-        // and date, which is 139. 112 predates the date and was already one
-        // long reason short of truncating.
-        char desc[160];
+        // 192, not 160: the longest wording is a 63-character "what happened",
+        // " after ", a 23-character duration, the parenthesised number of the
+        // boot that ended, and "now on #N since <date>" - which is 159, and 160
+        // left one byte. Naming both boots is what spent the old allowance; see
+        // describe_reset().
+        char desc[192];
         describe_reset(&cur, desc, sizeof(desc));
         printf("Last restart:   %s\n", desc);
     }
@@ -537,6 +538,22 @@ static void fmt_bound(uint32_t floor_s, char *out, size_t n)
     snprintf(out, n, ">%u%s", v, u);
 }
 
+// The two-unit form, for a duration that is a reading rather than a bound. Also
+// used for the boot that is still running: its length so far is exact, even
+// though it is not final.
+static void fmt_exact(uint32_t s, char *out, size_t n)
+{
+    if (s >= 86400) {
+        snprintf(out, n, "%ud %uh", (unsigned)(s / 86400), (unsigned)((s % 86400) / 3600));
+    } else if (s >= 3600) {
+        snprintf(out, n, "%uh %um", (unsigned)(s / 3600), (unsigned)((s % 3600) / 60));
+    } else if (s >= 60) {
+        snprintf(out, n, "%um %us", (unsigned)(s / 60), (unsigned)(s % 60));
+    } else {
+        snprintf(out, n, "%us", (unsigned)s);
+    }
+}
+
 static void reset_ran_for(const reset_log_entry_t *e, char *out, size_t n)
 {
     if (!(e->flags & (RESET_LOG_F_PREV_STATE | RESET_LOG_F_PREV_UPTIME_MIN))) {
@@ -551,16 +568,7 @@ static void reset_ran_for(const reset_log_entry_t *e, char *out, size_t n)
         fmt_bound(e->prev_uptime_s, out, n);
         return;
     }
-    uint32_t s = e->prev_uptime_s;
-    if (s >= 86400) {
-        snprintf(out, n, "%ud %uh", (unsigned)(s / 86400), (unsigned)((s % 86400) / 3600));
-    } else if (s >= 3600) {
-        snprintf(out, n, "%uh %um", (unsigned)(s / 3600), (unsigned)((s % 3600) / 60));
-    } else if (s >= 60) {
-        snprintf(out, n, "%um %us", (unsigned)(s / 60), (unsigned)(s % 60));
-    } else {
-        snprintf(out, n, "%us", (unsigned)s);
-    }
+    fmt_exact(e->prev_uptime_s, out, n);
 }
 
 // One sentence saying what happened, in the order the reader cares about rather
@@ -637,37 +645,47 @@ static void describe_reset(const reset_log_entry_t *e, char *out, size_t n)
     reset_what_happened(e, what, sizeof(what));
     reset_ran_for(e, ran, sizeof(ran));
 
-    // The boot number, and the date when that boot had a clock to know it by.
-    // Appended rather than leading, and only when known, for the reason
-    // resetText() gives on the dashboard: "why" is what this line is for and
-    // "when" is the qualifier, and most devices will have no date at all.
+    // Two boots, named separately, because the record describes two: what and
+    // ran are how the boot BELOW this record's boot_seq ended, and the date is
+    // when the boot this record opened started. Written as one number with both
+    // halves under it - which is what this line used to do - it reports every
+    // duration against the boot that did not run it.
     //
     // Built once because all four wordings below end with it. Written out per
-    // wording it was the same parenthesis four times, and a fifth wording that
+    // wording it was the same clause four times, and a fifth wording that
     // forgot the date is how this line and the dashboard's would drift into
     // describing one boot two ways - which is the drift the shared
     // describe_reset() exists to prevent.
-    char tail[CLOCK_TIME_STR_MAX + 24];
+    char tail[CLOCK_TIME_STR_MAX + 40];
     if (e->flags & RESET_LOG_F_BOOT_TIME) {
         char when[CLOCK_TIME_STR_MAX];
         clock_time_format((time_t)e->boot_epoch, when, sizeof(when));
-        snprintf(tail, sizeof(tail), "(boot #%u, %s)", (unsigned)e->boot_seq, when);
+        snprintf(tail, sizeof(tail), "now on #%u since %s", (unsigned)e->boot_seq, when);
     } else {
-        snprintf(tail, sizeof(tail), "(boot #%u)", (unsigned)e->boot_seq);
+        snprintf(tail, sizeof(tail), "now on #%u", (unsigned)e->boot_seq);
     }
 
+    // Nothing ran before the first boot, so there is no duration to report and
+    // no boot number to hang one on. The reason is still worth printing: it is
+    // how the device came up.
+    if (e->boot_seq <= 1) {
+        snprintf(out, n, "%s - %s", what, tail);
+        return;
+    }
+
+    unsigned ended = (unsigned)e->boot_seq - 1;
     if (e->flags & RESET_LOG_F_PREV_STATE) {
-        snprintf(out, n, "%s after %s %s", what, ran, tail);
+        snprintf(out, n, "%s after %s (boot #%u) - %s", what, ran, ended, tail);
     } else if (reset_uptime_is_floor(e) && e->prev_uptime_s == 0) {
         // ran is already "<10s"; a sentence has the room to spell it out, and
         // "after <10s" reads worse than this does.
-        snprintf(out, n, "%s in under %u seconds %s", what,
-                 (unsigned)reset_log_uptime_ceiling(0), tail);
+        snprintf(out, n, "%s in under %u seconds (boot #%u) - %s", what,
+                 (unsigned)reset_log_uptime_ceiling(0), ended, tail);
     } else if (reset_uptime_is_floor(e)) {
         // ran is ">5m"; again the mark belongs in the column, not the sentence.
-        snprintf(out, n, "%s after more than %s %s", what, ran + 1, tail);
+        snprintf(out, n, "%s after more than %s (boot #%u) - %s", what, ran + 1, ended, tail);
     } else {
-        snprintf(out, n, "%s %s", what, tail);
+        snprintf(out, n, "%s (boot #%u) - %s", what, ended, tail);
     }
 }
 
@@ -782,7 +800,14 @@ static int cmd_resets(int argc, char **argv)
         bool dated = (recs[i].flags & RESET_LOG_F_BOOT_TIME) != 0;
         any_when  = any_when  || dated;
         any_blank = any_blank || !dated;
-        any_floor = any_floor || reset_uptime_is_floor(&recs[i]);
+        // Asked of the records used as ENDINGS, not of every record: the oldest
+        // row's duration comes from the record above it, and recs[count-1]'s own
+        // duration belongs to a boot older than any row here and is not printed.
+        // A mark that is not on screen must not summon the footnote explaining
+        // it, which is the same rule the WHEN column follows.
+        if (i > 0 && recs[i - 1].boot_seq == recs[i].boot_seq + 1) {
+            any_floor = any_floor || reset_uptime_is_floor(&recs[i - 1]);
+        }
     }
 
     // The column is rendered into a cell that carries its own trailing space and
@@ -801,9 +826,29 @@ static int cmd_resets(int argc, char **argv)
         char seq_str[12];
         snprintf(seq_str, sizeof(seq_str), "#%u", (unsigned)recs[i].boot_seq);
 
+        // A boot cannot record its own ending, so this row's ending and length
+        // come from the record ABOVE it - the one the next boot wrote. Only
+        // where the two are consecutive: a record that never reached flash would
+        // otherwise put one boot's ending against another boot's number.
+        const reset_log_entry_t *ender = NULL;
+        if (i > 0 && recs[i - 1].boot_seq == recs[i].boot_seq + 1) {
+            ender = &recs[i - 1];
+        }
+
         char what[64], ran[24];
-        reset_what_happened(&recs[i], what, sizeof(what));
-        reset_ran_for(&recs[i], ran, sizeof(ran));
+        if (i == 0) {
+            // The boot printing this. Nothing has ended it, so the column shows
+            // how long it has been up instead - an exact figure that is not a
+            // final one, which is what the WHAT HAPPENED cell beside it says.
+            strlcpy(what, "still running", sizeof(what));
+            fmt_exact((uint32_t)(esp_timer_get_time() / 1000000ULL), ran, sizeof(ran));
+        } else if (ender) {
+            reset_what_happened(ender, what, sizeof(what));
+            reset_ran_for(ender, ran, sizeof(ran));
+        } else {
+            strlcpy(what, "unknown", sizeof(what));
+            strlcpy(ran, "unknown", sizeof(ran));
+        }
 
         char fw[64];
         snprintf(fw, sizeof(fw), "%s %s%s", recs[i].version, recs[i].part,

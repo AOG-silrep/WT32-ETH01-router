@@ -1152,6 +1152,18 @@ static esp_err_t leases_get_handler(httpd_req_t *req)
 // purpose - reason and uptime_s describe how the previous one ended, version and
 // partition what came up afterwards.
 //
+// Which means a surface that keys a row to a BOOT reads two records for it: the
+// record with that boot_seq gives the start, the firmware and the number, and
+// the record ABOVE it - written by the boot that followed - gives how long that
+// boot ran and how it ended. Pairing both halves of one record onto one row
+// reports every duration a boot too late, which is the mistake this note exists
+// to prevent.
+//
+// current_uptime_s is the other end of that: the newest record has no record
+// above it, because the boot it opened is the one still running. It carries how
+// long that boot has been up as of this response - the live counter, not a
+// record, since a boot's length is only a fact once it has ended.
+//
 // reached_ready is null whenever the RTC counter did not survive, which is the
 // normal case after a power cycle; see reset_log.h for why that absence is itself
 // the evidence. uptime_s follows it down only when the flash checkpoint has
@@ -1198,11 +1210,17 @@ static esp_err_t resets_get_handler(httpd_req_t *req)
     // device-supplied side of json_append_escaped()'s rule even though nothing
     // on the network chose it. Static because the httpd worker's 8KB stack is
     // shared with the OTA path, same as the other list endpoints here.
+    //
+    // The trailing 96 is the envelope rather than a margin: its four keys, the
+    // brackets and a current_uptime_s budgeted at a full 20-digit uint64 come to
+    // 73.
     static char resp[RESET_LOG_MAX_RECORDS * 352 +
                      RESET_LOG_MAX_RECORDS * 6 * RESET_LOG_VERSION_MAX + 96];
     int off = resp_append(resp, sizeof(resp), 0,
-                           "{\"max\":%d,\"count\":%d,\"resets\":[",
-                           RESET_LOG_MAX_RECORDS, count);
+                           "{\"max\":%d,\"count\":%d,\"current_uptime_s\":%llu,"
+                           "\"resets\":[",
+                           RESET_LOG_MAX_RECORDS, count,
+                           (unsigned long long)(esp_timer_get_time() / 1000000ULL));
     for (int i = 0; i < count && off < sizeof(resp); i++) {
         reset_log_entry_t *e = &recs[i];
         bool have_prev = (e->flags & RESET_LOG_F_PREV_STATE) != 0;
