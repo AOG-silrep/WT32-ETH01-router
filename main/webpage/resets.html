@@ -490,7 +490,12 @@ function addRow(r, older, ender, upSoFar) {
     // same device. Epochs are used below only for arithmetic, which is the same
     // number in any zone.
     when.textContent = r.when;
-    if (older && older.when_epoch !== null && r.when_epoch !== null) {
+    // Consecutive only, for the reason the ending above is guarded: the
+    // subtraction inside means something only if r.uptime_s is the length of the
+    // boot `older` opened. With a record missing between the two it is the
+    // length of some boot in between, and the gap comes out confident and wrong.
+    if (older && older.seq === r.seq - 1 &&
+        older.when_epoch !== null && r.when_epoch !== null) {
       const dark = darkTime(r, older);
       if (dark) {
         when.title = dark;
