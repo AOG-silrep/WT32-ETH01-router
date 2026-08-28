@@ -650,10 +650,17 @@ function resetText(s) {
     text = 'Firmware update'; fault = false;
   } else if (s.boot_intent === 'wifi-save') {
     text = 'WiFi settings applied'; fault = false;
+  } else if (s.boot_intent === 'wan-save') {
+    text = 'WAN settings applied'; fault = false;
   } else if (s.boot_intent === 'console') {
     text = 'Console requested restart'; fault = false;
   } else if (s.boot_intent === 'factory-reset') {
     text = 'Factory reset'; fault = false;
+  } else if (s.boot_intent && s.boot_intent !== 'unknown') {
+    // A tag this row has no wording for; see the same branch in resets.html.
+    // Anything tagged was asked for, and must not reach the reason chain and be
+    // reported as an untagged software reset.
+    text = 'Restarted on request (' + s.boot_intent + ')'; fault = false;
   } else if (s.boot_reason === 'panic') {
     text = 'Panic'; fault = true;
   } else if (s.boot_reason === 'int-wdt' || s.boot_reason === 'task-wdt' ||

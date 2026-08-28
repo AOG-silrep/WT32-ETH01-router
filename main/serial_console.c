@@ -596,6 +596,13 @@ static void reset_what_happened(const reset_log_entry_t *e, char *out, size_t n)
         strlcpy(out, "console requested restart", n);
     } else if (e->intent == RESET_INTENT_FACTORY_RESET) {
         strlcpy(out, "factory reset", n);
+    } else if (e->intent != RESET_INTENT_UNKNOWN) {
+        // A tag this build has no wording for: a record written by later
+        // firmware, or an intent added to the enum and not to this chain. It
+        // was still asked for, so it must not fall through to the reason below
+        // and be reported as an untagged software reset - which is this
+        // function's wording for a path nobody accounted for.
+        snprintf(out, n, "restart on request (%s)", reset_log_intent_name(e->intent));
     } else if (strcmp(reason, "panic") == 0) {
         strlcpy(out, "crashed (panic)", n);
     } else if (strcmp(reason, "int-wdt") == 0 || strcmp(reason, "task-wdt") == 0 ||

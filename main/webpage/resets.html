@@ -217,10 +217,20 @@ function whatHappened(r) {
     text = 'Restarted for a firmware update'; fault = false;
   } else if (r.intent === 'wifi-save') {
     text = 'Restarted to apply WiFi settings'; fault = false;
+  } else if (r.intent === 'wan-save') {
+    text = 'Restarted to apply WAN settings'; fault = false;
   } else if (r.intent === 'console') {
     text = 'Console requested restart'; fault = false;
   } else if (r.intent === 'factory-reset') {
     text = 'Factory reset'; fault = false;
+  } else if (r.intent && r.intent !== 'unknown') {
+    // A tag this page does not have wording for: a record written by later
+    // firmware, or an intent added to the device and not to this chain. It is
+    // still somebody asking for a restart, so it must not fall through to the
+    // reason chain below - "Restarted by software, untagged" there is this
+    // page's wording for a path nobody accounted for, and saying that about a
+    // deliberate action is worse than saying nothing specific.
+    text = 'Restarted on request (' + r.intent + ')'; fault = false;
   } else if (r.reason === 'panic') {
     text = 'Crashed (panic)'; fault = true;
   } else if (r.reason === 'int-wdt' || r.reason === 'task-wdt' || r.reason === 'other-wdt') {
