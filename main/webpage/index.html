@@ -61,7 +61,6 @@
   #banner { display: none; background: #b00020; color: #fff; padding: 0.6em 1em; border-radius: 4px;
             max-width: 1300px; margin: 2em auto 1em; }
   #banner.show { display: block; }
-  #banner.restarting { background: #c26a00; }
   /* Carried over from /wan with the WAN panel. No measure cap on the state
      line here - on /wan it needed one to keep prose off a full-width column,
      but inside a dashboard panel the panel is already the measure. */
@@ -979,7 +978,7 @@ async function poll() {
     }
     failCount = 0;
     const banner = document.getElementById('banner');
-    banner.classList.remove('show', 'restarting');
+    banner.classList.remove('show');
   } catch (e) {
     if (e === SETUP_ERROR) {
       // The bridge is back to its default password and won't serve anything
@@ -998,7 +997,6 @@ async function poll() {
       clearInterval(pollTimer);
       const banner = document.getElementById('banner');
       banner.textContent = 'Sign-in expired — asking for your password…';
-      banner.classList.remove('restarting');
       banner.classList.add('show');
       location.reload();
       return;
@@ -1007,7 +1005,6 @@ async function poll() {
     if (failCount >= 2) {
       const banner = document.getElementById('banner');
       banner.textContent = 'Lost connection to bridge — retrying…';
-      banner.classList.remove('restarting');
       banner.classList.add('show');
     }
   } finally {
