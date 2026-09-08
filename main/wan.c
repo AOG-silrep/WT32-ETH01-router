@@ -860,11 +860,6 @@ uint32_t wan_get_dns(void)
     return r->up ? r->dns_ip : 0;
 }
 
-bool wan_is_up(void)
-{
-    return s_status.state == WAN_STATE_UP;
-}
-
 bool wan_is_enabled(void)
 {
     return s_status.state != WAN_STATE_DISABLED;

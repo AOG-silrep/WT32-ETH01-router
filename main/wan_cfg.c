@@ -21,7 +21,6 @@ static const char *TAG = "wan_cfg";
 static SemaphoreHandle_t s_mutex;
 static wan_cfg_t s_cache;
 static bool s_cache_valid;
-static uint32_t s_generation;
 
 esp_err_t wan_cfg_init(void)
 {
@@ -57,7 +56,10 @@ static const wan_port_rule_t k_default_ports[] = {
     { 21117, WAN_PROTO_TCP },
 };
 
-void wan_cfg_default_ports(wan_port_rule_t *out, uint8_t *out_n)
+// The compiled-in default rule set: NTRIP plus RustDesk. Only load_from_nvs()
+// seeds from it; /ports, the console help and the README each spell the list
+// out in their own words.
+static void wan_cfg_default_ports(wan_port_rule_t *out, uint8_t *out_n)
 {
     memcpy(out, k_default_ports, sizeof(k_default_ports));
     *out_n = (uint8_t)(sizeof(k_default_ports) / sizeof(k_default_ports[0]));
@@ -121,14 +123,6 @@ void wan_cfg_get(wan_cfg_t *out)
     xSemaphoreGive(s_mutex);
 }
 
-uint32_t wan_cfg_generation(void)
-{
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    uint32_t gen = s_generation;
-    xSemaphoreGive(s_mutex);
-    return gen;
-}
-
 esp_err_t wan_cfg_save(const wan_cfg_t *cfg)
 {
     nvs_handle_t nvs_handle;
@@ -162,7 +156,6 @@ esp_err_t wan_cfg_save(const wan_cfg_t *cfg)
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_cache = *cfg;
     s_cache_valid = true;
-    s_generation++;
     xSemaphoreGive(s_mutex);
     return ESP_OK;
 }

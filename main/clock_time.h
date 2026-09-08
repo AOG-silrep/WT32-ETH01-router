@@ -63,7 +63,7 @@ extern "C" {
 // the time must still bridge.
 esp_err_t clock_time_init(void);
 
-// Driven from wan.c's event handlers rather than by polling wan_is_up(): the
+// Driven from wan.c's event handlers rather than by polling the WAN state: the
 // client starts when the WAN has an address and stops when it loses one.
 void clock_time_wan_up(void);
 void clock_time_wan_down(void);

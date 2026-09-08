@@ -55,15 +55,8 @@ esp_err_t wan_cfg_init(void);
 // Current configuration, from a RAM cache populated from NVS on first use.
 void wan_cfg_get(wan_cfg_t *out);
 
-// Persists a configuration and updates the cache. Bumps the generation counter
-// below on success whether or not anything changed, for the reason
-// syslog_cfg_save() records: "saved" is the event a consumer needs to hear
-// about, and suppressing a no-op save only means it occasionally re-reads what
-// it already had.
+// Persists a configuration and updates the cache.
 esp_err_t wan_cfg_save(const wan_cfg_t *cfg);
-
-// Incremented by every successful save.
-uint32_t wan_cfg_generation(void);
 
 // Validates a candidate configuration. Returns true and leaves *err_msg
 // untouched on success; returns false and sets *err_msg to a static reason on
@@ -96,9 +89,6 @@ bool wan_cfg_parse_ports(const char *csv, wan_port_rule_t *out, uint8_t *out_n,
 // TCP ones do not, so what comes back out is what a person would have typed.
 int wan_cfg_format_ports(const wan_cfg_t *cfg, char *out, size_t outsz);
 
-// Fills in the compiled-in default rule set: NTRIP plus RustDesk. Exposed so
-// the console and the docs cannot drift from what load_from_nvs() seeds.
-void wan_cfg_default_ports(wan_port_rule_t *out, uint8_t *out_n);
 
 #ifdef __cplusplus
 }
