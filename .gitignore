@@ -6,3 +6,5 @@
 /secure_boot_signing_key.pem
 /scripts/__pycache__
 /.vscode/settings.json
+/dependencies.lock
+/sdkconfig
