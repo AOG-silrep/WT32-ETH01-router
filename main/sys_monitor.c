@@ -4,6 +4,7 @@
 #include "reset_log.h"
 #include "clock_time.h"
 #include "rail_witness.h"
+#include "status_led.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_cpu.h"
@@ -112,6 +113,13 @@ static void sys_monitor_task(void *arg)
         // SNTP sync callback that triggers it runs in the tcpip task, which is
         // the one place an NVS write must not happen.
         clock_time_tick();
+
+        // And again: a once-a-second call that just reads state three other
+        // modules already maintain (eth_link, wan, client_track) and flips a
+        // bool. The blink itself runs on its own esp_timer, not this loop -
+        // this only decides which of the two patterns that timer should be
+        // playing.
+        status_led_tick();
     }
 }
 

@@ -25,6 +25,7 @@
 #include "client_track.h"
 #include "sys_monitor.h"
 #include "eth_link.h"
+#include "status_led.h"
 #include "reset_log.h"
 #include "rail_witness.h"
 #include "auth_cfg.h"
@@ -295,6 +296,12 @@ void app_main(void)
     // Has to be registered before esp_eth_start() below, or the first
     // link-up is missed and the port reads as down until the cable moves.
     ESP_ERROR_CHECK(eth_link_init());
+
+    // Status LED. No ordering dependency on anything else here - it doesn't
+    // read eth_link/wan/client_track state itself, status_led_tick() does,
+    // and that isn't called until sys_monitor's task is running further
+    // below.
+    ESP_ERROR_CHECK(status_led_init());
 
     // Initialize WiFi AP
     esp_netif_t *wifi_netif;
